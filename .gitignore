@@ -1,0 +1,39 @@
+# build artifacts
+*.o
+*.obj
+*.a
+*.dll
+*.so
+*.exe
+build/
+build.w64/
+build-win32/
+
+# backups from patchers
+*.bak
+*.pre-*.bak
+*.gluon.bak
+
+# logs
+*.log
+wine_*.log
+pp_scopes.log
+
+# local prefixes (never commit a Wine prefix)
+.premiere2025/
+*.prefix/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+*.swp
+/runtime/
+vkd3d-proton.cache
+webview2/
+# Wine Mono / Gecko source trees staged for `neutron prefix provision` (runtime
+# artifacts like webview2/, not committed — see install_mono_gecko).
+/mono/
+/gecko/

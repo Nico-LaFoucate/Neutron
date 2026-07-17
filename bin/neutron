@@ -1,0 +1,1965 @@
+#!/usr/bin/env python3
+# neutron — the Neutron CLI front door (v0).
+#
+# The stable surface Collider drives. Structured --json on every command,
+# meaningful exit codes, no interactivity. Internals wrap the proven hand-driven
+# stack (the `premiere` launcher, collider-hwmux.sh, the Debug Database pref);
+# the contract is the part that stays stable while internals evolve.
+#
+# Implement in the Neutron repo (LGPL v2.1). See docs/NEUTRON_CLI_CONTRACT.md.
+#
+# Exit codes (contract §Design rules):
+#   0  success
+#   1  generic failure
+#   2  prefix not found / invalid
+#   3  Premiere running (can't edit prefs)
+#   4  dependency missing  (also: feature not available in v0)
+#
+# Output discipline: JSON to stdout, human logs to stderr. Collider parses
+# stdout only. In --json mode, stdout carries exactly one JSON object.
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import glob
+
+# --- exit codes ------------------------------------------------------------
+EX_OK = 0
+EX_FAIL = 1
+EX_BADPREFIX = 2
+EX_RUNNING = 3
+EX_DEP = 4
+
+# --- where things live (engine knowledge, kept in ONE place) ---------------
+# Defaults match the proven working stack. Resolution is dynamic where it
+# matters (in-prefix user, Documents symlink target, Debug Database version
+# dir) so a version bump or a different prefix doesn't break the contract.
+
+HOME = os.path.expanduser("~")
+DEFAULT_PREFIX = os.path.join(HOME, ".premiere2025")
+
+# The proven launcher env (from ~/.local/bin/premiere). Single source of truth.
+PREMIERE_SUBPATH = os.path.join(
+    "drive_c", "Program Files", "Adobe",
+    "Adobe Premiere Pro 2025", "Adobe Premiere Pro.exe",
+)
+DXVK_CONF_SUBPATH = os.path.join(
+    "drive_c", "Program Files", "Adobe",
+    "Adobe Premiere Pro 2025", "dxvk.conf",
+)
+WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
+
+# --- Neutron-owned wine runtime (Phase 1 of the Proton-style owned runtime) -----
+# The CLI must NOT depend on the host's wine; it runs Neutron's PATCHED wine (the
+# X11 frame pacer + the winewayland fractional-scale fix). Resolution order:
+#   1. $NEUTRON_WINE   2. a packaged dist path   3. the dev build tree
+#   4. system 'wine' (last-resort fallback; patches NOT present -> warn).
+# Phase 2/3 replace the dev build tree with a versioned, bundled runtime.
+# The neutron-wine release the engine expects, and where `runtime install`
+# unpacks it. A downloaded runtime lands at
+#   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
+#   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
+NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
+NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-2")
+NEUTRON_RUNTIMES_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
+    "neutron", "runtimes")
+
+NEUTRON_WINE_CANDIDATES = [
+    os.environ.get("NEUTRON_WINE"),
+    os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{NEUTRON_WINE_VERSION}",
+                 "bin", "wine"),
+    os.path.join(HOME, "neutron", "dist", "wine", "bin", "wine"),
+    os.path.join(HOME, "wine-tkg-git", "wine-tkg-git", "src",
+                 "wine-tkg-staging-ntsync-git-64-build", "wine"),
+]
+
+# GPU-vendor ICD selection (NVIDIA default; TODO: generalize per detected GPU).
+NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+
+# --- Neutron runtime DLL bundle (Proton-style; provision stages it) -------------
+# The native translation/redistributable DLLs (DXVK + vkd3d-proton + dxvk-nvapi +
+# vcrun + gdiplus/d3dcompiler) and their DllOverrides that make an Adobe prefix
+# work, captured once from a proven prefix (`neutron runtime capture`) into a
+# versioned bundle: <runtime>/dlls/{system32,syswow64}/*.dll + <runtime>/overrides.json.
+# Resolution mirrors the wine runtime (env -> dist -> repo-local). Binaries are
+# NOT committed to git; they're a build/runtime artifact.
+NEUTRON_RUNTIME_CANDIDATES = [
+    os.environ.get("NEUTRON_RUNTIME"),
+    os.path.join(HOME, "neutron", "dist", "runtime"),
+    os.path.join(HOME, "neutron", "runtime"),
+]
+
+# --- WebView2 runtime (Adobe in-app sign-in / IMS is a Microsoft Edge WebView2
+# web UI). The Adobe installer drops WebView2 files under Common Files\Adobe but
+# never REGISTERS the runtime, so the app's WebView2 loader can't find it and the
+# sign-in window renders BLANK (a big time-sink to diagnose — bank it). provision
+# stages a complete *registered* runtime to the standard path AND writes the
+# EdgeUpdate\Clients\{GUID} "pv" the loader reads (both the 64-bit view and
+# Wow6432Node — the Adobe licensing helper is 32-bit). Binary is a runtime
+# artifact (like the DLL bundle), NOT committed to git.
+WEBVIEW2_CLIENT_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+WEBVIEW2_CANDIDATES = [
+    os.environ.get("NEUTRON_WEBVIEW2"),
+    os.path.join(HOME, "neutron", "dist", "webview2"),
+    os.path.join(HOME, "neutron", "webview2"),
+]
+
+# --- Wine Mono + Gecko (Adobe prefixes need them INSTALLED, never suppressed) ----
+# The Wine Mono/Gecko installer popup must never reach the end user, but the WRONG
+# way to dodge it is WINEDLLOVERRIDES="mscoree,mshtml=..." on the LAUNCH path — that
+# leaves gecko uninstalled and CLOBBERS Adobe's mshtml-backed web content (sign-in).
+# The RIGHT way (a complete Adobe prefix, e.g. the proven mudhut-accc2, has both Mono
+# and Gecko installed): actually INSTALL the matching versions during provision so
+# wineboot never prompts at launch and nothing is disabled. The versions MUST match
+# what the packaged neutron-wine runtime expects (baked at build time: appwiz.cpl
+# MONO_VERSION / mshtml GECKO_VERSION) — a version skew is exactly what makes wineboot
+# re-prompt on a prefix-update. Keep these in lockstep with build/WINE_BASE.
+MONO_VERSION = "11.1.0"
+GECKO_VERSION = "2.47.4"
+# Source trees (extracted wine-mono/wine-gecko), resolved in priority order. Like the
+# WebView2 runtime these are a runtime artifact, NOT committed to git; stage them under
+# ~/neutron/{mono,gecko} (or point NEUTRON_MONO/NEUTRON_GECKO at them), or fall back to
+# the host's /usr/share/wine trees IF they still carry the matching version.
+MONO_CANDIDATES = [
+    os.environ.get("NEUTRON_MONO"),
+    os.path.join(HOME, "neutron", "dist", "mono"),
+    os.path.join(HOME, "neutron", "mono"),
+    "/usr/share/wine/mono",
+]
+GECKO_CANDIDATES = [
+    os.environ.get("NEUTRON_GECKO"),
+    os.path.join(HOME, "neutron", "dist", "gecko"),
+    os.path.join(HOME, "neutron", "gecko"),
+    "/usr/share/wine/gecko",
+]
+
+# DXVK workaround: winevulkan can't marshal VK_EXT_graphics_pipeline_library
+# create-infos under winewayland.drv -> disable that DXVK feature.
+DXVK_GPL_LINE = "dxvk.enableGraphicsPipelineLibrary = False"
+
+# The hwmux daemon Neutron owns. Override with NEUTRON_HWMUX env if relocated.
+HWMUX_SCRIPT = os.environ.get(
+    "NEUTRON_HWMUX", os.path.join(HOME, "Downloads", "collider-hwmux.sh")
+)
+
+# Where neutron stashes the supervised hwmux PID so `hwmux stop` can find it.
+HWMUX_PIDFILE = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "neutron-hwmux.pid"
+)
+
+# The display-fix preference line. Premiere uses true/false (NOT 1/0) — verified
+# against the live, working Debug Database. The proven line is:
+#   DS.DisableDirectXDisplay<TAB>true<TAB>false
+DISPLAY_FIX_KEY = "DS.DisableDirectXDisplay"
+DISPLAY_FIX_CURRENT = "true"
+DISPLAY_FIX_DEFAULT = "false"
+
+# --- Prefix provisioning recipe (single source of truth; Mud Hut calls this) ----
+# What makes a freshly-staged prefix Neutron-ready. Registry-level fixes that
+# apply BEFORE first launch (the DS.DisableDirectXDisplay pref lives in Premiere's
+# Debug Database and is written post-first-launch by apply-display-fix, so it's
+# not part of provision). Values are the proven ones from the live suite.
+PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides
+    "dxcore": "native",              # DXGI/dxcore path Adobe panels need
+    "dcomp": "native,builtin",       # DirectComposition (DXVK dummy swapchain)
+    "nvapi64": "native",             # real-NVIDIA reporting (dxvk-nvapi)
+    "ucrtbase": "native,builtin",
+    "dwrite": "builtin",
+}
+# HKCU\Software\Wine\Fonts\Replacements — map the fonts Adobe requests but that
+# can't ship (MS Segoe/Calibri, CJK Noto/MS) onto Adobe Clean (installed with the
+# apps). Missing these -> dwrite FindFamilyName NULL -> AdobeOwl AV -> leaked
+# critsec -> deadlock/crash on new-doc. The full proven map (fallback when no
+# runtime fonts.json is present).
+PROVISION_FONT_REPLACEMENTS = {
+    "BIZ UDGothic": "Adobe Clean", "Calibri": "Adobe Clean",
+    "Microsoft Sans Serif": "Adobe Clean", "MS Gothic": "Adobe Clean",
+    "MS UI Gothic": "Adobe Clean", "Noto Sans JP": "Adobe Clean",
+    "Noto Sans KR": "Adobe Clean", "Noto Sans SC": "Adobe Clean",
+    "Noto Sans TC": "Adobe Clean", "Noto Serif JP": "Adobe Clean",
+    "Noto Serif KR": "Adobe Clean", "Noto Serif SC": "Adobe Clean",
+    "Noto Serif TC": "Adobe Clean", "Sans": "Adobe Clean",
+    "Segoe UI": "Adobe Clean", "Segoe UI Symbol": "Adobe Clean",
+}
+# The Adobe-suite DXVK config placed at the prefix root (Adobe panel render fix).
+PROVISION_DXVK_CONF = (
+    "# Neutron Adobe-suite DXVK config (provisioned by `neutron prefix provision`)\n"
+    "dxvk.enableGraphicsPipelineLibrary = False\n"
+    "dxgi.enableDummyCompositionSwapchain = True\n"
+)
+
+
+# --- Per-app launch profiles (single source of truth for the whole suite) -------
+# Each entry: the exe (relative to the prefix), the DXVK config it uses, its
+# WINEDLLOVERRIDES, extra env, brand accent, and whether it has a hardware-export
+# pipeline. Premiere keeps its historical values BYTE-FOR-BYTE (references the
+# constants above); the rest encode the proven per-app env from ~/.local/bin/<app>
+# plus the Neutron suite display fixes (dxcore/nvapi/dcomp native overrides).
+#   - dxvk_conf: relative to the prefix. Premiere uses its own dxvk.conf beside the
+#     exe; the rest use the shared neutron-apps-dxvk.conf (Adobe panel render fix).
+#   - nvapi: export DXVK_ENABLE_NVAPI=1 (real-NVIDIA reporting).
+#   - env: extra environment (e.g. Photoshop's GPU-present BTW gate).
+#   - accent: brand tint for the Collider app widget.
+#   - export: has a hardware-export pipeline (Collider runs the hwmux daemon).
+def _adobe(*parts):
+    return os.path.join("drive_c", "Program Files", "Adobe", *parts)
+
+
+def _common_adobe(*parts):
+    """Path under the prefix's 32-bit Common Files Adobe tree (Adobe Desktop Common)."""
+    return os.path.join("drive_c", "Program Files (x86)", "Common Files", "Adobe", *parts)
+
+
+# Adobe background services Photoshop's NGL/RPC needs at launch (else it fatals with
+# "can't communicate with CC desktop"). Started detached before the app; torn down
+# with the prefix. Full stop-on-app-exit lifecycle is a TODO
+# (see memory neutron-ipcbroker-lifecycle-collider).
+ADOBE_DAEMONS = [
+    _common_adobe("Adobe Desktop Common", "ADS", "Adobe Desktop Service.exe"),
+    _common_adobe("Adobe Desktop Common", "IPCBox", "AdobeIPCBroker.exe"),
+]
+
+
+def _start_adobe_daemons(prefix, wine, env, daemons):
+    """Start the Adobe RPC/IPC services (detached) if their exes exist. They are
+    singletons (mutex-guarded), so a duplicate start self-exits — safe to call
+    unconditionally on a freshly-torn-down prefix."""
+    started = []
+    for sub in daemons:
+        exe = os.path.join(prefix, sub)
+        if not os.path.isfile(exe):
+            continue
+        try:
+            subprocess.Popen([wine, exe], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            started.append(os.path.basename(exe))
+        except Exception:
+            pass
+    if started:
+        log("started Adobe daemons: " + ", ".join(started))
+    return started
+
+
+def _resolve_app_exe(prefix, exe_rel):
+    """Resolve a profile's (version-locked) exe subpath to an absolute path,
+    version-agnostically. Adobe bumps the folder year each release (…2025 → 2026 …)
+    but the per-app fixes are the same, so a profile shouldn't need editing per
+    version. Try the literal path first (fast; keeps a pinned path working);
+    otherwise replace a 4-digit year in the 'Adobe <App> <year>' segment with a
+    glob and return the highest-versioned match that exists. Falls back to the
+    literal path if nothing globs, so callers still get a sensible path to report."""
+    import re
+    if not prefix:
+        return ""
+    literal = os.path.join(prefix, exe_rel)
+    if os.path.isfile(literal):
+        return literal
+    pat_rel = re.sub(r'(?<!\d)(?:19|20)\d{2}(?!\d)', '*', exe_rel, count=1)
+    if pat_rel == exe_rel:
+        return literal  # no version segment to generalize
+    hits = [h for h in glob.glob(os.path.join(prefix, pat_rel)) if os.path.isfile(h)]
+    if not hits:
+        return literal
+    def _year(h):
+        yrs = re.findall(r'(?:19|20)\d{2}', h)
+        return max((int(y) for y in yrs), default=0)
+    return max(hits, key=_year)
+
+APP_PROFILES = {
+    "premiere": {
+        "name": "Premiere Pro",
+        "exe": PREMIERE_SUBPATH,
+        "dxvk_conf": DXVK_CONF_SUBPATH,
+        "overrides": WINEDLLOVERRIDES,           # "ucrtbase=n,b;dwrite=b"
+        "nvapi": False, "env": {},
+        "accent": "#9a5cf5", "export": True,
+    },
+    "photoshop": {
+        "name": "Photoshop",
+        "exe": _adobe("Adobe Photoshop 2025", "Photoshop.exe"),  # version-agnostic via _resolve_app_exe (finds 2026)
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        # dwrite=b ONLY. The aggressive dxcore/nvapi64/dcomp override set left PS 2026
+        # with no visible window, so it was dropped - but dropping the WHOLE string also
+        # removed dwrite=b, which REGRESSED PS 2025: with native dwrite (the bundle's
+        # registry override is dwrite=native,builtin), PS's font-shaping init delay-loads
+        # the Windows-only TextShaping.dll (absent under Wine) and ABORTS with
+        # "unimplemented function TextShaping.dll.ShapingSetInvariantAssertFunction".
+        # Wine's *builtin* dwrite shapes text internally (dwrite.so) and never touches
+        # TextShaping, so forcing dwrite=b (as every other Adobe profile does) fixes PS
+        # 2025 and is neutral for PS 2026. Keep ONLY dwrite here - do NOT re-add the
+        # dxcore/nvapi64/dcomp overrides (they black-box PS 2026's window).
+        # NEUTRON_DISABLE_BTW=1: the PS 2026 doc canvas presents via the real
+        # vkQueuePresentKHR -> winewayland client subsurface, and (verified 2026-07-10,
+        # packaged 11.10-2, protocol capture + screenshots) that subsurface IS composited
+        # correctly: full-size viewport, KWin presentation feedback "presented", canvas
+        # mutations (Invert/zoom) appear instantly. The earlier "GPU canvas invisible"
+        # was a misdiagnosis: a transient ~2s placeholder-geometry phase at doc-open plus
+        # the (separate, still-open) oversized layered tooltip popup that black-boxes over
+        # the canvas center. BTW-on adds no rendering benefit for PS and costs a pegged
+        # vkd3d worker thread at idle, so the GDI blit stays off. Premiere still relies
+        # on BTW - this env is per-profile, do NOT set it globally.
+        "overrides": "dwrite=b",
+        "nvapi": True,
+        "env": {"NEUTRON_DISABLE_BTW": "1"},
+        "accent": "#31a8ff", "export": False,
+        "daemons": ADOBE_DAEMONS,                # ADS + IPCBroker (PS NGL/RPC deps)
+        "post_launch": "psdock",                 # dock-helper inject (File>New docks the workspace)
+    },
+    "lightroom": {
+        "name": "Lightroom Classic",
+        "exe": _adobe("Adobe Lightroom Classic", "Lightroom.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b;dxcore=n;nvapi64=n;dcomp=n,b",
+        "nvapi": True,
+        # NEUTRON_DISABLE_BTW=1: the Develop preview presents a d3d12 swapchain via the BTW
+        # software blit-to-window at ~5.5fps (the slider/zoom "stepping"); disabling BTW ->
+        # GPU present -> smooth (verified 2026-07-16, same root/fix as the PS canvas). Per-
+        # profile (Premiere still needs BTW), do NOT set it globally.
+        "env": {"NEUTRON_DISABLE_BTW": "1"},
+        "accent": "#4d9fff", "export": False,
+    },
+    "animate": {
+        "name": "Animate",
+        "exe": _adobe("Adobe Animate 2024", "Animate.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b",
+        "nvapi": False, "env": {},
+        "accent": "#ff4d12", "export": False,
+    },
+    "mediaencoder": {
+        "name": "Media Encoder",
+        "exe": _adobe("Adobe Media Encoder 2025", "Adobe Media Encoder.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b",
+        "nvapi": False, "env": {},
+        "accent": "#6a32a2", "export": True,
+    },
+    "aftereffects": {
+        "name": "After Effects",
+        "exe": _adobe("Adobe After Effects 2025", "Support Files", "AfterFX.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b",
+        "nvapi": False, "env": {},
+        "accent": "#9999ff", "export": True,   # Render Queue outputs video → hwmux muxer
+    },
+    "illustrator": {
+        "name": "Illustrator",
+        "exe": _adobe("Adobe Illustrator 2025", "Support Files", "Contents", "Windows", "Illustrator.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b",
+        "nvapi": False, "env": {},
+        "accent": "#ff9a00", "export": False,
+    },
+}
+
+
+# --- small helpers ---------------------------------------------------------
+
+def log(msg):
+    """Human-readable log -> stderr (never pollutes the JSON on stdout)."""
+    print(f"[neutron] {msg}", file=sys.stderr)
+
+
+def emit(obj, as_json):
+    """Emit the result. JSON object to stdout in --json mode."""
+    if as_json:
+        print(json.dumps(obj))
+    else:
+        # Human mode: a compact readable rendering, still on stdout.
+        for k, v in obj.items():
+            print(f"{k}: {v}")
+
+
+def die(obj, code, as_json):
+    """Emit a structured error and exit with a meaningful code."""
+    obj.setdefault("ok", False)
+    obj.setdefault("error_code", code)
+    emit(obj, as_json)
+    sys.exit(code)
+
+
+def premiere_is_running():
+    """True if any Adobe Premiere process is alive (pref edits are unsafe then)."""
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", "Adobe Premiere"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except FileNotFoundError:
+        # No pgrep: fall back to a conservative "not detected".
+        return False
+
+
+def resolve_prefix(path):
+    """Validate a prefix path; return the absolute, real path or None."""
+    if not path:
+        return None
+    p = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(os.path.join(p, "drive_c")):
+        return None
+    return p
+
+
+def prefix_user(prefix):
+    """The in-prefix Wine username (the dir under drive_c/users that isn't Public)."""
+    users_dir = os.path.join(prefix, "drive_c", "users")
+    if not os.path.isdir(users_dir):
+        return None
+    candidates = [
+        d for d in os.listdir(users_dir)
+        if d != "Public" and os.path.isdir(os.path.join(users_dir, d))
+    ]
+    if not candidates:
+        return None
+    # Prefer the Linux $USER if present, else the first real user dir.
+    linux_user = os.environ.get("USER")
+    if linux_user in candidates:
+        return linux_user
+    return candidates[0]
+
+
+def documents_paths(prefix, user):
+    """Return (symlink_path, real_path) for the in-prefix Documents dir.
+
+    real_path is the symlink-resolved target — the canonical hwmux watch dir.
+    This encodes the symlink lesson so Collider never computes paths itself.
+    """
+    link = os.path.join(prefix, "drive_c", "users", user, "Documents")
+    real = os.path.realpath(link) if os.path.exists(link) else None
+    return link, real
+
+
+def find_debug_database(prefix, user):
+    """Locate the LIVE Debug Database.txt (the pref file apply-display-fix writes).
+
+    Globs the versioned Premiere Pro dir; excludes the .bak copy and the
+    Team Projects Local Hub copy, which are not the live prefs.
+    """
+    base = os.path.join(
+        prefix, "drive_c", "users", user, "AppData", "Roaming", "Adobe"
+    )
+    hits = glob.glob(os.path.join(base, "Premiere Pro", "*", "Debug Database.txt"))
+    # Exclude non-live copies defensively (glob above already avoids .bak,
+    # but be explicit in case of odd layouts).
+    hits = [h for h in hits if ".bak" not in h and "Team Projects" not in h]
+    if not hits:
+        return None
+    # If multiple version dirs exist, pick the highest version number.
+    def vkey(p):
+        ver = os.path.basename(os.path.dirname(p))
+        try:
+            return tuple(int(x) for x in ver.split("."))
+        except ValueError:
+            return (0,)
+    hits.sort(key=vkey, reverse=True)
+    return hits[0]
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def resolve_wine():
+    """The Neutron-owned wine binary (Phase 1). Returns (path, is_neutron).
+    Falls back to system wine (is_neutron=False) only if no Neutron wine exists."""
+    for c in NEUTRON_WINE_CANDIDATES:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c, True
+    sysw = shutil.which("wine")
+    return sysw, False
+
+
+def resolve_runtime():
+    """The Neutron runtime DLL bundle dir (has overrides.json + dlls/), or None."""
+    for c in NEUTRON_RUNTIME_CANDIDATES:
+        if c and os.path.isdir(c) and os.path.isfile(os.path.join(c, "overrides.json")):
+            return c
+    return None
+
+
+def session_is_wayland():
+    return (os.environ.get("XDG_SESSION_TYPE") == "wayland"
+            and bool(os.environ.get("WAYLAND_DISPLAY")))
+
+
+def reg_set(wine, prefix, key, name, vtype, data):
+    """Best-effort registry write via the Neutron wine. Shared-prefix safe: uses
+    the prefix's existing wineserver, never kills it, and only affects newly
+    started processes (so it can't disturb an already-running suite app)."""
+    try:
+        env = dict(os.environ)
+        env["WINEPREFIX"] = prefix
+        env.setdefault("DISPLAY", ":0")   # reg.exe needs a driver to init (Xwayland ok)
+        subprocess.run([wine, "reg", "add", key, "/v", name, "/t", vtype, "/d", data, "/f"],
+                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30)
+    except Exception as e:
+        log(f"reg set {key}\\{name} failed (non-fatal): {e}")
+
+
+def wineserver_wait(wine, prefix, timeout=240):
+    """Block until the prefix's wineserver quiesces, so pending registry/file
+    writes are flushed to disk. wineboot/reg.exe detach work onto the server and
+    return early; without this the .reg files aren't updated yet. Best-effort."""
+    srv = os.path.join(os.path.dirname(wine), "wineserver")
+    if not os.path.isfile(srv):
+        srv = shutil.which("wineserver") or "wineserver"
+    try:
+        env = dict(os.environ)
+        env["WINEPREFIX"] = prefix
+        env.setdefault("DISPLAY", ":0")
+        subprocess.run([srv, "-w"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=timeout)
+    except Exception as e:
+        log(f"wineserver -w failed (non-fatal): {e}")
+
+
+def resolve_webview2():
+    """The staged Microsoft Edge WebView2 registered-runtime source dir (has an
+    Application/<version>/msedgewebview2.exe), or None. This tree is copied into
+    the prefix's 'Program Files (x86)\\Microsoft\\EdgeWebView'. Resolution order:
+    $NEUTRON_WEBVIEW2 -> the runtime DLL bundle's webview2/ (so it ships with
+    `neutron runtime capture`) -> dist/ -> repo-local artifact."""
+    rt = resolve_runtime()
+    cands = list(WEBVIEW2_CANDIDATES)
+    if rt:
+        cands.insert(1, os.path.join(rt, "webview2"))
+    for c in cands:
+        if c and os.path.isdir(os.path.join(c, "Application")):
+            return c
+    return None
+
+
+def _webview2_version(appdir):
+    """Highest x.y.z.w version subdir under an EdgeWebView\\Application that
+    actually contains msedgewebview2.exe, or None."""
+    import re
+    if not os.path.isdir(appdir):
+        return None
+    vers = [d for d in os.listdir(appdir)
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', d)
+            and os.path.isfile(os.path.join(appdir, d, "msedgewebview2.exe"))]
+    return max(vers, default=None)
+
+
+def register_webview2(wine, prefix):
+    """Stage + register the WebView2 runtime so Adobe's in-app web sign-in (IMS)
+    renders instead of a blank window. Idempotent. Returns the registered version
+    string, or None if no runtime is present and no source was available.
+
+    The loader finds the runtime via HKLM ...\\EdgeUpdate\\Clients\\{GUID} "pv"
+    + the standard path %ProgramFiles(x86)%\\Microsoft\\EdgeWebView\\Application\\
+    <pv> — BOTH the files (at that path) and the key are required, and the key
+    must exist in the 64-bit view AND Wow6432Node (the licensing helper is 32-bit).
+    The Adobe installer's Common Files copy is NOT registered, hence blank sign-in."""
+    ew = os.path.join(prefix, "drive_c", "Program Files (x86)", "Microsoft", "EdgeWebView")
+    app = os.path.join(ew, "Application")
+    version = _webview2_version(app)                 # already staged?
+    if not version:
+        src = resolve_webview2()
+        if not src:
+            return None
+        version = _webview2_version(os.path.join(src, "Application"))
+        if not version:
+            return None
+        try:
+            os.makedirs(os.path.dirname(ew), exist_ok=True)
+            shutil.copytree(src, ew, dirs_exist_ok=True)
+        except OSError as e:
+            log(f"webview2 stage failed: {e}")
+            return None
+    # Register in both registry views so the 32-bit + 64-bit loaders find it.
+    for clients in (r"HKLM\Software\Microsoft\EdgeUpdate\Clients",
+                    r"HKLM\Software\Wow6432Node\Microsoft\EdgeUpdate\Clients"):
+        key = clients + "\\" + WEBVIEW2_CLIENT_GUID
+        reg_set(wine, prefix, key, "name", "REG_SZ", "Microsoft Edge WebView2 Runtime")
+        reg_set(wine, prefix, key, "pv", "REG_SZ", version)
+    return version
+
+
+def _mono_bases():
+    """MONO source bases, with the runtime DLL bundle's mono/ inserted so a
+    captured/shipped bundle carries wine-mono (like the WebView2 runtime)."""
+    rt = resolve_runtime()
+    bases = list(MONO_CANDIDATES)
+    if rt:
+        bases.insert(1, os.path.join(rt, "mono"))
+    return bases
+
+
+def _gecko_bases():
+    """GECKO source bases, with the runtime DLL bundle's gecko/ inserted."""
+    rt = resolve_runtime()
+    bases = list(GECKO_CANDIDATES)
+    if rt:
+        bases.insert(1, os.path.join(rt, "gecko"))
+    return bases
+
+
+def _resolve_mono_support_msi():
+    """Absolute path to the version-matched wine-mono support MSI
+    (<tree>/wine-mono-<MONO_VERSION>/support/winemono-support.msi), or None."""
+    for base in _mono_bases():
+        if not base:
+            continue
+        msi = os.path.join(base, f"wine-mono-{MONO_VERSION}",
+                           "support", "winemono-support.msi")
+        if os.path.isfile(msi):
+            return msi
+    return None
+
+
+def _resolve_gecko_tree(arch):
+    """Absolute path to the version-matched extracted wine-gecko tree for an arch
+    ('x86' or 'x86_64'): <tree>/wine-gecko-<GECKO_VERSION>-<arch>, or None."""
+    for base in _gecko_bases():
+        if not base:
+            continue
+        d = os.path.join(base, f"wine-gecko-{GECKO_VERSION}-{arch}")
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def install_mono_gecko(wine, prefix):
+    """Install the matching Wine Mono + Gecko INTO the prefix so wineboot never
+    prompts the user for them at launch and nothing (mscoree/mshtml) is disabled.
+    Idempotent. This is the correct, non-clobbering handling: a complete Adobe
+    prefix HAS mono+gecko installed (the proven mudhut-accc2 does) — we never
+    suppress mscoree/mshtml on the launch path (that leaves gecko missing and
+    blanks Adobe's mshtml-backed web content). Returns a dict describing what ran.
+
+    - Gecko: copy the extracted tree into system32/gecko/<ver>/wine_gecko (x86)
+      and syswow64/gecko/<ver>/wine_gecko (x86_64) — the exact layout wine's
+      mshtml produces (matches accc2). No MSI/prompt needed.
+    - Mono: run the tree's winemono-support.msi via msiexec (this is what wine's
+      own installer runs; it creates the c:\\windows\\mono links + registry)."""
+    res = {"mono": None, "gecko": None}
+    win = os.path.join(prefix, "drive_c", "windows")
+
+    # --- Gecko: place both arch trees where mshtml looks (idempotent). ----------
+    gecko_done = []
+    for arch, scope in (("x86", "system32"), ("x86_64", "syswow64")):
+        dst = os.path.join(win, scope, "gecko", GECKO_VERSION, "wine_gecko")
+        if os.path.isdir(dst) and os.listdir(dst):
+            gecko_done.append(f"{scope}:present")
+            continue
+        src = _resolve_gecko_tree(arch)
+        if not src:
+            gecko_done.append(f"{scope}:no-source")
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            gecko_done.append(f"{scope}:installed")
+        except OSError as e:
+            log(f"gecko {scope} install failed: {e}")
+            gecko_done.append(f"{scope}:error")
+    res["gecko"] = {"version": GECKO_VERSION, "arches": gecko_done}
+
+    # --- Mono: install via the support MSI unless already installed. ------------
+    # Modern wine-mono's support MSI references the extracted tree in place (no
+    # c:\windows\mono copy); its install artifact is syswow64\monodebg.vxd + the
+    # "Wine Mono Windows Support" uninstall record (matches the proven accc2 prefix).
+    mono_marker = os.path.join(win, "syswow64", "monodebg.vxd")
+    if os.path.isfile(mono_marker):
+        res["mono"] = {"version": MONO_VERSION, "status": "present"}
+    else:
+        msi = _resolve_mono_support_msi()
+        if not msi:
+            res["mono"] = {"version": MONO_VERSION, "status": "no-source"}
+        else:
+            try:
+                env = dict(os.environ)
+                env["WINEPREFIX"] = prefix
+                env.setdefault("DISPLAY", ":0")
+                # mscoree/mshtml must be ENABLED here so the MSI's mono setup runs;
+                # this is the install path, never the launch path.
+                env.pop("WINEDLLOVERRIDES", None)
+                winpath = "z:" + msi.replace("/", "\\")
+                subprocess.run([wine, "msiexec", "/i", winpath, "/qn"],
+                               env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=240)
+                wineserver_wait(wine, prefix)
+                res["mono"] = {"version": MONO_VERSION,
+                               "status": "installed" if os.path.isfile(mono_marker)
+                               else "ran"}
+            except Exception as e:
+                log(f"mono install failed (non-fatal): {e}")
+                res["mono"] = {"version": MONO_VERSION, "status": "error"}
+    return res
+
+
+# Font-type suffix Wine uses in the HKLM Fonts value name, by extension.
+_FONT_REG_SUFFIX = {".otf": " (OpenType)", ".ttf": " (TrueType)",
+                    ".ttc": " (TrueType)", ".fon": ""}
+
+
+def _host_font_files():
+    """The host machine's installed font files, via fontconfig. Portable: reads
+    THIS machine's fonts, so it self-populates correctly on any build-tester's
+    box (never a hardcoded list). Returns absolute Linux paths."""
+    try:
+        out = subprocess.run(["fc-list", ":", "file"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except Exception as e:
+        log(f"fc-list unavailable ({e}); host fonts NOT registered")
+        return []
+    files = []
+    for line in out.splitlines():
+        # fc-list ": file" prints "<path>: " — strip the trailing ": ".
+        p = line.strip()
+        if p.endswith(":"):
+            p = p[:-1].strip()
+        if os.path.isabs(p) and os.path.isfile(p):
+            files.append(p)
+    return files
+
+
+def _wine_fonts_dir(wine):
+    """The Wine builtin fonts dir (tahoma.ttf, arial.ttf, times.ttf, ...). These
+    are NOT on the Linux host (fc-list misses them) but dwrite's last-resort
+    fallback HARDCODES "Tahoma" (layout.c) — without it, Adobe text layout
+    NULL-derefs on File>New. Located relative to the wine binary; covers the
+    build tree and a packaged (bin/) install."""
+    # Check the dir of the wine symlink itself (build tree: fonts/ sits beside it)
+    # AND the realpath target's tree (packaged: bin/wine -> ../share/wine/fonts).
+    cands = []
+    for base in (os.path.dirname(os.path.abspath(wine)),
+                 os.path.dirname(os.path.realpath(wine))):
+        cands += [os.path.join(base, "fonts"),
+                  os.path.join(os.path.dirname(base), "share", "wine", "fonts"),
+                  os.path.join(os.path.dirname(base), "lib", "wine", "fonts")]
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "tahoma.ttf")):
+            return c
+    return None
+
+
+def register_prefix_fonts(wine, prefix):
+    """Populate HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts with
+    (1) the fonts staged under drive_c/windows/Fonts and (2) the host machine's
+    fonts (fontconfig). Returns the number of entries written.
+
+    Two failures this prevents, both because Wine does NOT auto-register fonts a
+    prefix merely *has*:
+
+    * Copied-in windows/Fonts: load_file_system_fonts() scans that dir with
+      flags=0 (win32u/font.c) and update_external_font_keys() — the only writer
+      of the HKLM Fonts key — skips faces lacking ADDFONT_EXTERNAL_FONT. So the
+      Adobe fonts stay invisible to dwrite; the Segoe UI->Adobe Clean
+      replacement resolves to an unregistered family -> blank menu bar.
+
+    * Host fonts: a freshly-provisioned prefix has an almost-empty dwrite system
+      font collection. When Adobe's torq text engine lays out the New Document
+      and dwrite reaches its LAST-RESORT fallback (layout.c
+      layout_run_get_last_resort_font -> create_matching_font), the range's font
+      collection is NULL -> create_matching_font derefs NULL -> HARD CRASH on
+      File>New (no dialog). Registering the host font set makes the collection
+      valid, exactly like a normally-used prefix. load_registry_fonts() loads
+      full-path (host) entries and windows/Fonts-relative (bare) entries alike.
+
+    One idempotent `reg import`. Registry key names are made unique so
+    load_registry_fonts() never skips a file on a duplicate face name (dwrite
+    still keys the loaded font on its real name read from the file)."""
+    entries = []           # (unique_reg_name, value)
+    seen = set()
+
+    def add(name, value):
+        base, i = name, 1
+        while name in seen:      # guarantee a unique key per file
+            i += 1
+            name = f"{base} #{i}"
+        seen.add(name)
+        entries.append((name, value))
+
+    # (1) prefix windows/Fonts — value is the bare filename (Wine resolves it
+    #     against %WINDIR%\Fonts).
+    fonts_dir = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    if os.path.isdir(fonts_dir):
+        for fn in sorted(os.listdir(fonts_dir)):
+            suffix = _FONT_REG_SUFFIX.get(os.path.splitext(fn)[1].lower())
+            if suffix is None:
+                continue
+            add(os.path.splitext(fn)[0] + suffix, fn)
+
+    # (2) host fonts — value is the full Wine DOS path (Z: maps to the host root).
+    host_files = list(_host_font_files())
+    # (3) Wine builtin fonts (Tahoma etc.) — the last-resort font isn't on Linux.
+    wfd = _wine_fonts_dir(wine)
+    if wfd:
+        host_files += [os.path.join(wfd, f) for f in sorted(os.listdir(wfd))]
+    for p in host_files:
+        suffix = _FONT_REG_SUFFIX.get(os.path.splitext(p)[1].lower())
+        if suffix is None or not os.path.isfile(p):
+            continue
+        dos = "Z:" + os.path.abspath(p).replace("/", "\\")
+        add(os.path.basename(os.path.splitext(p)[0]) + suffix, dos)
+
+    if not entries:
+        return 0
+
+    def esc(s):  # .reg string escaping
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    lines = ["REGEDIT4", "",
+             r"[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\Fonts]"]
+    lines += [f'"{esc(n)}"="{esc(v)}"' for n, v in entries]
+    body = "\r\n".join(lines) + "\r\n"
+
+    # Write the .reg inside the prefix so we can hand wine a plain C: path
+    # (avoids Z:\ DOS-path escaping quirks).
+    tmp_dir = os.path.join(prefix, "drive_c", "windows", "temp")
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        reg_path = os.path.join(tmp_dir, "neutron-fonts.reg")
+        with open(reg_path, "w", newline="") as f:
+            f.write(body)
+    except OSError as e:
+        log(f"font registry file write failed (non-fatal): {e}")
+        return 0
+    try:
+        env = dict(os.environ)
+        env["WINEPREFIX"] = prefix
+        env.setdefault("DISPLAY", ":0")
+        subprocess.run([wine, "reg", "import", r"C:\windows\temp\neutron-fonts.reg"],
+                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=120)
+    except Exception as e:
+        log(f"font registry import failed (non-fatal): {e}")
+        return 0
+    return len(entries)
+
+
+def detect_scale():
+    """Best-effort primary-monitor scale (KDE). Returns float or None. Collider
+    normally passes --scale; this is the direct-CLI fallback. (DE-specific: KDE
+    kscreen-doctor; GNOME/wlroots would need their own source.)"""
+    if not have("kscreen-doctor"):
+        return None
+    try:
+        r = subprocess.run(["kscreen-doctor", "--json"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=5)
+        data = json.loads(r.stdout or b"{}")
+        outs = [o for o in data.get("outputs", []) if o.get("enabled")]
+        prim = next((o for o in outs if o.get("priority") == 1), None)
+        if prim and prim.get("scale"):
+            return float(prim["scale"])
+        scales = [float(o["scale"]) for o in outs if o.get("scale")]
+        return max(scales) if scales else None
+    except Exception:
+        return None
+
+
+def ensure_dxvk_gpl(conf_path):
+    """Ensure the DXVK graphics-pipeline-library workaround line is present
+    (create the file if absent). Idempotent."""
+    try:
+        if os.path.isfile(conf_path):
+            with open(conf_path) as f:
+                if "enableGraphicsPipelineLibrary" in f.read():
+                    return
+        with open(conf_path, "a") as f:
+            f.write(DXVK_GPL_LINE + "\n")
+    except Exception as e:
+        log(f"dxvk gpl workaround write failed (non-fatal): {e}")
+
+
+def _display_fix_is_on(content):
+    """True iff the display-fix key is present AND its current value is 'true'.
+
+    Parses line by line, splits on tab, strips CR. Robust against the line's
+    trailing whitespace (Premiere writes this line with a double CRLF).
+    """
+    for raw in content.splitlines():
+        line = raw.rstrip("\r")
+        if line.startswith(DISPLAY_FIX_KEY + "\t"):
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1].strip().lower() == "true":
+                return True
+            return False
+    return False
+
+
+# --- commands --------------------------------------------------------------
+
+def cmd_prefix_info(args):
+    """Inspect a prefix; report the paths Collider needs.
+
+    NOTE: schema PROVISIONAL (v0-unstable). The hardening brief's ordering note
+    says prefix info / doctor JSON must not be frozen until the minimal-stack
+    cleanup (§5.2) confirms which components ship. Stable fields below are
+    documents_real and display_fix_applied; neutron_stack is best-effort.
+    """
+    prefix = resolve_prefix(args.path)
+    if not prefix:
+        die({"valid": False, "reason": "no drive_c found at path"},
+            EX_BADPREFIX, args.json)
+
+    user = prefix_user(prefix)
+    if not user:
+        die({"valid": False, "reason": "no user dir under drive_c/users"},
+            EX_BADPREFIX, args.json)
+
+    link, real = documents_paths(prefix, user)
+    dbg = find_debug_database(prefix, user)
+    display_fix_applied = False
+    if dbg and os.path.isfile(dbg):
+        try:
+            with open(dbg, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            display_fix_applied = _display_fix_is_on(content)
+        except OSError:
+            display_fix_applied = False
+
+    out = {
+        "valid": True,
+        "wineprefix": prefix,
+        "drive_c": os.path.join(prefix, "drive_c"),
+        "user": user,
+        "documents_symlink": link,
+        "documents_real": real,          # <- the hwmux watch target
+        "debug_database": dbg,
+        "display_fix_applied": display_fix_applied,
+        "neutron_stack": _stack_versions(),  # best-effort, provisional
+        "_schema": "provisional-v0",      # signal: not frozen yet
+    }
+    emit(out, args.json)
+    return EX_OK
+
+
+def _stack_versions():
+    """Best-effort stack version probe. Provisional until minimal stack settles."""
+    stack = {}
+    try:
+        r = subprocess.run(["wine", "--version"],
+                           capture_output=True, text=True, timeout=10)
+        stack["wine"] = r.stdout.strip() or None
+    except Exception:
+        stack["wine"] = None
+    # DXVK / vkd3d versions live in the deployed DLLs; reading them reliably is
+    # part of the hardening pass. Left null until §5.2 pins them.
+    stack["dxvk"] = None
+    stack["vkd3d"] = None
+    return stack
+
+
+def cmd_apply_display_fix(args):
+    """Write DS.DisableDirectXDisplay=true into Debug Database.txt. Idempotent."""
+    prefix = resolve_prefix(args.path)
+    if not prefix:
+        die({"changed": False, "reason": "invalid prefix"}, EX_BADPREFIX, args.json)
+
+    if premiere_is_running():
+        die({"changed": False, "already_applied": False,
+             "premiere_running": True,
+             "reason": "Premiere is running; cannot edit prefs"},
+            EX_RUNNING, args.json)
+
+    user = prefix_user(prefix)
+    dbg = find_debug_database(prefix, user) if user else None
+    if not dbg:
+        # The display fix is PREMIERE-SPECIFIC (DirectXDisplay pref in Premiere's
+        # Debug Database). On a prefix without Premiere (e.g. Photoshop), there is
+        # nothing to apply — return no-op success so it doesn't abort a non-Premiere
+        # launch. Only error if Premiere IS installed but hasn't been run yet.
+        if not os.path.isfile(os.path.join(prefix, PREMIERE_SUBPATH)):
+            emit({"ok": True, "changed": False, "already_applied": False,
+                  "not_applicable": True,
+                  "reason": "no Premiere in prefix; display fix not applicable"},
+                 args.json)
+            return EX_OK
+        die({"changed": False,
+             "reason": "Debug Database.txt not found (launch Premiere once?)"},
+            EX_FAIL, args.json)
+
+    # Read raw so we preserve every byte of every line we don't manage.
+    # Premiere writes this file with mixed/odd line endings (the display-fix
+    # line ends with a double CRLF); we must not rewrite lines we don't own.
+    try:
+        with open(dbg, "r", encoding="utf-8", errors="replace", newline="") as f:
+            raw = f.read()
+    except OSError as e:
+        die({"changed": False, "reason": f"read failed: {e}"}, EX_FAIL, args.json)
+
+    # The proven line, byte-for-byte as Premiere writes it: tab-separated
+    # key/current/default, value 'true', ending in CRLF. We use a single CRLF
+    # (sufficient and well-formed); Premiere accepts it.
+    new_line = f"{DISPLAY_FIX_KEY}\t{DISPLAY_FIX_CURRENT}\t{DISPLAY_FIX_DEFAULT}\r\n"
+
+    # Already correctly applied? Detect without rewriting anything.
+    if _display_fix_is_on(raw):
+        emit({"ok": True, "changed": False, "already_applied": True,
+              "premiere_running": False, "debug_database": dbg}, args.json)
+        return EX_OK
+
+    # Split on \n but KEEP it, so we can reassemble preserving each line's bytes.
+    lines = raw.splitlines(keepends=True)
+    out_lines = []
+    found = False
+    for ln in lines:
+        # Compare on a CR-stripped copy; the key sits at line start.
+        if ln.lstrip("\ufeff").startswith(DISPLAY_FIX_KEY + "\t"):
+            found = True
+            out_lines.append(new_line)   # replace ONLY this line
+        else:
+            out_lines.append(ln)         # preserve byte-for-byte
+
+    if not found:
+        # Append. Make sure the previous last line is newline-terminated so we
+        # don't glue our line onto it — but don't touch its other bytes.
+        if out_lines and not out_lines[-1].endswith(("\n", "\r")):
+            out_lines[-1] = out_lines[-1] + "\r\n"
+        out_lines.append(new_line)
+
+    try:
+        with open(dbg, "w", encoding="utf-8", newline="") as f:
+            f.write("".join(out_lines))
+    except OSError as e:
+        die({"changed": False, "reason": f"write failed: {e}"}, EX_FAIL, args.json)
+
+    log(f"display fix written to {dbg}")
+    emit({"ok": True, "changed": True, "already_applied": False,
+          "premiere_running": False, "debug_database": dbg}, args.json)
+    return EX_OK
+
+
+def cmd_prefix_provision(args):
+    """Make a (possibly freshly-staged) prefix Neutron-ready. Idempotent. This is
+    the single source of truth for the provisioning recipe — Mud Hut calls it
+    after copying the Adobe binaries in.
+
+    Steps: (1) initialize the Wine prefix if needed (wineboot); (2) bake the
+    registry provisioning (Wayland graphics driver, the Segoe UI->Adobe Clean
+    font fix, the native DLL overrides); (3) place the Adobe-suite DXVK config.
+
+    NOT yet automated (reported under `deferred`): staging the native DLL *files*
+    (dxcore/dcomp/nvapi64) from the Neutron runtime, licensing/activation, and
+    desktop-entry/MIME creation. Those are the remaining P1 chunks."""
+    prefix = resolve_prefix(args.path)
+    if not prefix:
+        die({"ok": False, "reason": "invalid prefix (no drive_c)"}, EX_BADPREFIX, args.json)
+
+    wine, is_neutron = resolve_wine()
+    if not wine:
+        die({"ok": False, "reason": "no wine runtime found"}, EX_FAIL, args.json)
+
+    steps = []
+
+    # 1. Initialize / update the prefix under Mono+Gecko suppression. Run wineboot -u
+    # ALWAYS (not only on a fresh prefix): an existing prefix launched against a newer
+    # runtime build triggers a lazy prefix-UPDATE on the first wine call, and that update
+    # pops the blocking Wine Mono/Gecko dialog — which then wedges every subsequent
+    # command (reg writes time out). Absorbing the update here with mscoree,mshtml=
+    # suppressed keeps the dialog from ever appearing; install_mono_gecko then installs
+    # the real thing right after, so no later wine call has a pending update to prompt on.
+    # This suppression is ONLY for this controlled boot, NEVER for the launch path.
+    sysreg = os.path.join(prefix, "system.reg")
+    fresh = not os.path.isfile(sysreg)
+    try:
+        env = dict(os.environ)
+        env["WINEPREFIX"] = prefix
+        env.setdefault("DISPLAY", ":0")
+        env["WINEDLLOVERRIDES"] = "mscoree,mshtml="   # suppress the Mono/Gecko prompt
+        subprocess.run([wine, "wineboot", "-u"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
+        wineserver_wait(wine, prefix)   # wineboot detaches; wait so system.reg lands
+    except Exception as e:
+        log(f"wineboot failed (non-fatal to reporting): {e}")
+    steps.append({"step": "init", "skipped": False, "fresh": fresh,
+                  "ok": os.path.isfile(sysreg)})
+
+    # 2. Registry provisioning (only affects newly-started processes; shared-safe).
+    reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ",
+            "wayland" if session_is_wayland() else "x11")
+    steps.append({"step": "graphics", "ok": True})
+
+    # 2b. Photoshop 2026 caption buttons: on a prefix reporting Windows 11 the
+    # Adobe chrome DEFERS its min/max/close caption buttons to DWM (real
+    # Windows 11 composites them); Wine has no DWM caption renderer, so the
+    # reserved button area renders as a black box (it never even queries
+    # DWMWA_CAPTION_BUTTON_BOUNDS on Win10). Reporting Windows 10 to
+    # Photoshop.exe selects Adobe's SELF-drawn caption buttons — the PS 2025
+    # behavior, which renders correctly under Wine. App-scoped: the rest of
+    # the prefix keeps its Windows version.
+    reg_set(wine, prefix, r"HKCU\Software\Wine\AppDefaults\Photoshop.exe",
+            "Version", "REG_SZ", "win10")
+    steps.append({"step": "ps_caption_win10", "ok": True})
+
+    runtime = resolve_runtime()
+    if runtime:
+        # Stage the full proven DLL set + write every override from the bundle.
+        try:
+            with open(os.path.join(runtime, "overrides.json")) as f:
+                overrides = json.load(f)
+        except Exception as e:
+            log(f"runtime overrides.json unreadable: {e}")
+            overrides = {}
+        files_staged = 0
+        for scope in ("system32", "syswow64"):
+            srcdir = os.path.join(runtime, "dlls", scope)
+            dstdir = os.path.join(prefix, "drive_c", "windows", scope)
+            if os.path.isdir(srcdir):
+                os.makedirs(dstdir, exist_ok=True)
+                for fn in os.listdir(srcdir):
+                    try:
+                        shutil.copyfile(os.path.join(srcdir, fn), os.path.join(dstdir, fn))
+                        files_staged += 1
+                    except OSError as e:
+                        log(f"stage {scope}/{fn} failed: {e}")
+        for name, val in overrides.items():
+            reg_set(wine, prefix, r"HKCU\Software\Wine\DllOverrides", name, "REG_SZ", val)
+        steps.append({"step": "dll_overrides", "source": "runtime-bundle",
+                      "overrides": len(overrides), "files_staged": files_staged, "ok": True})
+    else:
+        # No bundle yet: write the minimal override set, but the native DLL FILES
+        # aren't staged (apps won't launch until `neutron runtime capture` is run).
+        for dll, val in PROVISION_DLL_OVERRIDES.items():
+            reg_set(wine, prefix, r"HKCU\Software\Wine\DllOverrides", dll, "REG_SZ", val)
+        steps.append({"step": "dll_overrides", "source": "builtin-minimal",
+                      "count": len(PROVISION_DLL_OVERRIDES), "ok": True,
+                      "note": "no runtime bundle; native DLL files NOT staged"})
+
+    fonts = dict(PROVISION_FONT_REPLACEMENTS)
+    if runtime:
+        try:
+            with open(os.path.join(runtime, "fonts.json")) as f:
+                bundled = json.load(f)
+            if bundled:
+                fonts = bundled
+        except Exception as e:
+            log(f"runtime fonts.json unreadable ({e}); using builtin map")
+    for name, repl in fonts.items():
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
+    steps.append({"step": "fonts", "count": len(fonts), "ok": True})
+
+    # Activate the staged fonts. Copying files into windows/Fonts is NOT enough —
+    # Wine never registers them, so the replacement targets (Adobe Clean) stay
+    # invisible to dwrite and the suite deadlocks on first text layout. Register
+    # them explicitly in the HKLM Fonts key.
+    nfonts = register_prefix_fonts(wine, prefix)
+    steps.append({"step": "font_register", "count": nfonts, "ok": True})
+
+    # WebView2: stage + register the runtime or Adobe's in-app web sign-in (IMS)
+    # renders BLANK (the installer's Common Files copy is unregistered).
+    wv2 = register_webview2(wine, prefix)
+    steps.append({"step": "webview2", "version": wv2, "ok": wv2 is not None,
+                  "note": None if wv2 else
+                  "no WebView2 runtime source (set NEUTRON_WEBVIEW2 or stage ~/neutron/webview2); "
+                  "Adobe in-app sign-in will render blank without it"})
+
+    # Mono + Gecko: INSTALL the matching versions so wineboot never prompts at
+    # launch and nothing is disabled (the correct, non-clobbering handling — a
+    # complete Adobe prefix has them installed). NEVER suppress mscoree/mshtml on
+    # the launch path; that leaves gecko missing and blanks Adobe's web sign-in.
+    mg = install_mono_gecko(wine, prefix)
+    mono_ok = (mg["mono"] or {}).get("status") in ("present", "installed")
+    gecko_ok = any(s.endswith(("present", "installed"))
+                   for s in (mg["gecko"] or {}).get("arches", []))
+    steps.append({"step": "mono_gecko", "detail": mg,
+                  "ok": mono_ok and gecko_ok})
+
+    wineserver_wait(wine, prefix)   # flush the reg.exe writes to user.reg on disk
+
+    # 3. DXVK config at the prefix root (idempotent — don't clobber an existing one).
+    conf = os.path.join(prefix, "neutron-apps-dxvk.conf")
+    wrote = False
+    if not os.path.isfile(conf):
+        try:
+            with open(conf, "w") as f:
+                f.write(PROVISION_DXVK_CONF)
+            wrote = True
+        except OSError as e:
+            log(f"dxvk conf write failed (non-fatal): {e}")
+    steps.append({"step": "dxvk_conf", "path": conf, "wrote": wrote, "ok": True})
+
+    deferred = ["licensing/activation", "desktop-entries + XDG MIME associations"]
+    if not runtime:
+        deferred.insert(0, "native-dll-staging (run `neutron runtime capture` to build the bundle)")
+    if not wv2:
+        deferred.insert(0, "webview2-runtime (stage ~/neutron/webview2 or set NEUTRON_WEBVIEW2; "
+                           "Adobe in-app sign-in renders blank without it)")
+    if not (mono_ok and gecko_ok):
+        deferred.insert(0, f"mono/gecko install (stage matching wine-mono-{MONO_VERSION} + "
+                           f"wine-gecko-{GECKO_VERSION} under ~/neutron/{{mono,gecko}} or set "
+                           "NEUTRON_MONO/NEUTRON_GECKO; without them wineboot prompts for Mono at launch)")
+
+    emit({
+        "ok": True,
+        "prefix": prefix,
+        "neutron_wine": is_neutron,
+        "runtime_bundle": runtime,
+        "steps": steps,
+        "deferred": deferred,
+    }, args.json)
+    return EX_OK
+
+
+def cmd_runtime_capture(args):
+    """Build/refresh the Neutron runtime DLL bundle from a proven prefix. Reads
+    the source prefix's DllOverrides, writes the full override manifest, and
+    copies every native DLL file (system32 + syswow64) into the bundle. This is
+    the reproducible source `neutron prefix provision` stages into new prefixes."""
+    import re
+    src = resolve_prefix(args.from_prefix or DEFAULT_PREFIX)
+    if not src:
+        die({"ok": False, "reason": "invalid --from prefix"}, EX_BADPREFIX, args.json)
+    out = os.path.abspath(os.path.expanduser(
+        args.out or os.path.join(HOME, "neutron", "runtime")))
+
+    try:
+        with open(os.path.join(src, "user.reg"), encoding="utf-8", errors="replace") as f:
+            reg = f.read()
+    except OSError as e:
+        die({"ok": False, "reason": f"cannot read user.reg: {e}"}, EX_FAIL, args.json)
+
+    m = re.search(r'\[Software\\\\Wine\\\\DllOverrides\](.*?)(\n\[|\Z)', reg, re.S)
+    block = m.group(1) if m else ""
+    overrides = {}
+    for star, name, val in re.findall(r'"(\*?)([^"]+)"="([^"]+)"', block):
+        overrides[star + name] = val
+    if not overrides:
+        die({"ok": False, "reason": "no DllOverrides in source prefix"}, EX_FAIL, args.json)
+
+    staged = {"system32": 0, "syswow64": 0}
+    total = 0
+    for scope in ("system32", "syswow64"):
+        srcdir = os.path.join(src, "drive_c", "windows", scope)
+        dstdir = os.path.join(out, "dlls", scope)
+        os.makedirs(dstdir, exist_ok=True)
+        for full, val in overrides.items():
+            if "native" not in val:
+                continue
+            name = full.lstrip("*")
+            dll = name if name.lower().endswith(".dll") else name + ".dll"
+            # Stage the DLL AND its Wine forwarder companion if present. Wine ships
+            # some builtins split as a forwarder (X.dll) + impl (X_orig.dll); staging
+            # only the forwarder breaks it (e.g. ucrtbase.dll -> ucrtbase_orig).
+            for cand in (dll, dll[:-4] + "_orig.dll"):
+                sp = os.path.join(srcdir, cand)
+                if os.path.isfile(sp):
+                    try:
+                        shutil.copyfile(sp, os.path.join(dstdir, cand))
+                        staged[scope] += 1
+                        total += os.path.getsize(sp)
+                    except OSError as e:
+                        log(f"capture {scope}/{cand} failed: {e}")
+
+    with open(os.path.join(out, "overrides.json"), "w") as f:
+        json.dump(overrides, f, indent=2, sort_keys=True)
+
+    # Also capture the font-replacement map (fonts Adobe needs -> Adobe Clean).
+    fm = re.search(r'\[Software\\\\Wine\\\\Fonts\\\\Replacements\](.*?)(\n\[|\Z)', reg, re.S)
+    fonts = dict(re.findall(r'"([^"]+)"="([^"]+)"', fm.group(1))) if fm else {}
+    with open(os.path.join(out, "fonts.json"), "w") as f:
+        json.dump(fonts, f, indent=2, sort_keys=True)
+
+    # Capture the Microsoft Edge WebView2 registered runtime — Adobe's in-app
+    # sign-in (IMS) is a WebView2 web UI and renders BLANK without it (the Adobe
+    # installer ships it UNregistered). Copy the source prefix's registered
+    # EdgeWebView tree into <out>/webview2 so `prefix provision` (register_webview2)
+    # can stage + register it. Large (~550MB) but self-contained, like the DLL set.
+    wv2_src = os.path.join(src, "drive_c", "Program Files (x86)", "Microsoft", "EdgeWebView")
+    wv2_ver = _webview2_version(os.path.join(wv2_src, "Application"))
+    if wv2_ver:
+        try:
+            shutil.copytree(wv2_src, os.path.join(out, "webview2"), dirs_exist_ok=True)
+        except OSError as e:
+            log(f"capture webview2 failed: {e}")
+            wv2_ver = None
+
+    # Capture wine-mono + wine-gecko (version-matched to the runtime) into the bundle
+    # so `prefix provision` (install_mono_gecko) installs them on any machine — else a
+    # runtime-version bump / Adobe's mshtml web content re-prompts the Mono/Gecko
+    # installer. Runtime artifacts, like WebView2; sourced from wherever _resolve_* finds.
+    mono_ver = None
+    msi = _resolve_mono_support_msi()
+    if msi:  # msi = <base>/wine-mono-<ver>/support/winemono-support.msi -> copy the tree
+        try:
+            shutil.copytree(os.path.dirname(os.path.dirname(msi)),
+                            os.path.join(out, "mono", f"wine-mono-{MONO_VERSION}"),
+                            dirs_exist_ok=True)
+            mono_ver = MONO_VERSION
+        except OSError as e:
+            log(f"capture mono failed: {e}")
+    gecko_arches = []
+    for arch in ("x86", "x86_64"):
+        g = _resolve_gecko_tree(arch)
+        if g:
+            try:
+                shutil.copytree(g, os.path.join(out, "gecko", f"wine-gecko-{GECKO_VERSION}-{arch}"),
+                                dirs_exist_ok=True)
+                gecko_arches.append(arch)
+            except OSError as e:
+                log(f"capture gecko {arch} failed: {e}")
+
+    emit({"ok": True, "runtime": out, "source": src, "overrides": len(overrides),
+          "fonts": len(fonts), "webview2": wv2_ver, "mono": mono_ver, "gecko": gecko_arches,
+          "staged": staged, "bytes": total}, args.json)
+    return EX_OK
+
+
+def _download(src, dest, as_json):
+    """Stream `src` (http(s)/file URL or local path) to `dest`. Shows a simple
+    stderr progress line in human mode. Returns bytes written."""
+    import urllib.request
+    if "://" not in src:                     # plain local path
+        shutil.copyfile(src, dest)
+        return os.path.getsize(dest)
+    req = urllib.request.Request(src, headers={"User-Agent": "neutron-cli"})
+    done = 0
+    with urllib.request.urlopen(req) as r, open(dest, "wb") as out:
+        total = int(r.headers.get("Content-Length") or 0)
+        last = -1
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            out.write(chunk)
+            done += len(chunk)
+            if not as_json and total:
+                pct = done * 100 // total
+                if pct != last:
+                    print(f"\r[neutron]   {pct:3d}%  "
+                          f"({done/(1<<20):6.1f}/{total/(1<<20):.1f} MiB)",
+                          end="", file=sys.stderr, flush=True)
+                    last = pct
+    if not as_json and done:
+        print(file=sys.stderr)               # newline after the progress line
+    return done
+
+
+def _safe_extract(tar, path):
+    """Extract `tar` into `path`, refusing any member that escapes it."""
+    try:
+        tar.extractall(path, filter="data")  # Python 3.12+ hardened filter
+        return
+    except TypeError:
+        pass                                 # older Python: validate manually
+    base = os.path.abspath(path)
+    for m in tar.getmembers():
+        target = os.path.abspath(os.path.join(path, m.name))
+        if target != base and not target.startswith(base + os.sep):
+            raise RuntimeError(f"unsafe path in archive: {m.name}")
+    tar.extractall(path)
+
+
+def cmd_runtime_install(args):
+    """Download + verify + unpack a neutron-wine release so `launch` runs the
+    patched, Neutron-owned wine. Resolves the release manifest (download URL +
+    sha256), verifies the tarball against it, and unpacks to
+    ~/.local/share/neutron/runtimes/neutron-wine-<ver>/. Idempotent."""
+    import hashlib, tarfile, tempfile
+    import urllib.error
+
+    version = args.version or NEUTRON_WINE_VERSION
+    repo = args.repo or NEUTRON_WINE_REPO
+    name = f"neutron-wine-{version}"
+    dest_root = NEUTRON_RUNTIMES_DIR
+    install_dir = os.path.join(dest_root, name)
+
+    def _has_wine(d):
+        return (os.path.isfile(os.path.join(d, "bin", "wine"))
+                or os.path.isfile(os.path.join(d, "bin", "wine64")))
+
+    if _has_wine(install_dir) and not args.force:
+        emit({"ok": True, "status": "already-installed", "version": version,
+              "path": install_dir, "wine": os.path.join(install_dir, "bin", "wine")},
+             args.json)
+        return EX_OK
+
+    os.makedirs(dest_root, exist_ok=True)
+    # Work on the target filesystem so the final move is a fast rename and a big
+    # download can't overflow a small /tmp tmpfs.
+    tmp = tempfile.mkdtemp(prefix=".dl-", dir=dest_root)
+    try:
+        # 1. Resolve the manifest (download URL + sha256 live here).
+        manifest_src = args.manifest or (
+            f"https://github.com/{repo}/releases/download/v{version}/{name}.manifest.json")
+        if not args.json:
+            log(f"resolving manifest: {manifest_src}")
+        mpath = os.path.join(tmp, "manifest.json")
+        try:
+            _download(manifest_src, mpath, as_json=True)
+            with open(mpath) as f:
+                manifest = json.load(f)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            die({"ok": False, "reason": f"cannot fetch/parse manifest: {e}",
+                 "manifest": manifest_src,
+                 "hint": f"is release v{version} published on {repo}?"},
+                EX_FAIL, args.json)
+
+        sha_want = manifest.get("sha256")
+        artifact = manifest.get("artifact") or f"{name}.tar.xz"
+        art_url = manifest.get("url") or (
+            f"https://github.com/{repo}/releases/download/v{version}/{artifact}")
+        unpack_root = manifest.get("unpack_root") or name
+        if not sha_want:
+            die({"ok": False, "reason": "manifest has no sha256"}, EX_FAIL, args.json)
+
+        # 2. Download the tarball.
+        if not args.json:
+            size = manifest.get("size_bytes")
+            log(f"downloading {artifact}"
+                + (f" ({size/(1<<20):.1f} MiB)" if isinstance(size, int) else ""))
+        tarball = os.path.join(tmp, artifact)
+        try:
+            _download(art_url, tarball, args.json)
+        except (urllib.error.URLError, OSError) as e:
+            die({"ok": False, "reason": f"download failed: {e}", "url": art_url},
+                EX_FAIL, args.json)
+
+        # 3. Verify the checksum before trusting the archive.
+        h = hashlib.sha256()
+        with open(tarball, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != sha_want:
+            die({"ok": False, "reason": "sha256 mismatch (corrupt or tampered download)",
+                 "expected": sha_want, "got": h.hexdigest()}, EX_FAIL, args.json)
+
+        # 4. Unpack, then swap into place (replacing any prior install).
+        if not args.json:
+            log("verifying + unpacking…")
+        staging = os.path.join(tmp, "unpack")
+        os.makedirs(staging)
+        with tarfile.open(tarball) as tar:
+            _safe_extract(tar, staging)
+        unpacked = os.path.join(staging, unpack_root)
+        if not _has_wine(unpacked):
+            die({"ok": False,
+                 "reason": f"archive root '{unpack_root}' has no bin/wine"},
+                EX_FAIL, args.json)
+        if os.path.isdir(install_dir):
+            shutil.rmtree(install_dir, ignore_errors=True)
+        shutil.move(unpacked, install_dir)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    emit({"ok": True, "status": "installed", "version": version,
+          "path": install_dir, "wine": os.path.join(install_dir, "bin", "wine"),
+          "sha256": sha_want}, args.json)
+    return EX_OK
+
+
+def _stage_and_inject_psdock(prefix, wine, env):
+    """Photoshop dock helper: stage neutron_psdock.dll + the injector into the
+    prefix, then arm the SAME detached inject-waiter scripts/launch-photoshop.sh
+    uses — a backgrounded bash loop that injects once PS is ready (>=150 threads)
+    so File>New docks. Spawned DEVNULL'd + start_new_session so it never holds this
+    CLI's stdout pipe (Collider's run_json reads to EOF) and outlives the CLI.
+    Best-effort; never affects the launch. Set NEUTRON_PSDOCK_DEBUG=1 to log to
+    <prefix>/drive_c/neutron_psdock_inject.log."""
+    import shutil
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # neutron repo root (realpath: neutron is invoked via a ~/.local/bin symlink)
+    dll_src = os.path.join(root, "src", "neutron_psdock.dll")
+    inj_src = os.path.join(root, "src", "neutron_psinject.exe")
+    if not (os.path.isfile(dll_src) and os.path.isfile(inj_src)):
+        log("psdock: helper files missing (src/neutron_psdock.*) - File>New docking inactive")
+        return
+    dll_dst = os.path.join(prefix, "drive_c", "windows", "system32", "neutron_psdock.dll")
+    inj_dst = os.path.join(prefix, "drive_c", "neutron_psinject.exe")
+    try:
+        os.makedirs(os.path.dirname(dll_dst), exist_ok=True)
+        shutil.copyfile(dll_src, dll_dst); os.chmod(dll_dst, 0o755)
+        shutil.copyfile(inj_src, inj_dst); os.chmod(inj_dst, 0o755)
+    except OSError as e:
+        log(f"psdock: staging failed: {e}")
+        return
+
+    # The exact inject-waiter from launch-photoshop.sh, run detached + DEVNULL'd.
+    waiter = (
+        'exec >>"$DBG" 2>&1\n'
+        'echo "[psdock] armed $(date)"\n'
+        'for i in $(seq 1 120); do\n'
+        '  for d in /proc/[0-9]*; do\n'
+        '    cl=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null)\n'
+        '    case "$cl" in *Photoshop.exe*)\n'
+        '      t=$(ls "$d/task" 2>/dev/null | wc -l)\n'
+        '      if [ "$t" -ge 150 ]; then echo "[psdock] PS ready t=$t; injecting"; sleep 3; "$WINE_BIN" "$INJ"; echo "[psdock] injected rc=$?"; exit 0; fi;;\n'
+        '    esac\n'
+        '  done\n'
+        '  sleep 1\n'
+        'done\n'
+        'echo "[psdock] PS never reached ready state"\n'
+    )
+    wenv = dict(env)
+    wenv["WINE_BIN"] = wine
+    wenv["INJ"] = inj_dst
+    wenv["DBG"] = (os.path.join(prefix, "drive_c", "neutron_psdock_inject.log")
+                   if os.environ.get("NEUTRON_PSDOCK_DEBUG") else os.devnull)
+    try:
+        subprocess.Popen(["bash", "-c", waiter], env=wenv,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        log("psdock: dock-inject waiter armed")
+    except Exception as e:
+        log(f"psdock: could not arm waiter: {e}")
+
+
+def cmd_launch(args):
+    """Launch an app through the Neutron stack. Returns the spawned PID.
+    Profile-driven: the per-app exe/env/overrides come from APP_PROFILES so the
+    whole suite launches through this ONE path (Premiere stays byte-identical)."""
+    profile = APP_PROFILES.get(args.app)
+    if not profile:
+        die({"launched": False,
+             "reason": f"unknown app '{args.app}' (known: {', '.join(sorted(APP_PROFILES))})"},
+            EX_FAIL, args.json)
+
+    prefix = resolve_prefix(args.prefix)
+    if not prefix:
+        die({"launched": False, "reason": "invalid prefix"}, EX_BADPREFIX, args.json)
+
+    gpu_mode = "gpu"
+    if args.software:
+        # Honest about the v0 gap: the proven launcher has no software branch.
+        # Faking support would violate the "meaningful exit codes" contract.
+        die({"launched": False, "app": args.app, "gpu_mode": "software",
+             "reason": "software mode not implemented in v0; use --gpu (default)"},
+            EX_DEP, args.json)
+
+    exe = _resolve_app_exe(prefix, profile["exe"])
+    if not os.path.isfile(exe):
+        die({"launched": False, "reason": f"{profile['name']} exe not found: {exe}"},
+            EX_FAIL, args.json)
+
+    wine, is_neutron = resolve_wine()
+    if not wine:
+        die({"launched": False, "reason": "no Neutron wine and no system wine found"},
+            EX_DEP, args.json)
+    if not is_neutron:
+        log("WARNING: using system wine - Neutron patches (frame pacer / winewayland "
+            "fractional-scale) are NOT present; playback/UI fixes will be inactive")
+
+    dxvk_conf = os.path.join(prefix, profile["dxvk_conf"])
+    env = dict(os.environ)
+    env["WINEPREFIX"] = prefix
+    env["DXVK_CONFIG_FILE"] = dxvk_conf
+    if profile["overrides"]:                     # empty => leave unset (match the proven minimal launch)
+        env["WINEDLLOVERRIDES"] = profile["overrides"]
+    if profile.get("nvapi"):
+        env["DXVK_ENABLE_NVAPI"] = "1"
+    for k, v in profile.get("env", {}).items():
+        env[k] = v
+    # GPU-vendor ICD (NVIDIA default; TODO: generalize per detected GPU).
+    if os.path.isfile(NVIDIA_EGL_ICD):
+        env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", NVIDIA_EGL_ICD)
+        env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+
+    # --- Display path: Wayland-native (crisp UI + native-smooth playback) vs
+    #     X11 (software frame pacer). Selected per session; merged here so there
+    #     is ONE launch path (no redundant launcher script). ---
+    if session_is_wayland():
+        display_mode = "wayland"
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "wayland")
+        # auto-DPI: LogPixels = round(96 * scale) so System-DPI-aware Adobe apps
+        # render at device resolution; the wp_fractional_scale patch maps it 1:1.
+        scale = args.scale if getattr(args, "scale", None) else detect_scale()
+        logpixels = round(96 * scale) if (scale and scale > 0) else None
+        if logpixels:
+            reg_set(wine, prefix, r"HKCU\Control Panel\Desktop", "LogPixels",
+                    "REG_DWORD", str(logpixels))
+        ensure_dxvk_gpl(dxvk_conf)          # winevulkan GPL marshalling workaround
+        env.pop("DISPLAY", None)
+        env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        log(f"display: wayland | scale={scale} LogPixels={logpixels}")
+    else:
+        display_mode = "x11"
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "x11")
+        env["NEUTRON_PRESENT_PACE"] = "1"   # X11 software frame pacer
+        env.setdefault("DISPLAY", ":0")
+        log("display: x11 | software frame pacer (NEUTRON_PRESENT_PACE=1)")
+
+    # A file to open: the --project flag (Collider passes a Windows path) or an
+    # optional positional (a .desktop file association passes a Linux %f path).
+    project = args.project or getattr(args, "project_file", None)
+    if project and project.startswith("/"):
+        # Linux path -> Windows path. Wine maps Z:\ to the filesystem root, so an
+        # absolute Linux path becomes Z:\... — Adobe apps need a Windows-style path.
+        project = "Z:" + project.replace("/", "\\")
+
+    # Start the app's Adobe background services (ADS/IPCBroker) first, if any, and
+    # give them a moment to bind their RPC before the app connects.
+    if profile.get("daemons"):
+        if _start_adobe_daemons(prefix, wine, env, profile["daemons"]):
+            import time as _t
+            _t.sleep(4)
+
+    cmd = [wine, exe]
+    if project:
+        cmd.append(project)
+
+    log(f"launching: {profile['name']} -> {wine} {exe} {project or ''}")
+    try:
+        # Detach so Collider supervises via PID, not via this process.
+        proc = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.DEVNULL if args.json else None,
+            stderr=subprocess.DEVNULL if args.json else None,
+            start_new_session=True,
+        )
+    except Exception as e:
+        die({"launched": False, "reason": f"spawn failed: {e}"}, EX_FAIL, args.json)
+
+    # Brief liveness check: if Premiere dies instantly (bad env, missing DLL),
+    # report that rather than a misleading "launched: true".
+    import time
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        die({"launched": False, "pid": proc.pid,
+             "reason": f"process exited immediately (code {proc.returncode})"},
+            EX_FAIL, args.json)
+
+    # Post-launch hook: Photoshop's dock-helper inject (File>New docks the workspace).
+    if profile.get("post_launch") == "psdock":
+        _stage_and_inject_psdock(prefix, wine, env)
+
+    emit({"ok": True, "launched": True, "app": args.app,
+          "pid": proc.pid, "gpu_mode": gpu_mode, "display": display_mode,
+          "neutron_wine": is_neutron}, args.json)
+    return EX_OK
+
+
+def _app_version(exe_rel):
+    """Pull the release year (e.g. "2025") from the app's path as a lightweight
+    version label — no PE version-resource parsing needed."""
+    for part in exe_rel.replace("\\", "/").split("/"):
+        for tok in part.split():
+            if len(tok) == 4 and tok.isdigit() and tok.startswith("20"):
+                return tok
+    return ""
+
+
+def _app_icon(exe):
+    """Extract the app's REAL logo as a PNG `data:` URI, cached under
+    ~/.cache/collider/appicons. The main app icon is the LOWEST-ID group icon
+    (type 14) — verified true for every Adobe app (Ps/Pr/Ae/Ai/An/LrC/Me). Needs
+    icoutils (wrestool + icotool); returns None if absent or extraction fails ->
+    the UI falls back to the monogram badge."""
+    import base64, glob, tempfile, hashlib, re as _re, shutil as _sh
+    if not (_sh.which("wrestool") and _sh.which("icotool")):
+        return None
+    try:
+        cache_dir = os.path.join(HOME, ".cache", "collider", "appicons")
+        os.makedirs(cache_dir, exist_ok=True)
+        # cache key includes an extraction-scheme tag so a logic change invalidates old caches
+        cached = os.path.join(cache_dir, hashlib.sha1((exe + "|lowid-v1").encode()).hexdigest()[:16] + ".png")
+        if not (os.path.isfile(cached) and os.path.getmtime(cached) >= os.path.getmtime(exe)):
+            listing = subprocess.run(["wrestool", "-l", exe], capture_output=True,
+                                     text=True, timeout=30).stdout
+            ids = sorted(int(m) for ln in listing.splitlines() if "--type=14 " in ln
+                         for m in _re.findall(r"--name=(\d+)", ln))
+            if not ids:
+                return None
+            with tempfile.TemporaryDirectory() as td:
+                ico = os.path.join(td, "app.ico")
+                r = subprocess.run(["wrestool", "-x", "-t", "14", "--name", str(ids[0]), "-o", ico, exe],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                if r.returncode != 0 or not os.path.isfile(ico):
+                    return None
+                subprocess.run(["icotool", "-x", "-o", td, ico],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                pngs = glob.glob(os.path.join(td, "*.png"))
+                if not pngs:
+                    return None
+                def area(p):   # icotool names files ..._<idx>_<W>x<H>x<depth>.png
+                    try:
+                        wh = os.path.basename(p).rsplit("_", 1)[-1].split("x")
+                        return int(wh[0]) * int(wh[1])
+                    except Exception:
+                        return 0
+                _sh.copyfile(max(pngs, key=area), cached)
+        with open(cached, "rb") as f:
+            return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+    except Exception:
+        return None
+
+
+def cmd_apps(args):
+    """List the Adobe apps Neutron can launch + their install status in a prefix.
+    Powers Collider's app catalog (one tinted widget per installed app). Never
+    launches anything — pure detection (scan the prefix for each profile's exe)."""
+    prefix = resolve_prefix(args.prefix) or args.prefix
+    apps = []
+    for app_id, p in APP_PROFILES.items():
+        exe = _resolve_app_exe(prefix, p["exe"]) if prefix else ""
+        installed = bool(exe) and os.path.isfile(exe)
+        apps.append({
+            "id": app_id,
+            "name": p["name"],
+            "accent": p["accent"],
+            "version": _app_version(exe) if installed else _app_version(p["exe"]),
+            "export": p.get("export", False),
+            "installed": installed,
+            "exe": exe,
+            "icon": _app_icon(exe) if installed else None,   # real logo (lowest-ID group); None -> monogram
+        })
+    # Installed first, then alphabetical — a stable order for the widget grid.
+    apps.sort(key=lambda a: (not a["installed"], a["name"]))
+    emit({"ok": True, "apps": apps}, args.json)
+    return EX_OK
+
+
+def cmd_doctor(args):
+    """Health check. Powers Collider's prefix-health status surface.
+
+    NOTE: schema PROVISIONAL (v0-unstable), same ordering caveat as prefix info.
+    """
+    checks = []
+
+    def check(name, ok, detail=None):
+        c = {"name": name, "ok": bool(ok)}
+        if detail:
+            c["detail"] = detail
+        checks.append(c)
+
+    check("wine", have("wine"))
+    check("ffmpeg", have("ffmpeg"))
+    check("inotify-tools", have("inotifywait"))
+    check("exiftool", have("exiftool"))      # only needed for embed/both metadata
+    check("hwmux-script", os.path.isfile(HWMUX_SCRIPT), HWMUX_SCRIPT)
+
+    if args.prefix:
+        prefix = resolve_prefix(args.prefix)
+        if not prefix:
+            check("prefix", False, "drive_c not found")
+        else:
+            user = prefix_user(prefix)
+            check("prefix", True, prefix)
+            # App-agnostic health: a prefix is usable if ANY known Adobe app is
+            # installed (not Premiere specifically) — else a Photoshop-only prefix
+            # would read as "unhealthy" and gate the whole UI.
+            installed = [p["name"] for p in APP_PROFILES.values()
+                         if os.path.isfile(_resolve_app_exe(prefix, p["exe"]))]
+            check("adobe-app", bool(installed),
+                  ", ".join(installed) if installed else "no known Adobe app found")
+            # Premiere-only checks (Debug Database display fix) apply ONLY when
+            # Premiere is installed; they must not fail a Photoshop/other prefix.
+            if os.path.isfile(os.path.join(prefix, PREMIERE_SUBPATH)):
+                dbg = find_debug_database(prefix, user) if user else None
+                check("debug-database", bool(dbg), dbg)
+                applied = False
+                if dbg and os.path.isfile(dbg):
+                    try:
+                        with open(dbg, "r", encoding="utf-8", errors="replace") as f:
+                            applied = _display_fix_is_on(f.read())
+                    except OSError:
+                        applied = False
+                check("display_fix", applied)
+
+    healthy = all(c["ok"] for c in checks
+                  if c["name"] not in ("exiftool",))  # exiftool is optional
+    emit({"ok": True, "healthy": healthy, "checks": checks,
+          "_schema": "provisional-v0"}, args.json)
+    return EX_OK if healthy else EX_FAIL
+
+
+def cmd_hwmux_start(args):
+    """Supervise the hwmux daemon. Neutron owns the script; this tracks its PID."""
+    if not os.path.isfile(HWMUX_SCRIPT):
+        die({"started": False, "reason": f"hwmux script not found: {HWMUX_SCRIPT}"},
+            EX_DEP, args.json)
+    if not have("inotifywait"):
+        die({"started": False, "reason": "inotify-tools missing"}, EX_DEP, args.json)
+    if not have("ffmpeg"):
+        die({"started": False, "reason": "ffmpeg missing"}, EX_DEP, args.json)
+
+    # If already running, report it (idempotent-ish supervision).
+    if os.path.isfile(HWMUX_PIDFILE):
+        try:
+            with open(HWMUX_PIDFILE) as f:
+                old = int(f.read().strip())
+            os.kill(old, 0)  # raises if dead
+            emit({"ok": True, "started": False, "already_running": True,
+                  "pid": old, "watch": args.watch}, args.json)
+            return EX_OK
+        except (OSError, ValueError):
+            pass  # stale pidfile; fall through and start fresh
+
+    if not args.watch or not os.path.isdir(args.watch):
+        die({"started": False,
+             "reason": f"watch dir invalid: {args.watch} "
+                       "(Collider passes documents_real from prefix info)"},
+            EX_FAIL, args.json)
+
+    cmd = ["bash", HWMUX_SCRIPT, "--dir", args.watch]
+    if args.metadata:
+        cmd += ["--metadata", args.metadata]
+    if args.fps:
+        cmd += ["--fps", args.fps]
+
+    log(f"starting hwmux: {' '.join(cmd)}")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL if args.json else None,
+            stderr=subprocess.DEVNULL if args.json else None,
+            start_new_session=True,
+        )
+    except Exception as e:
+        die({"started": False, "reason": f"spawn failed: {e}"}, EX_FAIL, args.json)
+
+    try:
+        with open(HWMUX_PIDFILE, "w") as f:
+            f.write(str(proc.pid))
+    except OSError:
+        log("warning: could not write pidfile; stop will need the PID manually")
+
+    emit({"ok": True, "started": True, "pid": proc.pid,
+          "watch": args.watch, "metadata": args.metadata or "keep"}, args.json)
+    return EX_OK
+
+
+def cmd_hwmux_stop(args):
+    """Stop the supervised hwmux daemon."""
+    pid = None
+    if os.path.isfile(HWMUX_PIDFILE):
+        try:
+            with open(HWMUX_PIDFILE) as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            pid = None
+
+    if pid is None:
+        emit({"ok": True, "stopped": False, "reason": "no tracked hwmux pid"},
+             args.json)
+        return EX_OK
+
+    import signal
+    try:
+        # Kill the whole process group (script + sweeper + inotifywait).
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        stopped = True
+    except ProcessLookupError:
+        stopped = False
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped = True
+        except OSError:
+            stopped = False
+
+    try:
+        os.remove(HWMUX_PIDFILE)
+    except OSError:
+        pass
+
+    emit({"ok": True, "stopped": stopped, "pid": pid}, args.json)
+    return EX_OK
+
+
+# --- argument plumbing -----------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="neutron",
+        description="Neutron CLI — the engine front door Collider drives.",
+    )
+    p.add_argument("--json", action="store_true",
+                   help="structured JSON to stdout (Collider mode)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # prefix
+    pp = sub.add_parser("prefix", help="prefix inspection / provisioning")
+    psub = pp.add_subparsers(dest="subcmd", required=True)
+
+    pi = psub.add_parser("info", help="report paths Collider needs")
+    pi.add_argument("path", nargs="?", default=DEFAULT_PREFIX)
+    pi.set_defaults(func=cmd_prefix_info)
+
+    pa = psub.add_parser("apply-display-fix",
+                         help="write DS.DisableDirectXDisplay=true (idempotent)")
+    pa.add_argument("path", nargs="?", default=DEFAULT_PREFIX)
+    pa.set_defaults(func=cmd_apply_display_fix)
+
+    pv = psub.add_parser("provision",
+                         help="make a staged prefix Neutron-ready (idempotent)")
+    pv.add_argument("path", nargs="?", default=DEFAULT_PREFIX)
+    pv.set_defaults(func=cmd_prefix_provision)
+
+    # launch
+    pl = sub.add_parser("launch", help="launch an app through the Neutron stack")
+    pl.add_argument("app", help="app to launch (" + ", ".join(APP_PROFILES) + ")")
+    pl.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pl.add_argument("--project", default=None,
+                    help="optional project path (Windows-style, e.g. C:\\...\\x.prproj)")
+    pl.add_argument("project_file", nargs="?", default=None,
+                    help="optional file to open, e.g. from a .desktop file association "
+                         "(a Linux path is translated to a Windows Z:\\ path)")
+    pl.add_argument("--scale", type=float, default=None,
+                    help="display scale (e.g. 1.7); on Wayland Neutron sets "
+                         "LogPixels=round(96*scale). Collider passes this; else auto-detect.")
+    grp = pl.add_mutually_exclusive_group()
+    grp.add_argument("--gpu", action="store_true", help="GPU/Mercury (default)")
+    grp.add_argument("--software", action="store_true",
+                     help="software render (NOT implemented in v0)")
+    pl.set_defaults(func=cmd_launch)
+
+    # apps: catalog + install status for Collider's per-app widgets
+    pap = sub.add_parser("apps", help="list apps + install status in a prefix")
+    pap.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pap.set_defaults(func=cmd_apps)
+
+    # doctor
+    pd = sub.add_parser("doctor", help="health check")
+    pd.add_argument("--prefix", default=None)
+    pd.set_defaults(func=cmd_doctor)
+
+    # hwmux
+    ph = sub.add_parser("hwmux", help="supervise the hardware-export daemon")
+    hsub = ph.add_subparsers(dest="subcmd", required=True)
+
+    hs = hsub.add_parser("start", help="start the hwmux daemon")
+    hs.add_argument("--watch", required=True,
+                    help="watch dir (Collider passes documents_real)")
+    hs.add_argument("--metadata", default=None,
+                    choices=["keep", "embed", "both", "strip"])
+    hs.add_argument("--fps", default=None, help="override fps (e.g. 24000/1001)")
+    hs.set_defaults(func=cmd_hwmux_start)
+
+    ht = hsub.add_parser("stop", help="stop the hwmux daemon")
+    ht.set_defaults(func=cmd_hwmux_stop)
+
+    # runtime: build/refresh the DLL bundle that provision stages
+    prt = sub.add_parser("runtime", help="Neutron runtime DLL bundle")
+    rsub = prt.add_subparsers(dest="subcmd", required=True)
+    rc = rsub.add_parser("capture",
+                         help="build the DLL bundle from a proven prefix")
+    rc.add_argument("--from", dest="from_prefix", default=DEFAULT_PREFIX,
+                    help="source prefix to capture from")
+    rc.add_argument("--out", default=None,
+                    help="bundle output dir (default ~/neutron/runtime)")
+    rc.set_defaults(func=cmd_runtime_capture)
+
+    ri = rsub.add_parser("install",
+                         help="download + verify + unpack a neutron-wine release")
+    ri.add_argument("--version", default=None,
+                    help=f"release version (default: {NEUTRON_WINE_VERSION})")
+    ri.add_argument("--repo", default=None,
+                    help=f"GitHub owner/repo (default: {NEUTRON_WINE_REPO})")
+    ri.add_argument("--manifest", default=None,
+                    help="manifest URL or local path (overrides --version/--repo)")
+    ri.add_argument("--force", action="store_true",
+                    help="reinstall even if this version is already present")
+    ri.set_defaults(func=cmd_runtime_install)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_FAIL
+
+
+if __name__ == "__main__":
+    sys.exit(main())
