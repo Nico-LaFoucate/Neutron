@@ -308,7 +308,7 @@ APP_PROFILES = {
         "env": {"NEUTRON_DISABLE_BTW": "1"},
         "accent": "#31a8ff", "export": False,
         "daemons": ADOBE_DAEMONS,                # ADS + IPCBroker (PS NGL/RPC deps)
-        "post_launch": "psdock",                 # dock-helper inject (File>New docks the workspace)
+        "post_launch": None,                     # psdock DEPRECATED: PS2025-era app-side dock hack, superseded by the win32u Wine-level dock fix (OPEN_ISSUES P3). Its ~50-nudges/10s doc-create jitter hammer = the "shake on new doc" regression (OPEN_ISSUES PS2026 line 66). win32u docks the canvas natively without it.
     },
     "lightroom": {
         "name": "Lightroom Classic",
