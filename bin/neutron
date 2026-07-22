@@ -1030,6 +1030,52 @@ def cmd_apply_display_fix(args):
     return EX_OK
 
 
+def _win_path(prefix, abspath):
+    """Convert an absolute host path under <prefix>/drive_c to its Windows form
+    (C:\\...). Returns None if abspath isn't under the prefix's C: drive."""
+    dc = os.path.join(prefix, "drive_c") + os.sep
+    ap = os.path.abspath(abspath)
+    if not ap.startswith(dc):
+        return None
+    return "C:\\" + ap[len(dc):].replace("/", "\\")
+
+
+def provision_photoshop_detection(wine, prefix):
+    """Register the Uninstall key Lightroom Classic's PS detector requires.
+
+    LrC's scanner (in ui.dll) does a WHOLE-STRING std::regex_match of
+    each HKLM\\...\\Uninstall SUBKEY NAME against `(PHSP|PHSPBETA)[0-9_]+`, then
+    checks that subkey's InstallLocation + DisplayName + <InstallLocation>\\
+    Photoshop.exe exist. The key name MUST be dot-free (a '.' is not in [0-9_],
+    so `PHSP26.0` fails whole-string match — the bug that greyed Edit-In → PS).
+    We name it `PHSP<major>` (major = year-1999, e.g. PS 2025 -> PHSP26) and write
+    it into BOTH registry views (the detector opens with KEY_WOW64_32KEY, but be
+    robust). No-op when no Photoshop is installed in the prefix.
+    Returns a status dict (or None if PS absent)."""
+    import re
+    exe = _resolve_app_exe(prefix, _adobe("Adobe Photoshop 2025", "Photoshop.exe"))
+    if not (exe and os.path.isfile(exe)):
+        return None
+    install_dir = os.path.dirname(exe)
+    win_loc = _win_path(prefix, install_dir)
+    if not win_loc:
+        return {"ok": False, "reason": "PS install not under drive_c"}
+    yrs = re.findall(r'(?:19|20)\d{2}', install_dir)
+    year = max((int(y) for y in yrs), default=0)
+    if not year:
+        return {"ok": False, "reason": "no year in PS install path"}
+    major = year - 1999                       # 2025 -> 26, 2026 -> 27
+    keyname = "PHSP%d" % major                 # dot-free: matches (PHSP|PHSPBETA)[0-9_]+
+    display = "Adobe Photoshop %d" % year
+    for view in (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                 r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+        base = "%s\\%s" % (view, keyname)
+        reg_set(wine, prefix, base, "InstallLocation", "REG_SZ", win_loc)
+        reg_set(wine, prefix, base, "DisplayName", "REG_SZ", display)   # required or the scan drops the record
+        reg_set(wine, prefix, base, "DisplayVersion", "REG_SZ", "%d.0" % major)
+    return {"ok": True, "key": keyname, "display": display, "install_location": win_loc}
+
+
 def cmd_prefix_provision(args):
     """Make a (possibly freshly-staged) prefix Neutron-ready. Idempotent. This is
     the single source of truth for the provisioning recipe — Mud Hut calls it
@@ -1091,6 +1137,14 @@ def cmd_prefix_provision(args):
     reg_set(wine, prefix, r"HKCU\Software\Wine\AppDefaults\Photoshop.exe",
             "Version", "REG_SZ", "win10")
     steps.append({"step": "ps_caption_win10", "ok": True})
+
+    # 2c. Lightroom Classic's "Edit in Photoshop" detector: register the dot-free
+    # PHSP<major> Uninstall key so LrC's whole-string regex_match finds PS (see
+    # provision_photoshop_detection + memory neutron-lrc-editin-photoshop). No-op
+    # when no Photoshop is installed in this prefix.
+    ps_detect = provision_photoshop_detection(wine, prefix)
+    if ps_detect is not None:
+        steps.append({"step": "lrc_ps_detection", **ps_detect})
 
     runtime = resolve_runtime()
     if runtime:
