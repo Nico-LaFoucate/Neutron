@@ -3,7 +3,7 @@
 #
 # The stable surface Collider drives. Structured --json on every command,
 # meaningful exit codes, no interactivity. Internals wrap the proven hand-driven
-# stack (the `premiere` launcher, collider-hwmux.sh, the Debug Database pref);
+# stack (the `premiere` launcher, the Debug Database pref);
 # the contract is the part that stays stable while internals evolve.
 #
 # Implement in the Neutron repo (LGPL v2.1). See docs/NEUTRON_CLI_CONTRACT.md.
@@ -40,6 +40,10 @@ EX_DEP = 4
 
 HOME = os.path.expanduser("~")
 DEFAULT_PREFIX = os.path.join(HOME, ".premiere2025")
+
+# This repo's root (bin/neutron -> ..) — used to find checked-in reproducible sources
+# like scripts/ucrtshim/ that capture builds into the runtime bundle.
+NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The proven launcher env (from ~/.local/bin/premiere). Single source of truth.
 PREMIERE_SUBPATH = os.path.join(
@@ -141,16 +145,6 @@ GECKO_CANDIDATES = [
 # create-infos under winewayland.drv -> disable that DXVK feature.
 DXVK_GPL_LINE = "dxvk.enableGraphicsPipelineLibrary = False"
 
-# The hwmux daemon Neutron owns. Override with NEUTRON_HWMUX env if relocated.
-HWMUX_SCRIPT = os.environ.get(
-    "NEUTRON_HWMUX", os.path.join(HOME, "Downloads", "collider-hwmux.sh")
-)
-
-# Where neutron stashes the supervised hwmux PID so `hwmux stop` can find it.
-HWMUX_PIDFILE = os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "neutron-hwmux.pid"
-)
-
 # The display-fix preference line. Premiere uses true/false (NOT 1/0) — verified
 # against the live, working Debug Database. The proven line is:
 #   DS.DisableDirectXDisplay<TAB>true<TAB>false
@@ -204,7 +198,7 @@ PROVISION_DXVK_CONF = (
 #   - nvapi: export DXVK_ENABLE_NVAPI=1 (real-NVIDIA reporting).
 #   - env: extra environment (e.g. Photoshop's GPU-present BTW gate).
 #   - accent: brand tint for the Collider app widget.
-#   - export: has a hardware-export pipeline (Collider runs the hwmux daemon).
+#   - export: produces video output (native HW-export muxing).
 def _adobe(*parts):
     return os.path.join("drive_c", "Program Files", "Adobe", *parts)
 
@@ -345,7 +339,7 @@ APP_PROFILES = {
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
         "nvapi": False, "env": {},
-        "accent": "#9999ff", "export": True,   # Render Queue outputs video → hwmux muxer
+        "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
     "illustrator": {
         "name": "Illustrator",
@@ -427,7 +421,7 @@ def prefix_user(prefix):
 def documents_paths(prefix, user):
     """Return (symlink_path, real_path) for the in-prefix Documents dir.
 
-    real_path is the symlink-resolved target — the canonical hwmux watch dir.
+    real_path is the symlink-resolved target — the canonical real Documents dir.
     This encodes the symlink lesson so Collider never computes paths itself.
     """
     link = os.path.join(prefix, "drive_c", "users", user, "Documents")
@@ -924,7 +918,7 @@ def cmd_prefix_info(args):
         "drive_c": os.path.join(prefix, "drive_c"),
         "user": user,
         "documents_symlink": link,
-        "documents_real": real,          # <- the hwmux watch target
+        "documents_real": real,          # <- symlink-resolved real Documents dir
         "debug_database": dbg,
         "display_fix_applied": display_fix_applied,
         "neutron_stack": _stack_versions(),  # best-effort, provisional
@@ -1255,6 +1249,36 @@ def cmd_prefix_provision(args):
     return EX_OK
 
 
+def _build_ucrtshim(orig_path, out_path):
+    """(Re)build the 64-bit ucrtbase FH4 + "\\?\"-strip proxy from MS's real UCRT
+    (`ucrtbase_orig.dll`) using the checked-in reproducible source in
+    scripts/ucrtshim/ (see stub.c + memory neutron-native-muxing-idea / collider_notes
+    §3). Capturing the proxy as an opaque binary would freeze whatever fixes the source
+    prefix happened to have; building from source guarantees both the FH4 forwarder and
+    the _wstat64 "\\?\"-strip (Premiere native-muxing fix). Returns True on success. On
+    failure (e.g. mingw-w64 absent) logs a warning and LEAVES whatever ucrtbase.dll the
+    copy loop already staged, so capture still yields a working — if not freshly built —
+    bundle."""
+    builder = os.path.join(NEUTRON_REPO, "scripts", "ucrtshim", "build.sh")
+    if not os.path.isfile(builder):
+        log(f"ucrtshim: builder missing ({builder}); keeping captured ucrtbase.dll")
+        return False
+    try:
+        r = subprocess.run(["bash", builder, orig_path, out_path],
+                           capture_output=True, text=True)
+    except OSError as e:
+        log(f"ucrtshim: build could not start ({e}); keeping captured ucrtbase.dll")
+        return False
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        log(f"ucrtshim: build failed (rc={r.returncode}: "
+            f"{detail[-1] if detail else 'no output'}); keeping captured ucrtbase.dll")
+        return False
+    out = (r.stdout or "").strip().splitlines()
+    log(f"ucrtshim: {out[-1] if out else 'rebuilt ucrtbase.dll from source'}")
+    return True
+
+
 def cmd_runtime_capture(args):
     """Build/refresh the Neutron runtime DLL bundle from a proven prefix. Reads
     the source prefix's DllOverrides, writes the full override manifest, and
@@ -1304,6 +1328,15 @@ def cmd_runtime_capture(args):
                         total += os.path.getsize(sp)
                     except OSError as e:
                         log(f"capture {scope}/{cand} failed: {e}")
+
+    # Rebuild the 64-bit ucrtbase proxy from source rather than shipping the opaquely
+    # captured one, so the bundle always carries BOTH the __CxxFrameHandler4 forwarder and
+    # the _wstat64 "\\?\"-strip (Premiere native-muxing fix). 64-bit only — the FH4 proxy
+    # and the MainConcept muxer are 64-bit; syswow64 ships MS's real ucrtbase untouched.
+    shim_out = None
+    _shim_orig = os.path.join(out, "dlls", "system32", "ucrtbase_orig.dll")
+    if os.path.isfile(_shim_orig):
+        shim_out = _build_ucrtshim(_shim_orig, os.path.join(out, "dlls", "system32", "ucrtbase.dll"))
 
     with open(os.path.join(out, "overrides.json"), "w") as f:
         json.dump(overrides, f, indent=2, sort_keys=True)
@@ -1355,7 +1388,7 @@ def cmd_runtime_capture(args):
 
     emit({"ok": True, "runtime": out, "source": src, "overrides": len(overrides),
           "fonts": len(fonts), "webview2": wv2_ver, "mono": mono_ver, "gecko": gecko_arches,
-          "staged": staged, "bytes": total}, args.json)
+          "staged": staged, "bytes": total, "ucrtshim": shim_out}, args.json)
     return EX_OK
 
 
@@ -1772,10 +1805,6 @@ def cmd_doctor(args):
         checks.append(c)
 
     check("wine", have("wine"))
-    check("ffmpeg", have("ffmpeg"))
-    check("inotify-tools", have("inotifywait"))
-    check("exiftool", have("exiftool"))      # only needed for embed/both metadata
-    check("hwmux-script", os.path.isfile(HWMUX_SCRIPT), HWMUX_SCRIPT)
 
     if args.prefix:
         prefix = resolve_prefix(args.prefix)
@@ -1810,100 +1839,6 @@ def cmd_doctor(args):
     emit({"ok": True, "healthy": healthy, "checks": checks,
           "_schema": "provisional-v0"}, args.json)
     return EX_OK if healthy else EX_FAIL
-
-
-def cmd_hwmux_start(args):
-    """Supervise the hwmux daemon. Neutron owns the script; this tracks its PID."""
-    if not os.path.isfile(HWMUX_SCRIPT):
-        die({"started": False, "reason": f"hwmux script not found: {HWMUX_SCRIPT}"},
-            EX_DEP, args.json)
-    if not have("inotifywait"):
-        die({"started": False, "reason": "inotify-tools missing"}, EX_DEP, args.json)
-    if not have("ffmpeg"):
-        die({"started": False, "reason": "ffmpeg missing"}, EX_DEP, args.json)
-
-    # If already running, report it (idempotent-ish supervision).
-    if os.path.isfile(HWMUX_PIDFILE):
-        try:
-            with open(HWMUX_PIDFILE) as f:
-                old = int(f.read().strip())
-            os.kill(old, 0)  # raises if dead
-            emit({"ok": True, "started": False, "already_running": True,
-                  "pid": old, "watch": args.watch}, args.json)
-            return EX_OK
-        except (OSError, ValueError):
-            pass  # stale pidfile; fall through and start fresh
-
-    if not args.watch or not os.path.isdir(args.watch):
-        die({"started": False,
-             "reason": f"watch dir invalid: {args.watch} "
-                       "(Collider passes documents_real from prefix info)"},
-            EX_FAIL, args.json)
-
-    cmd = ["bash", HWMUX_SCRIPT, "--dir", args.watch]
-    if args.metadata:
-        cmd += ["--metadata", args.metadata]
-    if args.fps:
-        cmd += ["--fps", args.fps]
-
-    log(f"starting hwmux: {' '.join(cmd)}")
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL if args.json else None,
-            stderr=subprocess.DEVNULL if args.json else None,
-            start_new_session=True,
-        )
-    except Exception as e:
-        die({"started": False, "reason": f"spawn failed: {e}"}, EX_FAIL, args.json)
-
-    try:
-        with open(HWMUX_PIDFILE, "w") as f:
-            f.write(str(proc.pid))
-    except OSError:
-        log("warning: could not write pidfile; stop will need the PID manually")
-
-    emit({"ok": True, "started": True, "pid": proc.pid,
-          "watch": args.watch, "metadata": args.metadata or "keep"}, args.json)
-    return EX_OK
-
-
-def cmd_hwmux_stop(args):
-    """Stop the supervised hwmux daemon."""
-    pid = None
-    if os.path.isfile(HWMUX_PIDFILE):
-        try:
-            with open(HWMUX_PIDFILE) as f:
-                pid = int(f.read().strip())
-        except (OSError, ValueError):
-            pid = None
-
-    if pid is None:
-        emit({"ok": True, "stopped": False, "reason": "no tracked hwmux pid"},
-             args.json)
-        return EX_OK
-
-    import signal
-    try:
-        # Kill the whole process group (script + sweeper + inotifywait).
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-        stopped = True
-    except ProcessLookupError:
-        stopped = False
-    except OSError:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            stopped = True
-        except OSError:
-            stopped = False
-
-    try:
-        os.remove(HWMUX_PIDFILE)
-    except OSError:
-        pass
-
-    emit({"ok": True, "stopped": stopped, "pid": pid}, args.json)
-    return EX_OK
 
 
 # --- argument plumbing -----------------------------------------------------
@@ -1962,21 +1897,6 @@ def build_parser():
     pd = sub.add_parser("doctor", help="health check")
     pd.add_argument("--prefix", default=None)
     pd.set_defaults(func=cmd_doctor)
-
-    # hwmux
-    ph = sub.add_parser("hwmux", help="supervise the hardware-export daemon")
-    hsub = ph.add_subparsers(dest="subcmd", required=True)
-
-    hs = hsub.add_parser("start", help="start the hwmux daemon")
-    hs.add_argument("--watch", required=True,
-                    help="watch dir (Collider passes documents_real)")
-    hs.add_argument("--metadata", default=None,
-                    choices=["keep", "embed", "both", "strip"])
-    hs.add_argument("--fps", default=None, help="override fps (e.g. 24000/1001)")
-    hs.set_defaults(func=cmd_hwmux_start)
-
-    ht = hsub.add_parser("stop", help="stop the hwmux daemon")
-    ht.set_defaults(func=cmd_hwmux_stop)
 
     # runtime: build/refresh the DLL bundle that provision stages
     prt = sub.add_parser("runtime", help="Neutron runtime DLL bundle")
