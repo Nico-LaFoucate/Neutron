@@ -336,9 +336,16 @@ APP_PROFILES = {
     "aftereffects": {
         "name": "After Effects",
         "exe": _adobe("Adobe After Effects 2025", "Support Files", "AfterFX.exe"),
-        "dxvk_conf": "neutron-apps-dxvk.conf",
+        # 2026-07-31: AE was on the shared conf, which leaves DXVK's default in place --
+        # hide the real GPU and report an AMD Radeon (measured: "Hiding actual GPU,
+        # reporting vendor 0x1002" while creating a device on an RTX 5070). We ship
+        # dxvk-nvapi and Premiere has always reported the real GPU; AE doing otherwise was
+        # an oversight, not a decision. Its own conf reports the true NVIDIA GPU, paired
+        # with nvapi=True (reporting NVIDIA while withholding NVAPI is the worst case).
+        # See ~/.premiere2025/neutron-ae-dxvk.conf for the full rationale + revert steps.
+        "dxvk_conf": "neutron-ae-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
-        "nvapi": False, "env": {},
+        "nvapi": True, "env": {},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
     "illustrator": {
