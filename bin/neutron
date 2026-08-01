@@ -344,7 +344,17 @@ APP_PROFILES = {
         # with nvapi=True (reporting NVIDIA while withholding NVAPI is the worst case).
         # See ~/.premiere2025/neutron-ae-dxvk.conf for the full rationale + revert steps.
         "dxvk_conf": "neutron-ae-dxvk.conf",
-        "overrides": "ucrtbase=n,b;dwrite=b",
+        # nvapi64=n added 2026-07-31. A +loaddll capture compared against the Windows
+        # reference showed AE's module set matches natively in almost every respect
+        # (DisplaySurface, GPUFoundation, dvaui, aedisplay, nvcuda all loaded; glbinding
+        # correctly absent) EXCEPT that nvapi64.dll never loads here and does on Windows.
+        # The prefix's nvapi64.dll is the real dxvk-nvapi (symlink into nvidia-libs), but
+        # without a native DLL override Wine keeps its own builtin, so DXVK_ENABLE_NVAPI=1
+        # was inert. Lightroom has carried this override for a while; AE lacking it was an
+        # oversight. NVAPI is how NVIDIA-specific capabilities get queried, which is a
+        # plausible gate on AE's D3D<->GL interop path (its comp viewer resolves all 8
+        # WGL_NV_DX_interop entry points but never calls them).
+        "overrides": "ucrtbase=n,b;dwrite=b;nvapi64=n",
         "nvapi": True, "env": {},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
