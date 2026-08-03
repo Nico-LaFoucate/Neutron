@@ -270,7 +270,34 @@ APP_PROFILES = {
         "exe": PREMIERE_SUBPATH,
         "dxvk_conf": DXVK_CONF_SUBPATH,
         "overrides": WINEDLLOVERRIDES,           # "ucrtbase=n,b;dwrite=b"
-        "nvapi": False, "env": {},
+        # ⭐ 2026-08-03 — GPU-ACCELERATED UI MODE, PRODUCTIONISED (was ~/premiere-gpu-mode.sh).
+        # The prefix has MZ.Prefs.UseGpuAcceleration=true, and GPU mode WITHOUT this env blacks
+        # the ENTIRE interface -- so a plain `neutron launch premiere` rendered black all morning
+        # while we hunted a regression that did not exist. Premiere's UI drawbot is the D2D/GPU
+        # one; these six are what make its output reach the screen:
+        #   NEUTRON_D2D_DCDIRECT   -- D2D HwndRenderTargets render into the window's GDI paint
+        #       surface instead of a DXGI swapchain nothing presents ("swapchain-stomp
+        #       invisibility", d2d1_private.h:75). The single most load-bearing one.
+        #   NEUTRON_GDI_PRESENT    -- DXVK presents non-FLIP swapchains through GDI so they
+        #       compose with that same surface. Lives in the prefix's DXVK d3d11, not in wine.
+        #   NEUTRON_DCOMP_NATIVE   -- same-process D2D-UI composition path (staged dcomp).
+        #   NEUTRON_CEF_MAX_FPS    -- caps the CEF Home-screen repaint rate.
+        #   NEUTRON_D2D_COMPOSEREAD -- full-client GetDC+BitBlt compose-read. ⚠️ Premiere WANTS
+        #       this; AE must NOT have it (it paints a white screen over AE's canvas before a
+        #       composition exists). This is exactly why env is per-profile.
+        # NEUTRON_D2D_CLIPCHILDREN is deliberately absent: it defaults ON and only accepts "0",
+        # so passing "1" was always inert.
+        #
+        # ⚠️ Three DLLs must also be staged in the runtime (dcomp.dll, windows.ui.dll,
+        # winewayland.drv, all built from the dev tree 2026-08-03 and backed up as
+        # *.pre-gpumode-prod). They are LEAKY EXPORTS -- no .mypatch reproduces them, so a fresh
+        # `runtime install` will NOT have them and Premiere will be black again. Capturing them
+        # as patches is the outstanding work. All three are env-gated OFF by default, which is
+        # why staging them is safe for Photoshop/Lightroom/AE sharing this runtime.
+        "nvapi": False,
+        "env": {"NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
+                "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24",
+                "NEUTRON_D2D_COMPOSEREAD": "1"},
         "accent": "#9a5cf5", "export": True,
     },
     "photoshop": {
@@ -393,9 +420,17 @@ APP_PROFILES = {
         # to disable, so passing "1" was always inert.
         # ⚠️ Comments in a harness are not a specification. Check what a flag GATES in the source
         # before calling it unnecessary — "undocumented" is not "unused".
+        # NEUTRON_WL_ORPHAN_TOPLEVEL=1 (2026-08-03): AE's splash is an owned #32770 whose owner
+        # has no xdg_surface yet, so it becomes a subsurface of an unmapped parent and is never
+        # displayed. The winewayland fix promotes it to its own toplevel. It is OPT-IN and OFF BY
+        # DEFAULT because shipping it default-on GHOSTED PREMIERE'S SPLASH on the very next
+        # launch -- Premiere's splash is also an owned #32770 owned by an unmapped root, so the
+        # ownership-depth predicate cannot tell the two apps apart. ⚠️ Do NOT add this to another
+        # profile without launching that app and checking for a ghost window behind its splash.
         "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_DXVK_EXPORT_TEXTURES": "1",
                                "NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
-                               "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24"},
+                               "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24",
+                               "NEUTRON_WL_ORPHAN_TOPLEVEL": "1"},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
     "illustrator": {
@@ -1689,6 +1724,16 @@ def cmd_launch(args):
         env["DXVK_ENABLE_NVAPI"] = "1"
     for k, v in profile.get("env", {}).items():
         env[k] = v
+    # NEUTRON_PREMIERE_GPU=0 -> drop Premiere's GPU-UI env so the app falls back to its GDI+
+    # SOFTWARE drawbot. Needed as an A/B: GPU mode fixes the interface but the Program Monitor
+    # renders black in it, while the software drawbot shows video (with playhead trails). Pair
+    # with MZ.Prefs.UseGpuAcceleration=false -- the pref and the env must agree, or the app
+    # picks a drawbot whose output nothing presents. See ~/premiere-gpu-mode.sh.
+    if args.app == "premiere" and os.environ.get("NEUTRON_PREMIERE_GPU") == "0":
+        for k in ("NEUTRON_D2D_DCDIRECT", "NEUTRON_GDI_PRESENT", "NEUTRON_DCOMP_NATIVE",
+                  "NEUTRON_CEF_MAX_FPS", "NEUTRON_D2D_COMPOSEREAD"):
+            env.pop(k, None)
+        log("premiere: GPU-UI env DROPPED (NEUTRON_PREMIERE_GPU=0) -> software drawbot")
     # GPU-vendor ICD (NVIDIA default; TODO: generalize per detected GPU).
     if os.path.isfile(NVIDIA_EGL_ICD):
         env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", NVIDIA_EGL_ICD)
