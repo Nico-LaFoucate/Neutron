@@ -364,7 +364,20 @@ APP_PROFILES = {
         # Photoshop and Lightroom already carry this for the same reason (LrC's comment:
         # "the Develop preview presents a d3d12 swapchain via the BTW"); AE lacking it was
         # an oversight. ⚠️ Premiere RELIES on BTW -- keep this per-profile, never global.
-        "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1"},
+        # NEUTRON_DXVK_EXPORT_TEXTURES=1 added 2026-08-03. AE draws its on-canvas UI --
+        # rulers, guides, the layer bounding box and its corner handles -- into a GPU
+        # texture through CUDA, registering it with cuGraphicsD3D11RegisterResource on
+        # every blit. It does NOT tolerate that failing: it converts the failure into
+        # 0xA00F0001, throws it, and latches its hardware blit surface off process-wide,
+        # so the whole composition goes black (161 failed registrations == 161 latches).
+        # CUDA can only import Vulkan memory allocated with external-memory handle types,
+        # but AE asks for a plain unshared texture (MiscFlags=0) because on Windows CUDA
+        # and D3D11 are the same driver describing the same allocation. This gate tells
+        # DXVK to make interop-shaped textures exportable. Narrowly scoped inside DXVK
+        # (2D, >=512x512, BIND_UNORDERED_ACCESS, GPU-only) because a shared allocation is
+        # dedicated and bypasses the suballocator. ⚠️ Needs the staged nvcuda.dll +
+        # d3d11.dll -- see preserved-fixes/patches/README-cuda-d3d11-interop.md.
+        "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_DXVK_EXPORT_TEXTURES": "1"},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
     "illustrator": {
