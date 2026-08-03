@@ -355,7 +355,16 @@ APP_PROFILES = {
         # plausible gate on AE's D3D<->GL interop path (its comp viewer resolves all 8
         # WGL_NV_DX_interop entry points but never calls them).
         "overrides": "ucrtbase=n,b;dwrite=b;nvapi64=n",
-        "nvapi": True, "env": {},
+        # NEUTRON_DISABLE_BTW=1 added 2026-08-02. AE's composition canvas presents a d3d12
+        # swapchain, and vkd3d-proton's blit-to-window (GDI blit) worker was pacing it at
+        # ~4 fps: AE's own timer measured p50 274.7 ms between blits, and vkd3d's own
+        # QUEUEPRESENT log ticked every ~250 ms. With BTW off the swapchain presents
+        # natively (vkQueuePresentKHR -> winewayland subsurface) and the same measurement
+        # gives p50 39.4 ms -- ~7x faster, drawing on the canvas becomes usable.
+        # Photoshop and Lightroom already carry this for the same reason (LrC's comment:
+        # "the Develop preview presents a d3d12 swapchain via the BTW"); AE lacking it was
+        # an oversight. ⚠️ Premiere RELIES on BTW -- keep this per-profile, never global.
+        "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1"},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
     "illustrator": {
