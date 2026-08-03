@@ -377,7 +377,25 @@ APP_PROFILES = {
         # (2D, >=512x512, BIND_UNORDERED_ACCESS, GPU-only) because a shared allocation is
         # dedicated and bypasses the suballocator. ⚠️ Needs the staged nvcuda.dll +
         # d3d11.dll -- see preserved-fixes/patches/README-cuda-d3d11-interop.md.
-        "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_DXVK_EXPORT_TEXTURES": "1"},
+        # ⭐ 2026-08-03 — THE D2D/PRESENT SET. These four had lived only in ~/ae-best.sh, so a
+        # plain `neutron launch aftereffects` produced a BLACK, UNRENDERED UI. I had looked at
+        # them, called them unjustified carry-over from the Premiere harnesses because ae-best.sh
+        # documented four *other* settings and not these, and told the user to launch without
+        # them. They are LOAD-BEARING, and the source says so plainly:
+        #   NEUTRON_D2D_DCDIRECT  -- renders D2D HwndRenderTargets into the window's GDI paint
+        #       surface instead of a DXGI swapchain, "fixing the swapchain-stomp INVISIBILITY".
+        #       Without it AE's D2D chrome is drawn into a swapchain nothing ever presents.
+        #   NEUTRON_GDI_PRESENT   -- DXVK presents non-FLIP swapchains through GDI so they
+        #       compose with that same surface.
+        #   NEUTRON_DCOMP_NATIVE  -- same-process D2D-UI composition path.
+        #   NEUTRON_CEF_MAX_FPS   -- caps the CEF (Home screen) repaint rate.
+        # NEUTRON_D2D_CLIPCHILDREN is deliberately absent: it defaults to ON and only accepts "0"
+        # to disable, so passing "1" was always inert.
+        # ⚠️ Comments in a harness are not a specification. Check what a flag GATES in the source
+        # before calling it unnecessary — "undocumented" is not "unused".
+        "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_DXVK_EXPORT_TEXTURES": "1",
+                               "NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
+                               "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24"},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
     "illustrator": {
