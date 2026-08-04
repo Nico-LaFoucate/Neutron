@@ -184,6 +184,31 @@ PROVISION_DXVK_CONF = (
     "# Neutron Adobe-suite DXVK config (provisioned by `neutron prefix provision`)\n"
     "dxvk.enableGraphicsPipelineLibrary = False\n"
     "dxgi.enableDummyCompositionSwapchain = True\n"
+    "\n"
+    "# ---------------------------------------------------------------------------\n"
+    "# CEF/CEP panels (Animate's New Document + workspace, and every other Chromium-\n"
+    "# hosted Adobe panel) MUST NOT get a composition swapchain. Proven 2026-08-04.\n"
+    "#\n"
+    "# WHAT GOES WRONG: modern CEF presents through DirectComposition. DXVK answers\n"
+    "# CreateSwapChainForComposition with a DUMMY swapchain built with a NULL hwnd\n"
+    "# (dxgi_factory.cpp: 'Creating dummy swap chain') -- upstream only ever intended\n"
+    "# it to satisfy apps that query composition support, not to display anything.\n"
+    "# Chromium then renders the whole panel into it and Presents happily. Each Present\n"
+    "# reaches the dcomp bridge with hwnd=0, falls back to the global pending_hwnd --\n"
+    "# which holds DXVK's own 320x240 DXVKDUMMYWNDCLASS -- and every frame is discarded.\n"
+    "# Symptom: the panel paints ONE early (blank) frame and then freezes white forever.\n"
+    "# Measured on Animate: 9 presents all with m_window=0, then permanent silence.\n"
+    "#\n"
+    "# THE FIX: deny composition swapchains to CEF only. CreateSwapChainForComposition\n"
+    "# returns E_NOTIMPL and Chromium falls back to a WINDOWED swapchain (m_window != 0)\n"
+    "# -- the same path Premiere's working CEP panel has always used, which the dcomp\n"
+    "# bridge routes to the real panel host. After: 144 presents, 0 with m_window=0,\n"
+    "# 0 null-hwnd fallbacks, and Animate's New Document + canvas render and interact.\n"
+    "#\n"
+    "# Scoped per-exe on purpose: the global setting above stays for the host apps,\n"
+    "# which is the configuration Photoshop/Premiere/AE/LrC were all validated on.\n"
+    "[CEPHtmlEngine.exe]\n"
+    "dxgi.enableDummyCompositionSwapchain = False\n"
 )
 
 
@@ -1310,6 +1335,7 @@ def cmd_prefix_provision(args):
     # 3. DXVK config at the prefix root (idempotent — don't clobber an existing one).
     conf = os.path.join(prefix, "neutron-apps-dxvk.conf")
     wrote = False
+    repaired = False
     if not os.path.isfile(conf):
         try:
             with open(conf, "w") as f:
@@ -1317,7 +1343,26 @@ def cmd_prefix_provision(args):
             wrote = True
         except OSError as e:
             log(f"dxvk conf write failed (non-fatal): {e}")
-    steps.append({"step": "dxvk_conf", "path": conf, "wrote": wrote, "ok": True})
+    else:
+        # Idempotent REPAIR for prefixes provisioned before 2026-08-04: without the
+        # per-exe CEF section, every Chromium-hosted Adobe panel (Animate's New
+        # Document, its whole workspace) renders into a dummy composition swapchain
+        # and freezes white. Append only the missing section -- never rewrite the
+        # file, since it may carry the user's own tuning.
+        try:
+            with open(conf) as f:
+                existing = f.read()
+            if "[CEPHtmlEngine.exe]" not in existing:
+                tail = PROVISION_DXVK_CONF[PROVISION_DXVK_CONF.index("\n# ---"):]
+                with open(conf, "a") as f:
+                    if not existing.endswith("\n"):
+                        f.write("\n")
+                    f.write(tail)
+                repaired = True
+        except OSError as e:
+            log(f"dxvk conf repair failed (non-fatal): {e}")
+    steps.append({"step": "dxvk_conf", "path": conf, "wrote": wrote,
+                  "repaired": repaired, "ok": True})
 
     deferred = ["licensing/activation", "desktop-entries + XDG MIME associations"]
     if not runtime:
