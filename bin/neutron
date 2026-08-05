@@ -382,7 +382,23 @@ APP_PROFILES = {
         "exe": _adobe("Adobe Media Encoder 2025", "Adobe Media Encoder.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
-        "nvapi": False, "env": {},
+        # ⭐ 2026-08-04 — GPU-UI ENV PRODUCTIONISED. AME is a Premiere-family app: its UI draws
+        # through the SAME D2D/GPU drawbot, so without this env its HwndRenderTargets go to a
+        # DXGI swapchain whose output never reaches the screen -- the splash renders wrong and
+        # the interface is BLACK. Not a regression: `neutron launch mediaencoder` had ALWAYS
+        # been this path. Every prior validation (11.10-19, 11.10-22) went through
+        # `./adobe-smoke.sh mediaencoder --gpu`, which sets these itself, so the profile gap
+        # was invisible until the first plain launch on 2026-08-04 (11.10-28) and briefly
+        # looked like a runtime regression.
+        #   ⛔ THE LESSON (same as Premiere's black-screen ordeal): CHECK HOW AN APP WAS
+        #   PREVIOUSLY VALIDATED BEFORE LAUNCHING IT. A harness flag that supplies env is part
+        #   of the app's required configuration, not a debugging detail.
+        # Mirrors Premiere's set deliberately -- that is the configuration AME was validated
+        # on, and AME (like Premiere, unlike PS/LrC/AE) keeps blit-to-window ON.
+        "nvapi": False,
+        "env": {"NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
+                "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24",
+                "NEUTRON_D2D_COMPOSEREAD": "1"},
         "accent": "#6a32a2", "export": True,
     },
     "aftereffects": {
