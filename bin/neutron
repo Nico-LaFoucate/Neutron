@@ -67,7 +67,7 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
-NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-32")
+NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-36")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
@@ -374,7 +374,28 @@ APP_PROFILES = {
         "exe": _adobe("Adobe Animate 2024", "Animate.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
-        "nvapi": False, "env": {},
+        "nvapi": False,
+        # ⭐ 2026-08-06 — CANVAS PLAYBACK FRAGMENT FIX (user-confirmed: "sliver is gone").
+        # Animate paints its canvas from an off-screen bitmap that it draws SLIGHTLY LARGER
+        # than 1:1, then asks us to repaint a rectangle computed WITHOUT that enlargement.
+        # The stretch grows away from the top-left, so the far edges of the picture land
+        # outside the repainted area and are stranded there permanently -- the playback
+        # fragment. Confirmed by the shape of the symptom: the LEFT-hand shape leaves nothing
+        # behind even when it overhangs the canvas edge, while the RIGHT-hand shape, fully
+        # inside the canvas, always strands a sliver on its right.
+        #
+        # Cause is Animate truncating its own scale factor to two decimals (1.697917 -> 1.69),
+        # which is exact only at 150/175/200% display scaling -- hence not seen on typical
+        # Windows setups. We will not ship a modified Adobe binary, so we repaint slightly
+        # more than asked instead.
+        #
+        # 16 px is near the MINIMUM safe value, not a generous one: the drift is ~0.47% of the
+        # distance from the canvas origin, so ~15 px at the far edge of a 3229 px canvas.
+        # Do NOT lower it -- a smaller pad passes at one zoom and fails at another, which
+        # would read as an intermittent regression later. Cost is ~5% extra repaint area.
+        # ⚠️ Deliberately per-app: this is a workaround for ANIMATE's arithmetic, not a Wine
+        # correctness fix, and must not leak to the other apps.
+        "env": {"NEUTRON_INVALIDATE_PAD": "16"},
         "accent": "#ff4d12", "export": False,
     },
     "mediaencoder": {
