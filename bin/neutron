@@ -67,7 +67,7 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
-NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-39")
+NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-40")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
