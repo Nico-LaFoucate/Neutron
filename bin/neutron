@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import glob
+import signal
 
 # --- exit codes ------------------------------------------------------------
 EX_OK = 0
@@ -696,6 +697,55 @@ def _webview2_version(appdir):
     return max(vers, default=None)
 
 
+def _adopt_adobe_webview2(prefix, app_dir):
+    """Offline-installed prefixes: adopt the WebView2 runtime the ADOBE installer already put in the
+    prefix, instead of demanding an external source dir we may not have.
+
+    Adobe drops a complete runtime at
+        Program Files\\Common Files\\Adobe\\Microsoft\\EdgeWebView\\
+    but does NOT register it, and its layout is FLAT -- the DLLs sit directly in that directory with
+    a sibling '<version>.manifest' naming the build, rather than the
+    'Application/<version>/...' layout the loader expects. So the files are right there and the app
+    still gets a blank sign-in / blank UXP panel purely because nothing points at them.
+
+    We bridge it with a SYMLINK (Application/<version> -> Adobe's dir) rather than a copy: that tree
+    is ~558 MB and duplicating it per prefix is pure waste. Returns the version, or None.
+
+    Discovered the hard way: this had to be done by hand on ~/.premiere2025 during the Animate
+    home-screen investigation, and every offline-installed prefix hits it."""
+    adobe = os.path.join(prefix, "drive_c", "Program Files", "Common Files", "Adobe",
+                         "Microsoft", "EdgeWebView")
+    if not os.path.isdir(adobe):
+        return None
+    # version from '<version>.manifest'; fall back to a versioned subdir if the layout ever changes
+    version = None
+    try:
+        for name in os.listdir(adobe):
+            if name.endswith(".manifest") and name[:1].isdigit():
+                version = name[: -len(".manifest")]
+                break
+    except OSError:
+        return None
+    if not version:
+        return None
+    # sanity: it must actually look like a runtime
+    if not os.path.isfile(os.path.join(adobe, "msedgewebview2.exe")) and \
+       not os.path.isfile(os.path.join(adobe, "WebView2Loader.dll")):
+        log(f"webview2: Adobe copy at {adobe} has no loader/exe, not adopting")
+        return None
+    link = os.path.join(app_dir, version)
+    try:
+        os.makedirs(app_dir, exist_ok=True)
+        if os.path.islink(link) or os.path.exists(link):
+            return version                      # already adopted; idempotent
+        os.symlink(adobe, link)
+    except OSError as e:
+        log(f"webview2: could not adopt Adobe copy: {e}")
+        return None
+    log(f"webview2: adopted Adobe's in-prefix runtime {version} (symlink, no copy)")
+    return version
+
+
 def register_webview2(wine, prefix):
     """Stage + register the WebView2 runtime so Adobe's in-app web sign-in (IMS)
     renders instead of a blank window. Idempotent. Returns the registered version
@@ -709,6 +759,8 @@ def register_webview2(wine, prefix):
     ew = os.path.join(prefix, "drive_c", "Program Files (x86)", "Microsoft", "EdgeWebView")
     app = os.path.join(ew, "Application")
     version = _webview2_version(app)                 # already staged?
+    if not version:
+        version = _adopt_adobe_webview2(prefix, app)  # offline installs: use Adobe's own copy
     if not version:
         src = resolve_webview2()
         if not src:
@@ -1036,6 +1088,128 @@ def _display_fix_is_on(content):
 
 
 # --- commands --------------------------------------------------------------
+
+WINE_SYSTEM_PROCS = {
+    "wineserver", "services.exe", "winedevice.exe", "plugplay.exe", "explorer.exe",
+    "svchost.exe", "rpcss.exe", "start.exe", "conhost.exe", "rundll32.exe", "tabtip.exe",
+}
+
+
+def _prefix_procs(prefix):
+    """Live pids belonging to this prefix: [(pid, comm, is_app)].
+
+    Detect by `environ WINEPREFIX=` + exe path, NEVER by cmdline substring -- wine's own system
+    processes (services.exe, explorer.exe...) carry no 'wine'/'Adobe' text and would be missed,
+    which is precisely how orphans accumulated and deadlocked Lightroom's loader lock."""
+    out = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/environ", "rb") as f:
+                env = f.read().decode("utf8", "replace")
+            if ("WINEPREFIX=" + prefix.rstrip("/")) not in env:
+                continue
+            comm = open(f"/proc/{p}/comm").read().strip()
+            out.append((int(p), comm, comm not in WINE_SYSTEM_PROCS))
+        except Exception:
+            pass
+    return out
+
+
+def cmd_teardown(args):
+    """Close a prefix down CLEANLY, then make sure nothing survives.
+
+    Two things this exists for, both learned painfully:
+      1. Adobe apps write their preferences ON CLEAN EXIT. A bare `wineserver -k` kills them
+         outright, so everything the user changed that session (workspace layout, colour settings,
+         panel state) is silently discarded. We first ask each app window to close via `taskkill`
+         WITHOUT /F, which posts WM_CLOSE and lets the app run its own shutdown path.
+      2. `wineserver -k` alone leaves Adobe's daemons and wine's system processes running. They
+         accumulate across launches and break the NEXT app -- Lightroom deadlocks on ntdll's
+         loader_section with its licensing threads stuck behind them.
+
+    Order: graceful WM_CLOSE -> wineserver -k (SIGINT, unwinds children) -> -k9 -> sweep survivors
+    by literal pid -> clear stale server dirs. NEVER -k9 first: that orphans children mid-wait."""
+    prefix = resolve_prefix(args.prefix)
+    if not prefix:
+        die({"ok": False, "reason": "invalid prefix"}, EX_BADPREFIX, args.json)
+    wine, _ = resolve_wine()
+    env = dict(os.environ, WINEPREFIX=prefix)
+    import time as _t
+
+    before = _prefix_procs(prefix)
+    if not before:
+        emit({"ok": True, "torn_down": True, "already_clean": True, "killed": 0}, args.json)
+        return
+
+    # 1. graceful: let the apps save their preferences.
+    # ⚠️ Use /IM (image name), NOT /PID: taskkill's /pid takes a WINDOWS pid, and everything we can
+    # see from /proc is a LINUX pid. Passing the Linux pid silently matches nothing, which made the
+    # whole graceful step a no-op the first time this was written.
+    if wine and not args.force:
+        images = []
+        for pid, _comm, is_app in before:
+            if not is_app:
+                continue
+            try:
+                cl = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf8", "replace")
+                exe = cl.split("\0")[0].replace("\\", "/").rsplit("/", 1)[-1]
+                if exe.lower().endswith(".exe") and exe not in images:
+                    images.append(exe)
+            except Exception:
+                pass
+        for im in images:
+            try:
+                subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        if images:
+            log(f"teardown: asked {len(images)} app(s) to close: {', '.join(images)}")
+        for _ in range(args.grace):
+            if not [p for p in _prefix_procs(prefix) if p[2]]:
+                break
+            _t.sleep(1)
+
+    # 2/3. graceful server shutdown, then hard
+    ws = os.path.join(os.path.dirname(wine), "wineserver") if wine else None
+    for flag in ("-k", "-k9"):
+        if ws and os.path.exists(ws) and _prefix_procs(prefix):
+            try:
+                subprocess.run([ws, flag], env=env, timeout=60,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            for _ in range(20):
+                if not _prefix_procs(prefix):
+                    break
+                _t.sleep(1)
+
+    # 4. sweep survivors, killing by LITERAL pid (a shell "$PIDS" splat fires nothing under zsh)
+    for _ in range(3):
+        survivors = _prefix_procs(prefix)
+        if not survivors:
+            break
+        for pid, comm, _is_app in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        _t.sleep(2)
+
+    left = _prefix_procs(prefix)
+    if not left:
+        for d in glob.glob("/tmp/.wine-%d/server-*" % os.getuid()):
+            try:
+                shutil.rmtree(d)
+            except Exception:
+                pass
+    emit({"ok": not left, "torn_down": not left, "killed": len(before) - len(left),
+          "still_alive": [c for _p, c, _a in left]}, args.json)
+    if left:
+        sys.exit(EX_FAIL)
+
 
 def cmd_prefix_info(args):
     """Inspect a prefix; report the paths Collider needs.
@@ -2076,6 +2250,16 @@ def build_parser():
     pap = sub.add_parser("apps", help="list apps + install status in a prefix")
     pap.add_argument("--prefix", default=DEFAULT_PREFIX)
     pap.set_defaults(func=cmd_apps)
+
+    # teardown
+    pt = sub.add_parser("teardown",
+                        help="close a prefix cleanly (apps save prefs) and leave nothing running")
+    pt.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pt.add_argument("--grace", type=int, default=25,
+                    help="seconds to wait for apps to exit after WM_CLOSE (default 25)")
+    pt.add_argument("--force", action="store_true",
+                    help="skip the graceful close; apps will LOSE unsaved preferences")
+    pt.set_defaults(func=cmd_teardown)
 
     # doctor
     pd = sub.add_parser("doctor", help="health check")
