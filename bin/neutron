@@ -190,6 +190,42 @@ PROVISION_FONT_REPLACEMENTS = {
     "Segoe UI": "Adobe Clean", "Segoe UI Symbol": "Adobe Clean",
 }
 # The Adobe-suite DXVK config placed at the prefix root (Adobe panel render fix).
+# ⚠️ The shared conf above is NOT the only one. Two profiles point DXVK_CONFIG_FILE at their own
+# file, and provision used to create neither — so on a FRESH prefix, Premiere and After Effects
+# launched with DXVK on DEFAULTS. The defaults matter enormously here: DXVK's default HIDES the
+# real NVIDIA GPU and reports an AMD Radeon, while creating the device on the actual NVIDIA card.
+# Premiere's GPU sniffer then selects a backend for a GPU that isn't there. A build tester hit
+# "Initialization failure: Unknown error" after the splash on 2026-08-08 with the same GPU as the
+# dev box — the difference was not hardware, it was that this file existed here (hand-made
+# 2026-08-03) and not there.
+PROVISION_DXVK_CONF_PREMIERE = (
+    "# Neutron Premiere DXVK config (provisioned by `neutron prefix provision`)\n"
+    "dxgi.deferSurfaceCreation = True\n"
+    "dxgi.hideNvidiaGpu = False\n"
+    "dxgi.nvapiHack = False\n"
+    "dxgi.enableDummyCompositionSwapchain = True\n"
+    "dxvk.enableGraphicsPipelineLibrary = False\n"
+)
+
+PROVISION_DXVK_CONF_AE = (
+    "# Neutron After Effects DXVK config (provisioned by `neutron prefix provision`)\n"
+    "#\n"
+    "# AE shared the suite conf until 2026-07-31, which does not set hideNvidiaGpu -- so DXVK's\n"
+    "# default applied and AE enumerated an AMD Radeon while the device underneath was the real\n"
+    "# NVIDIA GPU. Mercury picks its backend from the GPU it detects (CUDA for NVIDIA, OpenCL for\n"
+    "# AMD), so detecting the wrong vendor can leave the render pipeline half-initialised.\n"
+    "dxgi.enableDummyCompositionSwapchain = True\n"
+    "dxgi.deferSurfaceCreation = True\n"
+    "dxvk.enableGraphicsPipelineLibrary = False\n"
+    "dxgi.hideNvidiaGpu = False\n"
+    "dxgi.nvapiHack = False\n"
+)
+
+PROVISION_DXVK_CONF_BODIES = {
+    DXVK_CONF_SUBPATH: PROVISION_DXVK_CONF_PREMIERE,
+    "neutron-ae-dxvk.conf": PROVISION_DXVK_CONF_AE,
+}
+
 PROVISION_DXVK_CONF = (
     "# Neutron Adobe-suite DXVK config (provisioned by `neutron prefix provision`)\n"
     "dxvk.enableGraphicsPipelineLibrary = False\n"
@@ -1768,6 +1804,34 @@ def cmd_prefix_provision(args):
             log(f"dxvk conf repair failed (non-fatal): {e}")
     steps.append({"step": "dxvk_conf", "path": conf, "wrote": wrote,
                   "repaired": repaired, "ok": True})
+    # 3b. The PER-APP dxvk configs. `launch` exports DXVK_CONFIG_FILE unconditionally from the
+    # profile, with no existence check, so a missing file means DXVK silently runs on defaults --
+    # which report the wrong GPU vendor. Write any that an installed app needs. Never clobber an
+    # existing one: it may carry the user's own tuning.
+    per_app = {}
+    for _app_id, _p in APP_PROFILES.items():
+        rel = _p.get("dxvk_conf")
+        body = PROVISION_DXVK_CONF_BODIES.get(rel)
+        if not rel or not body:
+            continue                      # the shared conf, handled above
+        # Only for apps actually present: Premiere's conf lives inside its install directory.
+        if not os.path.isfile(_resolve_app_exe(prefix, _p["exe"])):
+            per_app[_app_id] = "app-not-installed"
+            continue
+        target = os.path.join(prefix, rel)
+        if os.path.isfile(target):
+            per_app[_app_id] = "present"
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w") as f:
+                f.write(body)
+            per_app[_app_id] = "wrote"
+        except OSError as e:
+            log(f"per-app dxvk conf for {_app_id} failed (non-fatal): {e}")
+            per_app[_app_id] = "error"
+    steps.append({"step": "dxvk_conf_per_app", "apps": per_app, "ok": True})
+
 
     deferred = ["licensing/activation", "desktop-entries + XDG MIME associations"]
     if not runtime:
