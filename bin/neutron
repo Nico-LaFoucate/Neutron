@@ -2338,7 +2338,16 @@ def cmd_doctor(args):
             c["detail"] = detail
         checks.append(c)
 
-    check("wine", have("wine"))
+    # ⚠️ Check the wine NEUTRON WILL ACTUALLY USE, not `wine` on PATH. Neutron ships its own
+    # runtime and deliberately does not require a distro wine package, so `shutil.which("wine")`
+    # is False on a clean machine — every build tester failed this check, doctor returned
+    # "unhealthy" (exit 1), and Collider treated that as a command failure and blanked its entire
+    # Apps view. The dev box happened to have /usr/bin/wine installed, which is why it never
+    # reproduced here.
+    _wine, _wine_is_neutron = resolve_wine()
+    check("wine", bool(_wine),
+          (_wine + ("  (Neutron runtime)" if _wine_is_neutron else "  (system wine)")) if _wine
+          else "no wine found — install the Neutron runtime")
 
     if args.prefix:
         prefix = resolve_prefix(args.prefix)
