@@ -561,16 +561,22 @@ def die(obj, code, as_json):
 
 
 def premiere_is_running():
-    """True if any Adobe Premiere process is alive (pref edits are unsafe then)."""
-    try:
-        r = subprocess.run(
-            ["pgrep", "-f", "Adobe Premiere"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        return r.returncode == 0
-    except FileNotFoundError:
-        # No pgrep: fall back to a conservative "not detected".
-        return False
+    """True if any Adobe Premiere process is alive (pref edits are unsafe then).
+
+    ⛔ Matches the EXECUTABLE, never the command line. This used to be
+    `pgrep -f "Adobe Premiere"`, which matches any process whose full cmdline merely CONTAINS
+    that string — a terminal sitting in the install folder, a file manager, an editor with the
+    path open, or the very shell running this check. A false positive made
+    `prefix apply-display-fix` return exit 3 "Premiere is running; cannot edit prefs", which
+    (before the display fix was made best-effort) aborted the launch of every app in the prefix.
+    Same self-match trap as `_prefix_procs`, which documents the rule."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        # cmdline[0] is the exe the process was started with; argv[1..] is ignored on purpose.
+        if _proc_win_exe(int(pid)).lower().endswith("/adobe premiere pro.exe"):
+            return True
+    return False
 
 
 def resolve_prefix(path):
@@ -1465,9 +1471,21 @@ def cmd_apply_display_fix(args):
                   "reason": "no Premiere in prefix; display fix not applicable"},
                  args.json)
             return EX_OK
-        die({"changed": False,
-             "reason": "Debug Database.txt not found (launch Premiere once?)"},
-            EX_FAIL, args.json)
+        # Premiere IS installed but has never been run, so its Debug Database does not exist yet.
+        # That is the NORMAL state before a first launch — not a failure. This used to die with
+        # exit 1, and because Collider applies the display fix on the way into EVERY launch, a
+        # prefix with a never-run Premiere could not launch ANY app: the fix aborted the flow
+        # before the app was ever spawned. Reported by a build tester 2026-08-08 whose whole
+        # freshly-installed suite was unlaunchable.
+        #
+        # Premiere writes this file itself on first run; we apply the fix on the next launch.
+        # We do NOT fabricate the file — it is Adobe's, with a format (tab-separated
+        # key/current/default, odd line endings) that Premiere rewrites on a clean exit.
+        emit({"ok": True, "changed": False, "already_applied": False,
+              "pending_first_run": True,
+              "reason": "Premiere has not been run yet; the display fix applies on the next launch"},
+             args.json)
+        return EX_OK
 
     # Read raw so we preserve every byte of every line we don't manage.
     # Premiere writes this file with mixed/odd line endings (the display-fix
