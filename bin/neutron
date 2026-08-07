@@ -514,9 +514,28 @@ def log(msg):
     print(f"[neutron] {msg}", file=sys.stderr)
 
 
-def emit(obj, as_json):
+def event(args, **kw):
+    """Emit one newline-delimited progress event, when the caller asked for a stream.
+
+    Shape matches Mud Hut's NDJSON contract so Collider can consume both with the same reader:
+      {"event": "progress", "stage": <str>, "pct": <0-100>, "msg": <str>}
+      {"event": "note",     "msg": <str>}
+    The terminal object is emitted by emit() and carries "event": "result".
+
+    Silent unless BOTH --json and --progress: a long operation's steps are useless noise in human
+    mode, and streaming unconditionally would corrupt Mud Hut's stream (see --progress help)."""
+    if getattr(args, "progress", False) and getattr(args, "json", False):
+        sys.stdout.write(json.dumps(kw) + "\n")
+        sys.stdout.flush()
+
+
+def emit(obj, as_json, streaming=False):
     """Emit the result. JSON object to stdout in --json mode."""
     if as_json:
+        # A streamed run's consumer scans for the terminal event; tag it so it is unambiguous
+        # among the progress lines that preceded it.
+        if streaming:
+            obj = {"event": "result", **obj}
         print(json.dumps(obj))
     else:
         # Human mode: a compact readable rendering, still on stdout.
@@ -1560,6 +1579,7 @@ def cmd_prefix_provision(args):
 
     steps = []
 
+    event(args, event="progress", stage="init", pct=5, msg="initialising the wine prefix (wineboot) — this is the slow part")
     # 1. Initialize / update the prefix under Mono+Gecko suppression. Run wineboot -u
     # ALWAYS (not only on a fresh prefix): an existing prefix launched against a newer
     # runtime build triggers a lazy prefix-UPDATE on the first wine call, and that update
@@ -1583,6 +1603,7 @@ def cmd_prefix_provision(args):
     steps.append({"step": "init", "skipped": False, "fresh": fresh,
                   "ok": os.path.isfile(sysreg)})
 
+    event(args, event="progress", stage="registry", pct=62, msg="writing registry provisioning (graphics driver, app compat)")
     # 2. Registry provisioning (only affects newly-started processes; shared-safe).
     reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ",
             "wayland" if session_is_wayland() else "x11")
@@ -1600,6 +1621,7 @@ def cmd_prefix_provision(args):
             "Version", "REG_SZ", "win10")
     steps.append({"step": "ps_caption_win10", "ok": True})
 
+    event(args, event="progress", stage="lrc", pct=70, msg="registering the Lightroom → Photoshop detector key")
     # 2c. Lightroom Classic's "Edit in Photoshop" detector: register the dot-free
     # PHSP<major> Uninstall key so LrC's whole-string regex_match finds PS (see
     # provision_photoshop_detection + memory neutron-lrc-editin-photoshop). No-op
@@ -1631,6 +1653,7 @@ def cmd_prefix_provision(args):
                         log(f"stage {scope}/{fn} failed: {e}")
         for name, val in overrides.items():
             reg_set(wine, prefix, r"HKCU\Software\Wine\DllOverrides", name, "REG_SZ", val)
+        event(args, event="progress", stage="dlls", pct=75, msg="staged native DLL overrides from the runtime bundle")
         steps.append({"step": "dll_overrides", "source": "runtime-bundle",
                       "overrides": len(overrides), "files_staged": files_staged, "ok": True})
     else:
@@ -1653,6 +1676,7 @@ def cmd_prefix_provision(args):
             log(f"runtime fonts.json unreadable ({e}); using builtin map")
     for name, repl in fonts.items():
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
+    event(args, event="progress", stage="fonts", pct=82, msg="applied the Adobe font replacement map")
     steps.append({"step": "fonts", "count": len(fonts), "ok": True})
 
     # Activate the staged fonts. Copying files into windows/Fonts is NOT enough —
@@ -1665,6 +1689,7 @@ def cmd_prefix_provision(args):
     # WebView2: stage + register the runtime or Adobe's in-app web sign-in (IMS)
     # renders BLANK (the installer's Common Files copy is unregistered).
     wv2 = register_webview2(wine, prefix)
+    event(args, event="progress", stage="webview2", pct=88, msg="adopted the WebView2 runtime (Adobe sign-in)")
     steps.append({"step": "webview2", "version": wv2, "ok": wv2 is not None,
                   "note": None if wv2 else
                   "no WebView2 runtime source (set NEUTRON_WEBVIEW2 or stage ~/neutron/webview2); "
@@ -1678,11 +1703,13 @@ def cmd_prefix_provision(args):
     mono_ok = (mg["mono"] or {}).get("status") in ("present", "installed")
     gecko_ok = any(s.endswith(("present", "installed"))
                    for s in (mg["gecko"] or {}).get("arches", []))
+    event(args, event="progress", stage="mono_gecko", pct=91, msg="installed Wine Mono + Gecko")
     steps.append({"step": "mono_gecko", "detail": mg,
                   "ok": mono_ok and gecko_ok})
 
     wineserver_wait(wine, prefix)   # flush the reg.exe writes to user.reg on disk
 
+    event(args, event="progress", stage="dxvk", pct=94, msg="placing the Adobe DXVK config")
     # 3. DXVK config at the prefix root (idempotent — don't clobber an existing one).
     conf = os.path.join(prefix, "neutron-apps-dxvk.conf")
     wrote = False
@@ -1733,7 +1760,7 @@ def cmd_prefix_provision(args):
         "runtime_bundle": runtime,
         "steps": steps,
         "deferred": deferred,
-    }, args.json)
+    }, args.json, streaming=getattr(args, "progress", False))
     return EX_OK
 
 
@@ -2348,6 +2375,12 @@ def build_parser():
     )
     p.add_argument("--json", action="store_true",
                    help="structured JSON to stdout (Collider mode)")
+    p.add_argument("--progress", action="store_true",
+                   help="with --json, stream newline-delimited progress events before the terminal "
+                        "result (same NDJSON contract Mud Hut uses: {event:progress|note|error|result}). "
+                        "OPT-IN on purpose: Mud Hut runs `neutron prefix provision` with INHERITED "
+                        "stdout, so streaming by default would inject these lines into Mud Hut's own "
+                        "event stream and Collider would read our result as Mud Hut's.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # prefix
