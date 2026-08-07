@@ -219,7 +219,21 @@ PROVISION_DXVK_CONF_AE = (
     "dxvk.enableGraphicsPipelineLibrary = False\n"
     "dxgi.hideNvidiaGpu = False\n"
     "dxgi.nvapiHack = False\n"
+    "\n"
+    "# CEF/CEP panels must NOT get a composition swapchain -- without this per-exe override every\n"
+    "# Chromium-hosted Adobe panel renders into a dummy swapchain with a NULL hwnd and freezes\n"
+    "# white. The shared conf has carried this since 2026-08-04; AE hosts CEP panels too, and the\n"
+    "# first draft of this file omitted it. See the repair in cmd_prefix_provision.\n"
+    "[CEPHtmlEngine.exe]\n"
+    "dxgi.enableDummyCompositionSwapchain = False\n"
 )
+
+# Keys a per-app conf MUST pin. A conf missing these is a STUB, not a user's tuned file:
+# `ensure_dxvk_gpl` creates a one-line conf on first launch, which then satisfies any
+# "does the file exist?" check and silently locks in DXVK's defaults -- including reporting an
+# AMD GPU on an NVIDIA card. Provision repairs such a file by APPENDING what is missing.
+DXVK_REQUIRED_KEYS = ("dxgi.hideNvidiaGpu", "dxgi.nvapiHack",
+                      "dxgi.enableDummyCompositionSwapchain", "dxgi.deferSurfaceCreation")
 
 PROVISION_DXVK_CONF_BODIES = {
     DXVK_CONF_SUBPATH: PROVISION_DXVK_CONF_PREMIERE,
@@ -613,6 +627,24 @@ def premiere_is_running():
         if _proc_win_exe(int(pid)).lower().endswith("/adobe premiere pro.exe"):
             return True
     return False
+
+
+def collider_selected_prefix():
+    """The prefix Collider is pointed at, from ~/.config/collider/config.json.
+
+    The CLI's DEFAULT_PREFIX ($HOME/.premiere2025) is a legacy dev path that exists on exactly one
+    machine. Every tester who followed our own documented log-capture command --
+    `neutron launch premiere > pp.log` -- got `invalid prefix` and could not produce a log at all,
+    which is why a build-test bug went two rounds with no diagnostics (2026-08-08)."""
+    try:
+        with open(os.path.join(HOME, ".config", "collider", "config.json"),
+                  encoding="utf-8") as f:
+            sel = json.load(f).get("selected_prefix")
+        if sel and os.path.isdir(os.path.join(sel, "drive_c")):
+            return sel
+    except Exception:
+        pass
+    return None
 
 
 def resolve_prefix(path):
@@ -1127,16 +1159,25 @@ def detect_scale():
         return None
 
 
-def ensure_dxvk_gpl(conf_path):
-    """Ensure the DXVK graphics-pipeline-library workaround line is present
-    (create the file if absent). Idempotent."""
+def ensure_dxvk_gpl(conf_path, full_body=None):
+    """Ensure the DXVK config exists and carries the graphics-pipeline-library workaround.
+
+    ⚠️ If the file has to be CREATED and we know the app's full config, write the full config --
+    not just the one workaround line. Writing a one-line stub here is what bit a build tester on
+    2026-08-08: the stub satisfied every later "does the conf exist?" check, so the app ran on
+    DXVK's defaults (which report an AMD GPU on an NVIDIA card) and provision would not replace it.
+    Appending to an EXISTING file stays minimal -- it may carry the user's own tuning."""
     try:
         if os.path.isfile(conf_path):
             with open(conf_path) as f:
                 if "enableGraphicsPipelineLibrary" in f.read():
                     return
-        with open(conf_path, "a") as f:
-            f.write(DXVK_GPL_LINE + "\n")
+            with open(conf_path, "a") as f:
+                f.write(DXVK_GPL_LINE + "\n")
+            return
+        os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+        with open(conf_path, "w") as f:
+            f.write(full_body if full_body else DXVK_GPL_LINE + "\n")
     except Exception as e:
         log(f"dxvk gpl workaround write failed (non-fatal): {e}")
 
@@ -1820,7 +1861,27 @@ def cmd_prefix_provision(args):
             continue
         target = os.path.join(prefix, rel)
         if os.path.isfile(target):
-            per_app[_app_id] = "present"
+            # ⚠️ Existing is NOT the same as correct. `ensure_dxvk_gpl` creates a one-line conf on
+            # first launch; skipping any file that exists would leave that stub in place forever,
+            # and the app keeps running on DXVK's defaults. Append what is missing -- never
+            # rewrite, since a real conf may carry the user's own tuning.
+            try:
+                with open(target) as f:
+                    have = f.read()
+                missing = [ln for ln in body.splitlines()
+                           if any(ln.startswith(k) for k in DXVK_REQUIRED_KEYS)
+                           and ln.split("=")[0].strip() not in have]
+                if missing:
+                    with open(target, "a") as f:
+                        f.write("\n# NEUTRON repair: keys missing from this conf (a first-launch\n"
+                                "# stub pins none of them, so DXVK ran on defaults).\n")
+                        f.write("\n".join(missing) + "\n")
+                    per_app[_app_id] = f"repaired({len(missing)})"
+                else:
+                    per_app[_app_id] = "present"
+            except OSError as e:
+                log(f"per-app dxvk conf repair for {_app_id} failed (non-fatal): {e}")
+                per_app[_app_id] = "error"
             continue
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -2203,9 +2264,14 @@ def cmd_launch(args):
              "reason": f"unknown app '{args.app}' (known: {', '.join(sorted(APP_PROFILES))})"},
             EX_FAIL, args.json)
 
-    prefix = resolve_prefix(args.prefix)
+    prefix = resolve_prefix(args.prefix) or resolve_prefix(collider_selected_prefix())
     if not prefix:
-        die({"launched": False, "reason": "invalid prefix"}, EX_BADPREFIX, args.json)
+        _tried = [t for t in (args.prefix, collider_selected_prefix()) if t]
+        die({"launched": False, "tried": _tried,
+             "reason": "no usable prefix (no drive_c). Tried: "
+                       + (", ".join(_tried) or "<none>")
+                       + ". Pass --prefix, or select one in Collider."},
+            EX_BADPREFIX, args.json)
 
     gpu_mode = "gpu"
     if args.software:
@@ -2266,7 +2332,9 @@ def cmd_launch(args):
         if logpixels:
             reg_set(wine, prefix, r"HKCU\Control Panel\Desktop", "LogPixels",
                     "REG_DWORD", str(logpixels))
-        ensure_dxvk_gpl(dxvk_conf)          # winevulkan GPL marshalling workaround
+        # Pass the app's full config so a first launch never leaves a one-line stub behind.
+        ensure_dxvk_gpl(dxvk_conf,
+                        PROVISION_DXVK_CONF_BODIES.get(profile.get("dxvk_conf")))
         env.pop("DISPLAY", None)
         env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
         log(f"display: wayland | scale={scale} LogPixels={logpixels}")
