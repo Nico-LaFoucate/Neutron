@@ -1117,8 +1117,142 @@ def _prefix_procs(prefix):
     return out
 
 
-def cmd_teardown(args):
+def _app_dir_token(app_id):
+    """The install-directory segment that identifies a process as belonging to ONE app,
+    e.g. 'Adobe Premiere Pro 2025' from 'drive_c/Program Files/Adobe/Adobe Premiere Pro 2025/...'.
+
+    This is what makes an app-scoped teardown possible at all: every app in APP_PROFILES lives in
+    its own directory under Program Files/Adobe, while Adobe's SHARED daemons (IPCBroker, CoreSync,
+    Dynamic Link, CCX) live under Common Files/Adobe and therefore match NO app token. So a
+    per-app kill can never take out the machinery another running app depends on."""
+    prof = APP_PROFILES.get(app_id)
+    if not prof:
+        return None
+    parts = prof["exe"].replace("\\", "/").split("/")
+    try:
+        return parts[parts.index("Adobe") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_win_exe(pid):
+    """The WINDOWS exe path a wine process was started with, slash-normalised.
+    /proc/<pid>/exe points at the wine loader, not the app -- cmdline[0] is the real identity."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().decode("utf8", "replace").split("\0")[0].replace("\\", "/")
+    except Exception:
+        return ""
+
+
+def _app_procs(prefix, app_id):
+    """Live pids in this prefix that belong to ONE app: [(pid, comm)]."""
+    token = _app_dir_token(app_id)
+    if not token:
+        return []
+    needle = "/" + token + "/"
+    return [(pid, comm) for pid, comm, is_app in _prefix_procs(prefix)
+            if is_app and needle in _proc_win_exe(pid)]
+
+
+def _running_app_ids(prefix):
+    """Which APP_PROFILES apps still have live processes in this prefix."""
+    exes = {pid: _proc_win_exe(pid) for pid, _c, is_app in _prefix_procs(prefix) if is_app}
+    out = []
+    for app_id in APP_PROFILES:
+        token = _app_dir_token(app_id)
+        if token and any(("/" + token + "/") in e for e in exes.values()):
+            out.append(app_id)
+    return out
+
+
+def _teardown_app(args, prefix, wine, env):
+    """Close ONE app, leaving every other app in the prefix running.
+
+    Why this exists: all seven apps share a single prefix, and closing/reopening apps while working
+    on a project is a normal workflow -- so the full-prefix teardown (wineserver -k, which is
+    per-prefix and therefore kills EVERYTHING) is the wrong tool for a routine app close.
+
+    Order: WM_CLOSE to this app's images only (so it saves its preferences) -> wait -> SIGTERM ->
+    SIGKILL, always by literal pid and only for processes under this app's install directory.
+    Adobe's shared daemons are deliberately left alone; they are reaped by the full teardown when
+    the LAST app exits, because until then another app is still using them."""
+    import time as _t
+
+    app_id = args.app
+    if app_id not in APP_PROFILES:
+        die({"ok": False, "reason": f"unknown app '{app_id}'",
+             "known": sorted(APP_PROFILES)}, EX_FAIL, args.json)
+
+    before = _app_procs(prefix, app_id)
+    if not before:
+        emit({"ok": True, "app": app_id, "torn_down": True, "already_clean": True, "killed": 0,
+              "still_running": _running_app_ids(prefix)}, args.json)
+        return
+
+    # 1. graceful: WM_CLOSE via taskkill /IM so the app runs its own shutdown and writes prefs.
+    #    /IM (image name), never /PID -- taskkill's /pid is a WINDOWS pid and everything we can see
+    #    from /proc is a LINUX pid, so /pid silently matches nothing.
+    if wine and not args.force:
+        images = []
+        for pid, _comm in before:
+            exe = _proc_win_exe(pid).rsplit("/", 1)[-1]
+            if exe.lower().endswith(".exe") and exe not in images:
+                images.append(exe)
+        for im in images:
+            try:
+                subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        if images:
+            log(f"teardown[{app_id}]: asked to close: {', '.join(images)}")
+        for _ in range(args.grace):
+            if not _app_procs(prefix, app_id):
+                break
+            _t.sleep(1)
+
+    # 2. escalate on this app's pids ONLY.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        left = _app_procs(prefix, app_id)
+        if not left:
+            break
+        for pid, _comm in left:
+            try:
+                os.kill(pid, sig)
+            except Exception:
+                pass
+        for _ in range(10):
+            if not _app_procs(prefix, app_id):
+                break
+            _t.sleep(1)
+
+    left = _app_procs(prefix, app_id)
+    others = [a for a in _running_app_ids(prefix) if a != app_id]
+
+    # 3. Last one out reaps the shared machinery. While ANY app is still up, Adobe's shared daemons
+    #    are in use -- killing them is what wedges the next launch, so we only sweep when the
+    #    prefix is otherwise idle.
+    swept = False
+    if not left and not others:
+        log(f"teardown[{app_id}]: last app out -- sweeping shared daemons + wineserver")
+        args.app = None
+        cmd_teardown(args, _emitted=True)
+        swept = True
+
+    emit({"ok": not left, "app": app_id, "torn_down": not left,
+          "killed": len(before) - len(left), "still_alive": [c for _p, c in left],
+          "still_running": others, "swept_prefix": swept}, args.json)
+    if left:
+        sys.exit(EX_FAIL)
+
+
+def cmd_teardown(args, _emitted=False):
     """Close a prefix down CLEANLY, then make sure nothing survives.
+
+    ⚠️ This is the FULL-PREFIX teardown: wineserver is per-prefix, so it takes down every app in
+    the prefix. For a routine "the user closed one app" use `--app <id>` (_teardown_app), which
+    leaves the other apps running.
 
     Two things this exists for, both learned painfully:
       1. Adobe apps write their preferences ON CLEAN EXIT. A bare `wineserver -k` kills them
@@ -1138,9 +1272,14 @@ def cmd_teardown(args):
     env = dict(os.environ, WINEPREFIX=prefix)
     import time as _t
 
+    # A routine app close is app-scoped; only "shut the whole prefix down" comes through here.
+    if getattr(args, "app", None):
+        return _teardown_app(args, prefix, wine, env)
+
     before = _prefix_procs(prefix)
     if not before:
-        emit({"ok": True, "torn_down": True, "already_clean": True, "killed": 0}, args.json)
+        if not _emitted:
+            emit({"ok": True, "torn_down": True, "already_clean": True, "killed": 0}, args.json)
         return
 
     # 1. graceful: let the apps save their preferences.
@@ -1205,10 +1344,11 @@ def cmd_teardown(args):
                 shutil.rmtree(d)
             except Exception:
                 pass
-    emit({"ok": not left, "torn_down": not left, "killed": len(before) - len(left),
-          "still_alive": [c for _p, c, _a in left]}, args.json)
-    if left:
-        sys.exit(EX_FAIL)
+    if not _emitted:
+        emit({"ok": not left, "torn_down": not left, "killed": len(before) - len(left),
+              "still_alive": [c for _p, c, _a in left]}, args.json)
+        if left:
+            sys.exit(EX_FAIL)
 
 
 def cmd_prefix_info(args):
@@ -2255,6 +2395,11 @@ def build_parser():
     pt = sub.add_parser("teardown",
                         help="close a prefix cleanly (apps save prefs) and leave nothing running")
     pt.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pt.add_argument("--app", default=None,
+                    help="close ONLY this app (e.g. premiere), leaving the prefix's other apps "
+                         "running. This is the routine case -- all apps share one prefix, so the "
+                         "default full teardown would take them all down. When the last app exits, "
+                         "the shared daemons + wineserver are swept automatically.")
     pt.add_argument("--grace", type=int, default=25,
                     help="seconds to wait for apps to exit after WM_CLOSE (default 25)")
     pt.add_argument("--force", action="store_true",
