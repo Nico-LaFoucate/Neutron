@@ -159,12 +159,21 @@ DISPLAY_FIX_DEFAULT = "false"
 # Debug Database and is written post-first-launch by apply-display-fix, so it's
 # not part of provision). Values are the proven ones from the live suite.
 PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides
-    "dxcore": "native",              # DXGI/dxcore path Adobe panels need
-    "dcomp": "native,builtin",       # DirectComposition (DXVK dummy swapchain)
     "nvapi64": "native",             # real-NVIDIA reporting (dxvk-nvapi)
-    "ucrtbase": "native,builtin",
+    "ucrtbase": "native,builtin",    # the muxing shim (forwards to ucrtbase_orig.dll)
     "dwrite": "builtin",
 }
+# ⛔ dxcore and dcomp were REMOVED here 2026-08-07. They used to be staged as `native` because the
+# patched versions had to be supplied as files; that is obsolete — a wineboot on 11.10-22+ is a
+# SELF-HEAL that installs the runtime's own PATCHED dcomp/dxcore/dwrite builtins (verified by
+# marker, not size: wiki APPS.md prefix registry). Re-adding them is not merely redundant:
+# wiki APPS.md records "do NOT re-add dcomp/dxcore/nvapi64 — they black-box PS 2026" (that note is
+# about the photoshop app profile, but the prefix-wide case points the same way). The live
+# ~/.premiere2025, which runs all seven apps, has NEITHER override.
+#
+# This mattered because these only fire on the `builtin-minimal` path — when no runtime bundle is
+# present — which is exactly a fresh tester's first provision. The bundle-derived path never had
+# them, so the defect was invisible on any machine that had already captured a bundle.
 # HKCU\Software\Wine\Fonts\Replacements — map the fonts Adobe requests but that
 # can't ship (MS Segoe/Calibri, CJK Noto/MS) onto Adobe Clean (installed with the
 # apps). Missing these -> dwrite FindFamilyName NULL -> AdobeOwl AV -> leaked
