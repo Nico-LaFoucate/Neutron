@@ -10,7 +10,8 @@
 
 **A Wine-based compatibility engine tuned for professional creative software on Linux.**
 
-Premiere Pro · Photoshop · Lightroom — accelerated on your GPU, running on Linux.
+Premiere Pro · After Effects · Photoshop · Lightroom · Illustrator · Animate · Media Encoder
+— accelerated on your GPU, running on Linux.
 
 <br>
 
@@ -79,15 +80,20 @@ patched Wine foundation and shipping the fixes those applications need to run.
 
 | Application / Feature | Status | Notes |
 | :--- | :--- | :--- |
-| **Premiere Pro 2025** | 🟢 `Alpha` | Launches with a localized home screen; GPU/CUDA (Mercury) rendering; timeline playback; hardware **NVENC** export (via a finalize daemon) → valid MP4. Frame pacing and third-party plugins are still rough. |
-| **Photoshop 2025** | 🟢 `Alpha` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). Some warm-up lag and redraw artifacts remain. |
-| **Lightroom Classic** | 🟢 `Alpha` | Boots; imports 1000+ RAW files; SD-card hotplug works. Broad feature validation (AI Denoise, Develop GPU, Edit-in-Photoshop) still pending. |
+| **Premiere Pro 2025** | 🟢 `Alpha` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. Frame pacing and third-party plugins are still rough. |
+| **After Effects 2025** | 🟢 `Alpha` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers/guides overlay is disabled pending CUDA↔D3D11 interop. |
+| **Photoshop 2025** | 🟢 `Alpha` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). Some warm-up lag remains. |
+| **Lightroom Classic** | 🟢 `Alpha` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
+| **Illustrator 2025** | 🟢 `Alpha` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
+| **Media Encoder 2025** | 🟢 `Alpha` | Queue, render and export end-to-end, including native muxing. |
+| **Animate 2024** | 🟢 `Alpha` | Canvas, panels and playback. Its home screen is blank — that is Adobe's own bug, blank on Windows too; File → New works. |
+| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Alpha` | Full round trip, no engine changes required — both applications must be running. |
 | **CEP / UXP panels** | 🟢 `Alpha` | Third-party panels render and stay interactive inside their docks. |
-| **After Effects** | 🟡 `Partial` | Reaches its workspace; the New Project dialog is not yet displayed. |
-| **Illustrator · Animate · Media Encoder** | 🔬 `Experimental` | Early bring-up, not yet characterized. |
+| **Pen / tablet input** | 🟢 `Alpha` | Pressure, tilt and eraser via WinTab. The first stroke after a tool switch can stray. |
+| **Drag and drop from the file manager** | 🟢 `Alpha` | Dropping files from Dolphin/Nautilus into an application. |
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Alpha` | The primary hardware used in development (RTX 5070, nvidia-open). |
-| **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. |
-| **Third-party plugins · Dynamic Link** | ⚪ `Untested` | Core application stability comes first. |
+| **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. NVENC in particular is NVIDIA-only. |
+| **Third-party plugins** | ⚪ `Untested` | Core application stability comes first. |
 
 > [!NOTE]
 > Even where a specific app is untested, the core fixes built for the apps above — licensing and
@@ -111,8 +117,9 @@ focus areas:
   heavy timelines.
 - **🔗 Inter-process communication** — the structural foundation for interoperability between
   suite applications (dynamic asset linking, panels, brokers).
-- **📦 Hardware export** — a finalize daemon that recovers Adobe's NVENC elementary streams and
-  muxes them into valid deliverables.
+- **📦 Hardware export** — NVENC output muxed natively into valid deliverables. (This began as an
+  external finalize daemon; it was retired once the underlying fault — Microsoft's UCRT rejecting
+  Wine's `\\?\` temp paths, which made the muxer skip interleaving — was fixed properly.)
 
 The shipping fixes live in [`patches/production/`](patches/), the reusable runtime bundle in
 `runtime/`, and the full engineering story in [`docs/`](docs/) and [`STATE.md`](STATE.md).
@@ -172,7 +179,7 @@ command for structured output.
 | `neutron prefix info <path>` | Report the paths and state Collider needs. |
 | `neutron apps --prefix <path>` | List apps and install status in a prefix. |
 | `neutron doctor --prefix <path>` | Health-check the prefix and stack. |
-| `neutron hwmux start --watch <dir>` | Supervise the hardware-export (NVENC finalize) daemon (`stop` to end it). |
+| `neutron teardown [--app <id>]` | Close one app, or the whole prefix, cleanly — apps save their preferences, and Adobe's orphaned daemons are swept so they can't wedge the next launch. |
 | `neutron runtime install` | Download, verify (sha256), and unpack the pinned [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) runtime — the patched Wine the engine runs. |
 | `neutron runtime capture` | Build the runtime DLL bundle from a proven prefix. |
 
