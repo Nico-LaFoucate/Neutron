@@ -2513,6 +2513,22 @@ def cmd_doctor(args):
                          if os.path.isfile(_resolve_app_exe(prefix, p["exe"]))]
             check("adobe-app", bool(installed),
                   ", ".join(installed) if installed else "no known Adobe app found")
+            # Adobe's CC-desktop IPC broker. EVERY Adobe app fatals at launch without it --
+            # Photoshop says "unable to communicate with Creative Cloud Desktop", Premiere dies on
+            # an uncaught C++ exception and reports the useless "Initialization failure: Unknown
+            # error". A build tester lost a day to this in 2026-08 because nothing checked for it:
+            # `mudhut --method windows` copies whatever the source Windows install happens to have,
+            # and if that machine never had CC Desktop, the prefix comes out app-complete and
+            # unlaunchable, with the install reporting success.
+            if installed:
+                broker = os.path.join(prefix, "drive_c", "Program Files (x86)", "Common Files",
+                                      "Adobe", "Adobe Desktop Common", "IPCBox",
+                                      "AdobeIPCBroker.exe")
+                check("cc-desktop-ipc", os.path.isfile(broker),
+                      broker if os.path.isfile(broker)
+                      else "AdobeIPCBroker.exe missing - Adobe apps will fail at launch on CC "
+                           "Desktop IPC. The Adobe Desktop Common runtime was never staged into "
+                           "this prefix.")
             # Premiere-only checks (Debug Database display fix) apply ONLY when
             # Premiere is installed; they must not fail a Photoshop/other prefix.
             if os.path.isfile(os.path.join(prefix, PREMIERE_SUBPATH)):
