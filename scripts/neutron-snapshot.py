@@ -163,16 +163,47 @@ def prefix_report(p):
     out("AdobeIPCBroker.exe", "present" if os.path.isfile(broker) else "MISSING (Photoshop will fail)")
 
     section("PREFIX · native DLLs (size; a MISMATCH vs the healthy box is the signal)")
+    # The 32-bit halves and the full DXVK/vkd3d set are listed because this section
+    # ONLY covered the 64-bit natives until 2026-08-08, and reported "nothing changed"
+    # while d3d11/dxgi/nvcuda were never inspected at all.
     for rel in ("system32/dxcore.dll", "syswow64/dxcore.dll",
                 "system32/dcomp.dll", "syswow64/dcomp.dll",
-                "system32/dwrite.dll", "system32/d3d11.dll", "system32/dxgi.dll",
-                "system32/d3d12core.dll", "system32/ucrtbase.dll",
+                "system32/dwrite.dll", "syswow64/dwrite.dll",
+                "system32/d3d11.dll", "syswow64/d3d11.dll",
+                "system32/dxgi.dll", "syswow64/dxgi.dll",
+                "system32/d3d9.dll", "system32/d3d10core.dll",
+                "system32/d3d12.dll", "system32/d3d12core.dll",
+                "system32/opengl32.dll", "system32/nvcuda.dll",
+                "system32/ucrtbase.dll",
                 "system32/ucrtbase_orig.dll", "system32/nvapi64.dll"):
         f = os.path.join(p, "drive_c/windows", rel)
         s = size(f)
         if os.path.islink(f):
             s = f"{s} (symlink -> {norm(os.path.realpath(f))})"
         out(f"  {rel}", s)
+
+    section("PREFIX · FIX MARKERS (presence of the file proves NOTHING — these prove the fix)")
+    # 2026-08-08: nvcuda.dll was present, the expected size, and was the ungated DIAG build
+    # whose sampler thread crashed every CUDA export. Size/mtime could not have caught it;
+    # the marker string is the only evidence. Same idea as adobe-smoke.sh's preflight.
+    MARKERS = (
+        ("system32/nvcuda.dll", b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT",
+         "sampler GATED (ungated = CUDA exports crash in libcuda)"),
+        ("system32/nvcuda.dll", b"cuGraphicsD3D11RegisterResource", "AE D3D11 interop"),
+        ("system32/d3d11.dll", b"NEUTRON_GDI_PRESENT", "GPU UI path can engage"),
+        ("system32/dcomp.dll", b"NEUTRON_DCOMP_DIRECT", "dcomp direct publish"),
+    )
+    for rel, marker, why in MARKERS:
+        f = os.path.join(p, "drive_c/windows", rel)
+        if not os.path.isfile(f):
+            out(f"  {rel} : {marker.decode()}", "file absent")
+            continue
+        try:
+            found = marker in open(f, "rb").read()
+        except OSError as e:
+            found = False
+            why = f"{why} (unreadable: {e})"
+        out(f"  {rel} : {marker.decode()}", f"{'OK' if found else '** MISSING **'}  ({why})")
 
     section("PREFIX · DLL overrides (HKCU\\Software\\Wine\\DllOverrides)")
     try:

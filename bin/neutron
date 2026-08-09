@@ -379,10 +379,23 @@ APP_PROFILES = {
         # `runtime install` will NOT have them and Premiere will be black again. Capturing them
         # as patches is the outstanding work. All three are env-gated OFF by default, which is
         # why staging them is safe for Photoshop/Lightroom/AE sharing this runtime.
+        #
+        # ⭐ 2026-08-08 — THREE MORE GATES MOVED IN FROM ~/premiere-soak.sh. Premiere was only
+        # ever validated through that script, which sets these on top of the profile; every
+        # `neutron launch premiere` (and therefore every Collider launch) ran with a strictly
+        # smaller feature set than any session judged "working". Defaults in the soak script are
+        # RTG=1, DIRG=1, so these values ARE the validated configuration:
+        #   NEUTRON_WIC_READTHROUGH -- WIC bitmaps handed to D2D as GPU memory directly.
+        #   NEUTRON_DCOMP_DIRECT    -- direct publish of the CEP/Captioneer panel surface.
+        #   NEUTRON_HEAP_LARGE_CACHE-- large-block heap cache.
+        # ⚠️ Keep this list and premiere-soak.sh's env block in sync; if they diverge again the
+        # CLI and the validated path stop testing the same thing. (3rd occurrence of "check how
+        # the app was previously validated" -- see INCIDENTS.md.)
         "nvapi": False,
         "env": {"NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
                 "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24",
-                "NEUTRON_D2D_COMPOSEREAD": "1"},
+                "NEUTRON_D2D_COMPOSEREAD": "1", "NEUTRON_WIC_READTHROUGH": "1",
+                "NEUTRON_DCOMP_DIRECT": "1", "NEUTRON_HEAP_LARGE_CACHE": "1"},
         "accent": "#9a5cf5", "export": True,
     },
     "photoshop": {
@@ -1523,6 +1536,21 @@ def _stack_versions():
     return stack
 
 
+def _has_marker(path, marker):
+    """True if the binary contains `marker` (bytes). Used to prove a FIX is in the
+    artifact on disk, not merely that a file of the right name exists.
+
+    Size and mtime are worthless here: we patch wine's own builtins, so a reverted
+    or debug build has the same name and a plausible size. 2026-08-08 cost a full
+    day to exactly that — `nvcuda.dll` was present, correct size, and was the
+    ungated diagnostic build."""
+    try:
+        with open(path, "rb") as f:
+            return marker in f.read()
+    except OSError:
+        return False
+
+
 def cmd_apply_display_fix(args):
     """Write DS.DisableDirectXDisplay=true into Debug Database.txt. Idempotent."""
     prefix = resolve_prefix(args.path)
@@ -2535,6 +2563,21 @@ def cmd_doctor(args):
                       else "AdobeIPCBroker.exe missing - PHOTOSHOP will fail with 'unable to "
                            "communicate with Creative Cloud Desktop'. Other apps are unaffected. "
                            "The Adobe Desktop Common runtime was never staged into this prefix.")
+            # 🚨 nvcuda MUST be the GATED build. The diag build contains `neutron_live_thread`,
+            # which samples 8 KB out of every CUDA allocation >=4 MB on a 1 s timer and never
+            # drops freed pointers -- during an export it reads a freed buffer and libcuda page
+            # faults, killing the app. The gate (`NEUTRON_CUDA_PLAYBACK_EXPERIMENT`, default off)
+            # was written and built 2026-08-03 and never installed; the ungated build then went
+            # into the runtime bundle and cost the user a day of editing (2026-08-08).
+            # Presence of nvcuda.dll proves nothing -- the gate string is the only evidence.
+            nvcuda = os.path.join(prefix, "drive_c", "windows", "system32", "nvcuda.dll")
+            if os.path.isfile(nvcuda):
+                check("nvcuda-gated", _has_marker(nvcuda, b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT"),
+                      "gated release build" if _has_marker(
+                          nvcuda, b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT")
+                      else "UNGATED DIAG BUILD - CUDA exports will crash in libcuda. Install "
+                           "~/nvidia-libs/nvcuda/build.release/dlls/nvcuda/nvcuda.dll.so over "
+                           "it (and over ~/neutron/runtime/dlls/system32/nvcuda.dll).")
             # Premiere-only checks (Debug Database display fix) apply ONLY when
             # Premiere is installed; they must not fail a Photoshop/other prefix.
             if os.path.isfile(os.path.join(prefix, PREMIERE_SUBPATH)):
