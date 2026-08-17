@@ -25,7 +25,10 @@ import shutil
 import subprocess
 import sys
 import glob
+import re
 import signal
+import struct
+import time
 
 # --- exit codes ------------------------------------------------------------
 EX_OK = 0
@@ -72,6 +75,12 @@ NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-45")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
+
+# Where `neutron launch --json` writes each app's wine log. Sibling of runtimes so
+# it follows XDG_DATA_HOME and a fake-HOME clean-room test the same way.
+NEUTRON_LOGS_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
+    "neutron", "logs")
 
 NEUTRON_WINE_CANDIDATES = [
     os.environ.get("NEUTRON_WINE"),
@@ -152,6 +161,21 @@ DXVK_GPL_LINE = "dxvk.enableGraphicsPipelineLibrary = False"
 DISPLAY_FIX_KEY = "DS.DisableDirectXDisplay"
 DISPLAY_FIX_CURRENT = "true"
 DISPLAY_FIX_DEFAULT = "false"
+
+# ⭐ 2026-08-09 — THE DISPLAY FIX IS NOT PREMIERE-ONLY.
+# `DS.DisableDirectXDisplay` lives in the Debug Database of every DVA-based app: Premiere,
+# After Effects AND Media Encoder. apply-display-fix only ever resolved Premiere's, so on any
+# real install AE and AME silently never got it. It went unnoticed for months because this dev
+# box has the key set to `true` in all three files -- set by hand long ago, never by this code.
+# A build tester found it the honest way: of the three, the only app whose display fix was
+# correct was the only one of the three that worked. Same class as corefonts and
+# `Program Files (x86)` -- dev-box state standing in for a step no install performs.
+#   (label, AppData\Roaming\Adobe subdir, install-dir glob under drive_c/Program Files/Adobe)
+DISPLAY_FIX_APPS = (
+    ("premiere",     "Premiere Pro",        "Adobe Premiere Pro*"),
+    ("aftereffects", "After Effects",       "Adobe After Effects*"),
+    ("mediaencoder", "Adobe Media Encoder", "Adobe Media Encoder*"),
+)
 
 # --- Prefix provisioning recipe (single source of truth; Mud Hut calls this) ----
 # What makes a freshly-staged prefix Neutron-ready. Registry-level fixes that
@@ -725,6 +749,90 @@ def find_debug_database(prefix, user):
     return hits[0]
 
 
+def find_debug_databases(prefix, user):
+    """Every DVA app's live Debug Database.txt, plus whether that app is installed.
+
+    Returns a list of (label, path_or_None, installed). `path` is None when the app has
+    never been run (Adobe writes this file itself on a clean exit) or is not installed.
+    See DISPLAY_FIX_APPS for why this is not Premiere-only.
+    """
+    base = os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming", "Adobe")
+    appsdir = os.path.join(prefix, "drive_c", "Program Files", "Adobe")
+    out = []
+    for label, subdir, instglob in DISPLAY_FIX_APPS:
+        installed = bool(glob.glob(os.path.join(appsdir, instglob)))
+        hits = glob.glob(os.path.join(base, subdir, "*", "Debug Database.txt"))
+        hits = [h for h in hits if ".bak" not in h and "Team Projects" not in h]
+
+        def vkey(p):
+            ver = os.path.basename(os.path.dirname(p))
+            try:
+                return tuple(int(x) for x in ver.split("."))
+            except ValueError:
+                return (0,)
+
+        hits.sort(key=vkey, reverse=True)
+        out.append((label, hits[0] if hits else None, installed))
+    return out
+
+
+def _display_fix_pref_dir(prefix, user, label):
+    """Versioned prefs dir for an app that has never written a Debug Database.
+
+    Prefers a version dir the app has already created (it usually writes other prefs before
+    it ever writes this one); falls back to deriving it from the install directory's year,
+    which is how Adobe names these (Adobe Media Encoder 2025 -> 25.0). None if undecidable.
+    """
+    entry = next((e for e in DISPLAY_FIX_APPS if e[0] == label), None)
+    if not entry:
+        return None
+    _, subdir, instglob = entry
+    base = os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming", "Adobe", subdir)
+    existing = [d for d in glob.glob(os.path.join(base, "*")) if os.path.isdir(d)]
+    if existing:
+        def vkey(p):
+            try:
+                return tuple(int(x) for x in os.path.basename(p).split("."))
+            except ValueError:
+                return (0,)
+        existing.sort(key=vkey, reverse=True)
+        return existing[0]
+    inst = glob.glob(os.path.join(prefix, "drive_c", "Program Files", "Adobe", instglob))
+    for d in inst:
+        m = re.search(r"\b(20\d\d)\b", os.path.basename(d))
+        if m:
+            return os.path.join(base, f"{int(m.group(1)) - 2000}.0")
+    return None
+
+
+def _apply_display_fix_to(dbg):
+    """Set DISPLAY_FIX_KEY=true in one Debug Database, preserving every other byte.
+
+    Returns "already" | "changed". Raises OSError on read/write failure.
+    Adobe writes these lines as key\\tcurrent\\tdefault terminated by CR CR LF; we write a
+    single CRLF, which the apps accept and rewrite in their own style on a clean exit.
+    """
+    with open(dbg, "r", encoding="utf-8", errors="replace", newline="") as f:
+        raw = f.read()
+    if _display_fix_is_on(raw):
+        return "already"
+    new_line = f"{DISPLAY_FIX_KEY}\t{DISPLAY_FIX_CURRENT}\t{DISPLAY_FIX_DEFAULT}\r\n"
+    out_lines, found = [], False
+    for ln in raw.splitlines(keepends=True):
+        if ln.lstrip("﻿").startswith(DISPLAY_FIX_KEY + "\t"):
+            found = True
+            out_lines.append(new_line)   # replace ONLY this line
+        else:
+            out_lines.append(ln)         # preserve byte-for-byte
+    if not found:
+        if out_lines and not out_lines[-1].endswith(("\n", "\r")):
+            out_lines[-1] = out_lines[-1] + "\r\n"
+        out_lines.append(new_line)
+    with open(dbg, "w", encoding="utf-8", newline="") as f:
+        f.write("".join(out_lines))
+    return "changed"
+
+
 def have(cmd):
     return shutil.which(cmd) is not None
 
@@ -1035,6 +1143,359 @@ def _host_font_files():
         if os.path.isabs(p) and os.path.isfile(p):
             files.append(p)
     return files
+
+
+def font_postscript_names(path):
+    """EVERY nameID 6 (PostScript name) in a TrueType/OpenType `name` table, as a
+    set. Dependency-free — this has to run on a build tester's box.
+
+    ⚠️ Returns a SET, and reads every record, because the real Microsoft core
+    fonts carry TWO nameID 6 entries (a Macintosh-platform one whose bytes are
+    UTF-16 anyway, then the Windows one) while Wine's substitutes carry only the
+    Windows one. An earlier version returned the first match and therefore
+    decoded the genuine times.ttf as '\\x00T\\x00i\\x00m...' and reported the
+    HEALTHY dev-box prefix as faked — a check that condemns working machines is
+    worse than no check. Both decodings of every record are collected.
+
+    Why the PostScript name and not the family name: Wine's replacement fonts
+    carry the REAL family ("Times New Roman") under the REAL filename
+    (times.ttf) but a Wine-specific PostScript name ("WineTimesNewRoman").
+    Adobe's CoolType resolves the per-script default face by PostScript name, so
+    family-name and filename checks both come back clean on a prefix that is
+    fatally broken. See _roman_default_status()."""
+    names = set()
+    try:
+        with open(path, "rb") as f:
+            d = f.read()
+        # collection: first font only — the Roman defaults are never .ttc anyway
+        off = struct.unpack(">I", d[12:16])[0] if d[:4] == b"ttcf" else 0
+        name_off = None
+        for i in range(struct.unpack(">H", d[off + 4:off + 6])[0]):
+            e = off + 12 + 16 * i
+            if d[e:e + 4] == b"name":
+                name_off = struct.unpack(">II", d[e + 8:e + 16])[0]
+                break
+        if name_off is None:
+            return names
+        count, str_off = struct.unpack(">HH", d[name_off + 2:name_off + 6])
+        for i in range(count):
+            r = name_off + 6 + 12 * i
+            _pid, _eid, _lid, nid, ln, o = struct.unpack(">HHHHHH", d[r:r + 12])
+            if nid != 6:
+                continue
+            raw = d[name_off + str_off + o:name_off + str_off + o + ln]
+            for enc in ("utf-16-be", "latin1"):
+                try:
+                    s = raw.decode(enc).strip("\x00").strip()
+                except UnicodeDecodeError:
+                    continue
+                if s:
+                    names.add(s)
+    except Exception:
+        return names
+    return names
+
+
+# 🚨 The three faces Adobe's CoolType tries, in order, when it picks the default
+# Roman face. Wine ships a substitute for EVERY one of them
+# under the same Microsoft filename, so a prefix can hold all three files, pass
+# every presence check, and still contain none of the PostScript names CoolType
+# is looking for.
+_ROMAN_DEFAULTS = {"times.ttf": "TimesNewRomanPSMT",
+                   "arial.ttf": "ArialMT",
+                   "cour.ttf": "CourierNewPSMT"}
+
+# FamilyName as CoolType records it, per PostScript name. Needed to find the
+# right record in AdobeFnt_OSFonts.lst -- see _stale_roman_cache_records().
+_ROMAN_FAMILY = {"TimesNewRomanPSMT": "Times New Roman",
+                 "ArialMT": "Arial",
+                 "CourierNewPSMT": "Courier New"}
+
+
+def _roman_default_status(prefix):
+    """Per-file authenticity of the fonts CoolType needs for its default Roman
+    face. Returns [(filename, state, detail)] with state in
+    real | wine-substitute | missing | unreadable.
+
+    ⭐ 2026-08-11 — THIS IS THE AFTER EFFECTS `IEggApp failed` BUG, reproduced on the dev
+    box in the clean room. Replace times.ttf, arial.ttf and cour.ttf with Wine's
+    substitutes and AE dies at startup with `EGG Constructor IEggApp failed` and
+    the boilerplate "check you have the appropriate permissions" message; restore
+    them and it starts. Confirmed at the exception level: 81 CoolType throws +1
+    TXT.dll +1 aelib.dll on the failing run vs 80 +0 +0 on the working one, and
+    the AE internal log is a 93-line normalized match for the build tester's.
+    CoolType throws when NONE of the three resolves; it
+    falls back gracefully as long as ONE survives, which is why swapping only
+    times.ttf changes the log line to ArialMT and nothing breaks.
+
+    ⛔ Do NOT replace this with a filename or family-name check. The existing
+    msttcorefonts check tests six Wine-UNIQUE names (georgia/verdana/impact/
+    trebuc/comic/andalemo) precisely because they cannot collide — which is
+    exactly why it reports 6/6 on a prefix with all three Roman defaults faked."""
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    rows = []
+    for fn, want in _ROMAN_DEFAULTS.items():
+        path = os.path.join(fd, fn)
+        if not os.path.isfile(path):
+            rows.append((fn, "missing", f"{fn} not in windows/Fonts"))
+            continue
+        ps = font_postscript_names(path)
+        if want in ps:
+            rows.append((fn, "real", want))
+        elif not ps:
+            rows.append((fn, "unreadable", "no PostScript name in the font's name table"))
+        else:
+            # Report the shortest pure-ASCII name: the UTF-16 record decoded as
+            # latin1 also lands in the set as "W i n e A r i a l", which is noise.
+            ascii_names = [n for n in ps if all(0x20 <= ord(c) < 0x7f for c in n)]
+            best = min(ascii_names or sorted(ps), key=len)
+            rows.append((fn, "wine-substitute",
+                         f"PostScript name is {best!r}, not {want!r}"))
+    return rows
+
+
+def _prune_app_logs(log_dir, app, keep=20):
+    """Keep only the newest `keep` logs for this app; delete the rest.
+
+    Bounded per-app so a chatty app can't starve a quiet one out of its history.
+    ⚠️ Size matters here: an Adobe wine log with debug channels on reaches
+    hundreds of MB (this box has a 5.4 GB one), so an unbounded log dir would
+    quietly become the biggest thing on the disk. Best-effort — a failure to
+    prune must never stop a launch."""
+    try:
+        mine = sorted(
+            (e.path for e in os.scandir(log_dir)
+             if e.is_file() and e.name.startswith(app + "-") and e.name.endswith(".log")),
+            key=os.path.getmtime, reverse=True)
+        for old in mine[keep - 1:]:      # -1: we are about to create one more
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _cooltype_cache_dirs(prefix):
+    """CoolType's per-app `Typesupport` cache dirs inside a prefix (they hold
+    AdobeFnt_OSFonts.lst / AdobeFnt_CMaps.lst)."""
+    out = []
+    users = os.path.join(prefix, "drive_c", "users")
+    for root, dirs, _files in os.walk(users):
+        if os.path.basename(root).lower() == "typesupport":
+            out.append(root)
+            dirs[:] = []
+    return out
+
+
+def _stale_roman_cache_records(prefix):
+    """The Roman-default families whose CACHED record still names a Wine
+    substitute, as [(family, cached FontName, cache path)].
+
+    🚨 2026-08-12, from the build tester — THIS, not the files, is what actually
+    kept After Effects down. Their times/arial/cour were all genuine (installed
+    by `winetricks corefonts`), every file-level check passed, and AE still died
+    for three more days: `AdobeFnt_OSFonts.lst` was still serving
+    `WineTimesNewRoman`/`WineArial`/`WineCourierNew` with the SUBSTITUTES' file
+    lengths. We had hit the same trap mirrored (our cache kept serving the real
+    font's length after we installed a substitute), so this is symmetric and it
+    invalidates a files-only check in BOTH directions.
+
+    ⭐ The staleness is PER RECORD, keyed on filename: corefonts introduced new
+    filenames (georgia, verdana, impact, trebuc, comic, andalemo) and those were
+    read fresh, and the Bold/Italic faces of Times/Arial/Courier refreshed too
+    — because Wine ships substitutes for exactly times/arial/cour REGULAR and
+    nothing else. So the only stale records are the three Regular faces, which
+    are exactly and only what CoolType looks up for its default. Everything else
+    refreshing correctly is what made this so well hidden.
+
+    ⚠️ Two rules this must obey, both learned by getting them wrong (2026-08-12,
+    caught by the build tester on a prefix where AE starts):
+
+    * **At least one genuine is enough**, exactly like the file-level rule —
+      CoolType falls back. An earlier version appended an entry for each of the
+      three whose genuine name was absent and failed on any of them, so a prefix
+      with a substitute `times.ttf` but genuine `arial`/`cour` — files and cache
+      faithful to each other, AE starting fine on ArialMT — was reported FAIL and
+      the user told to delete a correct cache. That is the false PASS mirrored.
+    * **Scope the lookup to the right record.** Searching the whole file for
+      `FontName:Wine\\w*` reports the first Wine record anywhere, and every real
+      prefix legitimately carries several (msyh, symbol, tahoma, tahomabd,
+      wingding) — it blamed `WineYahei`, a CJK face with nothing to do with Roman
+      defaults. Match on FamilyName + StyleName:Regular, because the Bold/Italic
+      records share the FamilyName and are genuine.
+    """
+    stale = []
+    for d in _cooltype_cache_dirs(prefix):
+        lst = os.path.join(d, "AdobeFnt_OSFonts.lst")
+        if not os.path.isfile(lst):
+            continue
+        try:
+            with open(lst, "rb") as f:
+                text = f.read().decode("latin1")
+        except OSError:
+            continue
+        # Records are "%BeginFont ... FontName:X ... %EndFont" blocks.
+        recs = re.findall(r"%BeginFont(.*?)%EndFont", text, re.S)
+        per_file, found_genuine = [], False
+        for want in _ROMAN_DEFAULTS.values():
+            fam = _ROMAN_FAMILY[want]
+            blk = next((r for r in recs
+                        if re.search(r"FamilyName:%s\s" % re.escape(fam), r)
+                        and re.search(r"StyleName:Regular\s", r)), None)
+            if blk and ("FontName:%s" % want) in blk:
+                found_genuine = True        # one is enough, same as the files
+            else:
+                m = re.search(r"FontName:(Wine\w*)", blk or "")
+                per_file.append((want, m.group(1) if m else "absent", lst))
+        if not found_genuine:
+            stale.extend(per_file)
+    return stale
+
+
+# ⭐ 2026-08-15 — CEP PANEL CEF FLAGS, and why they must be re-applied rather than set once.
+#
+# Chromium inside CEPHtmlEngine splits its output into DirectComposition layers; under Wine the
+# textured tile quads fail to draw (ANGLE->D3D11->DXVK tile-texture interop) and the panel renders
+# as blank/banded solid quads. `--disable-direct-composition` makes Chromium abandon layer
+# splitting and draw one composited frame into a single CreateSwapChainForHwnd swapchain, which
+# our DXVK-hook -> shared-mem -> winewayland transport already delivers. That, with the two
+# sandbox flags, is what made the Captioneer panel render at all (memory
+# `neutron-cep-panel-sandbox`, 2026-07-04).
+#
+# 🚨 The flags live in the EXTENSION'S OWN manifest, which its updater overwrites. Captioneer
+# 1.8.1 (2026-08-15) shipped a manifest with 5 parameters where the working one had 10, and the
+# panel stopped rendering. The 2026-07-04 note already said these should become "Neutron's
+# standard CEP command-line set (manifest patcher)" -- that patcher was never built, so the fix
+# survived only as a hand edit in a file an installer replaces. This is that patcher.
+#
+# ⚠️ Scoped deliberately. `--disable-direct-composition` changes how a panel composites, and
+# Adobe's own panels (com.adobe.ccx.* Home screen) currently render fine WITHOUT it. Applying it
+# suite-wide would be changing working panels on a hunch, so we touch only vendors we have
+# actually validated. Add a prefix here when a panel is confirmed broken without the flags.
+NEUTRON_CEP_FLAGS = ("--no-sandbox", "--disable-gpu-sandbox", "--disable-direct-composition")
+NEUTRON_CEP_VENDORS = ("com.aescripts.",)
+CEP_MANIFEST_BACKUP_SUFFIX = ".pre-neutron-cepflags"
+
+
+def _cep_manifests(prefix):
+    """Every installed CEP extension manifest, as (extension_id, path)."""
+    user = prefix_user(prefix) or "nuck"
+    roots = [
+        os.path.join(prefix, "drive_c", "Program Files (x86)", "Common Files",
+                     "Adobe", "CEP", "extensions"),
+        os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming",
+                     "Adobe", "CEP", "extensions"),
+    ]
+    out = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in entries:
+            man = os.path.join(root, name, "CSXS", "manifest.xml")
+            if os.path.isfile(man):
+                out.append((name, man))
+    return out
+
+
+def cep_flag_status(prefix):
+    """Which in-scope manifests are missing Neutron's CEF flags.
+
+    Returns [(extension_id, manifest_path, [missing flags])]; empty when all are correct.
+    """
+    missing = []
+    for ext_id, man in _cep_manifests(prefix):
+        if not ext_id.startswith(NEUTRON_CEP_VENDORS):
+            continue
+        try:
+            with open(man, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        # A manifest with no <CEFCommandLine> at all declares no flags; that still counts as
+        # missing, but we cannot safely invent the element, so report it and skip repair.
+        present = set(re.findall(r"<Parameter>([^<]*)</Parameter>", text))
+        absent = [f for f in NEUTRON_CEP_FLAGS if f not in present]
+        if absent:
+            missing.append((ext_id, man, absent))
+    return missing
+
+
+def ensure_cep_flags(prefix, log_fn=None):
+    """Re-add Neutron's CEF flags to in-scope CEP manifests. Returns the list repaired."""
+    repaired = []
+    for ext_id, man, absent in cep_flag_status(prefix):
+        try:
+            with open(man, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            if "<CEFCommandLine>" not in text:
+                if log_fn:
+                    log_fn("cep-flags: %s has no <CEFCommandLine>; not editing" % ext_id)
+                continue
+
+            def _add(m, absent=absent):
+                block = m.group(0)
+                have = set(re.findall(r"<Parameter>([^<]*)</Parameter>", block))
+                ins = "".join("\n            <Parameter>%s</Parameter>" % f
+                              for f in absent if f not in have)
+                return block.replace("</CEFCommandLine>",
+                                     ins + "\n         </CEFCommandLine>") if ins else block
+
+            new = re.sub(r"<CEFCommandLine>.*?</CEFCommandLine>", _add, text, flags=re.S)
+            if new == text:
+                continue
+            bak = man + CEP_MANIFEST_BACKUP_SUFFIX
+            if not os.path.exists(bak):
+                shutil.copy2(man, bak)
+            with open(man, "w", encoding="utf-8") as f:
+                f.write(new)
+            repaired.append((ext_id, absent))
+            if log_fn:
+                log_fn("cep-flags: %s <- %s" % (ext_id, " ".join(absent)))
+        except OSError as e:
+            if log_fn:
+                log_fn("cep-flags: %s FAILED: %s" % (ext_id, e))
+    return repaired
+
+
+def invalidate_cooltype_caches(prefix):
+    """Delete CoolType's Typesupport caches so the next launch re-reads the font
+    FILES. Adobe rebuilds them automatically; this is safe and idempotent.
+
+    Called unconditionally whenever we touch fonts. The alternative — repair the
+    files and leave the cache — produces a prefix that passes every check we can
+    make and still fails, which is precisely how three days were lost. Returns
+    the number of files removed."""
+    n = 0
+    for d in _cooltype_cache_dirs(prefix):
+        for fn in os.listdir(d):
+            if fn.lower().startswith("adobefnt") and fn.lower().endswith(".lst"):
+                try:
+                    os.remove(os.path.join(d, fn))
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
+def _find_real_roman_font(want, extra_dirs=()):
+    """A host (or extra_dirs) font file whose PostScript name is `want`, or None.
+    Used to repair a prefix whose Roman defaults are Wine substitutes without
+    making the user re-run winetricks — but only when a genuine source exists."""
+    cands = list(_host_font_files())
+    for d in extra_dirs:
+        if d and os.path.isdir(d):
+            cands += [os.path.join(d, f) for f in sorted(os.listdir(d))]
+    for p in cands:
+        if os.path.splitext(p)[1].lower() not in (".ttf", ".ttc", ".otf"):
+            continue
+        if want in font_postscript_names(p):
+            return p
+    return None
 
 
 def _wine_fonts_dir(wine):
@@ -1564,6 +2025,59 @@ def cmd_apply_display_fix(args):
             EX_RUNNING, args.json)
 
     user = prefix_user(prefix)
+    if user:
+        results, any_changed, any_target = [], False, False
+        for label, dbg, installed in find_debug_databases(prefix, user):
+            if not installed:
+                results.append({"app": label, "state": "not-installed"})
+                continue
+            any_target = True
+            if dbg:
+                try:
+                    state = _apply_display_fix_to(dbg)
+                except OSError as e:
+                    results.append({"app": label, "state": "error", "reason": str(e)})
+                    continue
+                any_changed |= (state == "changed")
+                results.append({"app": label, "state": state, "debug_database": dbg})
+            else:
+                # The app is installed but has never written its prefs. Adobe creates this file
+                # itself on a clean exit, so on a never-run app there is nothing to edit -- which
+                # is exactly the state Media Encoder was found in on a real install. Create it
+                # carrying only our line; these are debug OVERRIDES, so absent keys simply take
+                # their defaults, and the app rewrites the file in its own style when it exits.
+                # Proven 2026-08-09 by deleting Premiere's, writing a one-line file and launching.
+                vdir = _display_fix_pref_dir(prefix, user, label)
+                if not vdir:
+                    results.append({"app": label, "state": "pending-first-run"})
+                    continue
+                try:
+                    os.makedirs(vdir, exist_ok=True)
+                    path = os.path.join(vdir, "Debug Database.txt")
+                    with open(path, "w", encoding="utf-8", newline="") as f:
+                        f.write(f"{DISPLAY_FIX_KEY}\t{DISPLAY_FIX_CURRENT}"
+                                f"\t{DISPLAY_FIX_DEFAULT}\r\n")
+                except OSError as e:
+                    results.append({"app": label, "state": "error", "reason": str(e)})
+                    continue
+                any_changed = True
+                results.append({"app": label, "state": "created", "debug_database": path})
+
+        prem = next((r for r in results if r["app"] == "premiere"), {})
+        payload = {"ok": True, "changed": any_changed,
+                   "already_applied": bool(any_target) and not any_changed,
+                   "premiere_running": False,
+                   "debug_database": prem.get("debug_database"),
+                   "apps": results}
+        if not any_target:
+            payload.update({"not_applicable": True,
+                            "reason": "no Premiere/After Effects/Media Encoder in prefix"})
+        for r in results:
+            if r["state"] in ("changed", "created"):
+                log(f"display fix {r['state']}: {r['debug_database']}")
+        emit(payload, args.json)
+        return EX_OK
+
     dbg = find_debug_database(prefix, user) if user else None
     if not dbg:
         # The display fix is PREMIERE-SPECIFIC (DirectXDisplay pref in Premiere's
@@ -1817,6 +2331,65 @@ def cmd_prefix_provision(args):
     # them explicitly in the HKLM Fonts key.
     nfonts = register_prefix_fonts(wine, prefix)
     steps.append({"step": "font_register", "count": nfonts, "ok": True})
+
+    # 🚨 Repair the Roman defaults BEFORE anything launches. If every one of
+    # times/arial/cour is a Wine substitute, CoolType has no PostScript name to
+    # select as its default Roman face, it throws, and After Effects
+    # dies at startup ("EGG Constructor IEggApp failed" -- a message about
+    # preferences-folder permissions that has nothing to do with the fault).
+    # Repro'd and reversed in the clean room 2026-08-11; see
+    # _roman_default_status(). We only ever copy a font whose PostScript name is
+    # genuinely the one CoolType wants, so this cannot make a prefix worse.
+    roman = _roman_default_status(prefix)
+    fake = [fn for fn, state, _ in roman if state != "real"]
+    repaired, unrepaired = [], []
+    if fake:
+        fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+        for fn in fake:
+            # The prefix's own Fonts dir is searched too: a `--method windows`
+            # copy often carries the genuine face under a different filename
+            # (e.g. "Times New Roman.ttf"), which repairs with no download.
+            src = _find_real_roman_font(_ROMAN_DEFAULTS[fn], extra_dirs=(fd,))
+            if src:
+                try:
+                    shutil.copyfile(src, os.path.join(fd, fn))
+                    repaired.append(fn)
+                    continue
+                except OSError as e:
+                    log(f"roman-default repair of {fn} failed: {e}")
+            unrepaired.append(fn)
+        if repaired:
+            register_prefix_fonts(wine, prefix)   # re-register the replaced files
+    # 🚨 UNCONDITIONALLY, even when nothing was repaired. CoolType's cache is
+    # keyed on FILENAME, so any font work that overwrites a file in place --
+    # ours above, or the `winetricks corefonts` we tell people to run -- leaves
+    # the cached record pointing at whatever used to be there. Repairing the
+    # files and leaving the cache yields a prefix that passes every check and
+    # still fails, which is exactly how the build tester lost three days after
+    # their fonts were already correct. Adobe rebuilds these on next launch.
+    ncache = invalidate_cooltype_caches(prefix)
+    steps.append({"step": "cooltype_cache_invalidate", "count": ncache, "ok": True})
+    # CEP panel CEF flags: unconditional, because the thing that removes them is an extension
+    # update that can happen at any time and leaves no other trace than "the panel is blank".
+    cep_fixed = ensure_cep_flags(prefix, log_fn=log)
+    steps.append({"step": "cep_cef_flags", "ok": True,
+                  "repaired": [e for e, _f in cep_fixed],
+                  "detail": ("re-applied to " + ", ".join(e for e, _f in cep_fixed) +
+                             "  — RESTART the app; manifests are read only at startup")
+                            if cep_fixed else "all in-scope manifests already correct"})
+    roman = _roman_default_status(prefix)
+    genuine = [fn for fn, state, _ in roman if state == "real"]
+    steps.append({"step": "cooltype_roman_default",
+                  "ok": bool(genuine),
+                  "genuine": genuine, "repaired": repaired,
+                  "detail": ", ".join(f"{fn}={state}" for fn, state, _ in roman) +
+                            ("" if genuine else
+                             "  — NO genuine Roman face; After Effects WILL fail at startup. "
+                             "Install the real Microsoft core fonts (`winetricks corefonts`).")})
+    if not genuine:
+        log("⚠️  no genuine Roman default font (times/arial/cour are all Wine "
+            "substitutes) — After Effects will fail at startup. Run "
+            "`winetricks corefonts` against this prefix.")
 
     # WebView2: stage + register the runtime or Adobe's in-app web sign-in (IMS)
     # renders BLANK (the installer's Common Files copy is unregistered).
@@ -2330,8 +2903,19 @@ def cmd_launch(args):
         env["WINEDLLOVERRIDES"] = profile["overrides"]
     if profile.get("nvapi"):
         env["DXVK_ENABLE_NVAPI"] = "1"
+    # setdefault, NOT assignment: an explicitly pre-set NEUTRON_* in the caller's environment
+    # must WIN, or no gate can ever be turned off from outside. Two independent failures of the
+    # old `env[k] = v` (both 2026-08-09):
+    #   1. premiere-soak.sh's isolation runs (`RTG=0 DIRG=0`) were silently overwritten back to 1
+    #      the moment those gates moved into the profile on 08-08 -- our own A/B tool went inert
+    #      and would have reported "no difference" for every isolation run since.
+    #   2. the build tester could not bisect the Photoshop dcomp-gate bug at all, because every
+    #      gate they set on the command line was discarded before the app saw it.
+    # Trade-off accepted: a stale exported NEUTRON_* in a shell now sticks instead of being
+    # corrected. That is the price of having an override at all, and it is the behaviour the
+    # validated soak path always assumed it had.
     for k, v in profile.get("env", {}).items():
-        env[k] = v
+        env.setdefault(k, v)
     # NEUTRON_PREMIERE_GPU=0 -> drop Premiere's GPU-UI env so the app falls back to its GDI+
     # SOFTWARE drawbot. Needed as an A/B: GPU mode fixes the interface but the Program Monitor
     # renders black in it, while the software drawbot shows video (with playhead trails). Pair
@@ -2342,6 +2926,22 @@ def cmd_launch(args):
                   "NEUTRON_CEF_MAX_FPS", "NEUTRON_D2D_COMPOSEREAD"):
             env.pop(k, None)
         log("premiere: GPU-UI env DROPPED (NEUTRON_PREMIERE_GPU=0) -> software drawbot")
+    # ⭐ 2026-08-15 — AUDIO DROPOUTS DURING PLAYBACK. winepulse asks PulseAudio for a very small
+    # buffer; against PipeWire's pulse shim and a USB interface that is not enough headroom, and
+    # Premiere's playback drops audio while reporting NOTHING -- its own log shows zero audio lines
+    # and "Frames dropped during playback: 0". The gap is entirely below the app, which is why
+    # looking in Premiere for it finds nothing.
+    #
+    # 90 ms is the smallest value that held up in testing here (PipeWire 1.6.8, quantum 1024 @ 48k,
+    # Focusrite Scarlett Solo over USB). The cost is 90 ms of output latency, which matters for
+    # live monitoring but not for timeline playback.
+    #
+    # setdefault, so anyone chasing latency can lower or unset it per launch.
+    # ⚠️ Provisional: confirmed by ear over one session, not by an xrun count. If dropouts persist,
+    # measure with `pw-top` during playback (the ERR column) before raising this further -- a bigger
+    # buffer that does not help means the problem is elsewhere (USB scheduling, winepulse itself).
+    env.setdefault("PULSE_LATENCY_MSEC", "90")
+
     # GPU-vendor ICD (NVIDIA default; TODO: generalize per detected GPU).
     if os.path.isfile(NVIDIA_EGL_ICD):
         env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", NVIDIA_EGL_ICD)
@@ -2393,20 +2993,50 @@ def cmd_launch(args):
         cmd.append(project)
 
     log(f"launching: {profile['name']} -> {wine} {exe} {project or ''}")
+
+    # 🚨 CAPTURE THE APP LOG. This used to be `subprocess.DEVNULL if args.json`,
+    # and Collider always passes --json -- so EVERY Collider-launched session
+    # threw its wine log away. Verified on a live Premiere 2026-08-12: fd1 and
+    # fd2 both /dev/null. Two user-reported bugs (the missing timeline chrome
+    # and the Button Editor drag) could not be investigated at all from a normal
+    # session, and the answer was always "relaunch by hand from a terminal".
+    #
+    # A terminal caller (no --json) still inherits the tty, so `neutron launch
+    # ... > my.log 2>&1` keeps working exactly as before and does NOT get a
+    # second copy. Only the --json path, which had nowhere to write, gains one.
+    log_path, log_fh = None, None
+    if args.json:
+        try:
+            os.makedirs(NEUTRON_LOGS_DIR, exist_ok=True)
+            _prune_app_logs(NEUTRON_LOGS_DIR, args.app, keep=20)
+            log_path = os.path.join(
+                NEUTRON_LOGS_DIR, f"{args.app}-{time.strftime('%Y%m%d-%H%M%S')}.log")
+            log_fh = open(log_path, "wb")
+        except OSError as e:
+            # Never let logging break a launch. Fall back to the old behaviour.
+            log(f"app log unavailable ({e}); output discarded")
+            log_path, log_fh = None, None
     try:
         # Detach so Collider supervises via PID, not via this process.
         proc = subprocess.Popen(
             cmd, env=env,
-            stdout=subprocess.DEVNULL if args.json else None,
-            stderr=subprocess.DEVNULL if args.json else None,
+            stdout=(log_fh or subprocess.DEVNULL) if args.json else None,
+            stderr=(subprocess.STDOUT if log_fh else subprocess.DEVNULL) if args.json else None,
             start_new_session=True,
         )
     except Exception as e:
         die({"launched": False, "reason": f"spawn failed: {e}"}, EX_FAIL, args.json)
+    finally:
+        # The child holds its own dup'd fd; the parent must not keep this open or
+        # the file would stay held by a process Collider does not supervise.
+        if log_fh:
+            log_fh.close()
 
     # Brief liveness check: if Premiere dies instantly (bad env, missing DLL),
     # report that rather than a misleading "launched: true".
-    import time
+    # (`time` is imported at module scope — a function-local `import time` here
+    # would make the name local for the WHOLE function and turn the strftime
+    # call above into an UnboundLocalError.)
     time.sleep(0.5)
     if proc.poll() is not None:
         die({"launched": False, "pid": proc.pid,
@@ -2417,9 +3047,11 @@ def cmd_launch(args):
     if profile.get("post_launch") == "psdock":
         _stage_and_inject_psdock(prefix, wine, env)
 
+    # `log` is returned so Collider can surface "open log" in the UI and so a bug
+    # report can name the exact file without the user hunting for it.
     emit({"ok": True, "launched": True, "app": args.app,
           "pid": proc.pid, "gpu_mode": gpu_mode, "display": display_mode,
-          "neutron_wine": is_neutron}, args.json)
+          "neutron_wine": is_neutron, "log": log_path}, args.json)
     return EX_OK
 
 
@@ -2578,6 +3210,58 @@ def cmd_doctor(args):
                       else "UNGATED DIAG BUILD - CUDA exports will crash in libcuda. Install "
                            "~/nvidia-libs/nvcuda/build.release/dlls/nvcuda/nvcuda.dll.so over "
                            "it (and over ~/neutron/runtime/dlls/system32/nvcuda.dll).")
+            # 🚨 CoolType's default Roman face. Adobe resolves it by PostScript
+            # name, and Wine ships a substitute for all three candidate files
+            # under the same Microsoft filenames -- so a prefix can hold
+            # times/arial/cour, pass every presence check, and still leave
+            # CoolType with nothing to select. When all three are fake,
+            # CoolType THROWS and After Effects dies at startup with
+            # `EGG Constructor IEggApp failed` behind a boilerplate "check your
+            # permissions" message. Reproduced and reversed in the clean room
+            # 2026-08-11. Premiere and AME share CoolType and are at risk of the
+            # same class of failure, so this is a suite-wide check.
+            roman = _roman_default_status(prefix)
+            genuine = [r for r in roman if r[1] == "real"]
+            # ⚠️ The FILES being genuine is not sufficient — CoolType may never read
+            # them. Its cache is keyed on filename, so `winetricks corefonts`
+            # (which overwrites in place) leaves the three Regular records
+            # pointing at Wine substitutes forever. A files-only check reports
+            # PASS on exactly the state our own remedy creates.
+            stale = _stale_roman_cache_records(prefix)
+            detail = ", ".join(f"{fn}={state}" for fn, state, _ in roman)
+            if not genuine:
+                check("cooltype-roman-default", False, detail +
+                      "  — NO genuine Roman face: CoolType will throw and "
+                      "After Effects will fail at startup with 'EGG Constructor IEggApp failed'. "
+                      "Install the real Microsoft core fonts (`winetricks corefonts`) or run "
+                      "`neutron prefix provision <prefix>` to repair from host fonts.")
+            elif stale:
+                check("cooltype-roman-default", False, detail +
+                      "  — a genuine file is present but CoolType's CACHE offers NO genuine "
+                      "Roman face (it serves " +
+                      ", ".join(sorted({s[1] for s in stale})) +
+                      "). AE will fail at startup regardless of the files. Fix: delete " +
+                      os.path.dirname(stale[0][2]) + " (Adobe rebuilds it), or run "
+                      "`neutron prefix provision <prefix>`, which now does it for you.")
+            else:
+                check("cooltype-roman-default", True, detail)
+            # CEP panel CEF flags. An extension UPDATE silently reverts these (Captioneer 1.8.1
+            # did, 2026-08-15) and the only symptom is "the panel does not load" -- nothing in
+            # Premiere's log says why, so without this check it costs an investigation every time.
+            cep_missing = cep_flag_status(prefix)
+            if cep_missing:
+                check("cep-cef-flags", False,
+                      "; ".join("%s missing %s" % (e, " ".join(m)) for e, _p, m in cep_missing) +
+                      "  — the panel will load but render blank (Chromium composites through "
+                      "DirectComposition, whose tile quads do not draw under Wine). An extension "
+                      "update overwrites the manifest; run `neutron prefix provision <prefix>` to "
+                      "re-apply, then RESTART the app (manifests are read only at startup).")
+            else:
+                n_scoped = len([1 for e, _p in _cep_manifests(prefix)
+                                if e.startswith(NEUTRON_CEP_VENDORS)])
+                check("cep-cef-flags", True,
+                      "%d in-scope extension(s) carry %s" % (n_scoped, " ".join(NEUTRON_CEP_FLAGS))
+                      if n_scoped else "no in-scope CEP extensions installed")
             # Premiere-only checks (Debug Database display fix) apply ONLY when
             # Premiere is installed; they must not fail a Photoshop/other prefix.
             if os.path.isfile(os.path.join(prefix, PREMIERE_SUBPATH)):
