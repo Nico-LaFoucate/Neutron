@@ -71,7 +71,7 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
-NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-58")
+NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-59")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
@@ -416,10 +416,20 @@ APP_PROFILES = {
         # CLI and the validated path stop testing the same thing. (3rd occurrence of "check how
         # the app was previously validated" -- see INCIDENTS.md.)
         "nvapi": False,
+        # ⭐ 2026-08-19 — NEUTRON_WHEEL_NOTCH: snap a high-resolution mouse wheel to whole
+        # notches. A hi-res wheel (HID++ multiplier 8) delivers one physical detent as an
+        # IRREGULAR burst of value120 fragments (measured: 15,15,60,30,75...), because the
+        # layers below Wine coalesce by timing rather than by detent. Premiere's timeline
+        # treats each WM_MOUSEWHEEL as one discrete step, so the same click scrubbed 3-8
+        # frames at random. The driver now accumulates and emits one WHEEL_DELTA per whole
+        # notch. Off by default in the driver -- it is a compatibility choice, not a
+        # conformance fix -- so it must be requested here, per app.
+        # ⚠️ Also set in premiere-soak.sh; keep the two in sync (see the warning above).
         "env": {"NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
                 "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24",
                 "NEUTRON_D2D_COMPOSEREAD": "1", "NEUTRON_WIC_READTHROUGH": "1",
-                "NEUTRON_DCOMP_DIRECT": "1", "NEUTRON_HEAP_LARGE_CACHE": "1"},
+                "NEUTRON_DCOMP_DIRECT": "1", "NEUTRON_HEAP_LARGE_CACHE": "1",
+                "NEUTRON_WHEEL_NOTCH": "1"},
         "accent": "#9a5cf5", "export": True,
     },
     "photoshop": {
@@ -2941,6 +2951,83 @@ def cmd_launch(args):
     # measure with `pw-top` during playback (the ERR column) before raising this further -- a bigger
     # buffer that does not help means the problem is elsewhere (USB scheduling, winepulse itself).
     env.setdefault("PULSE_LATENCY_MSEC", "90")
+
+    # --- silence Wine's FIXME chatter -------------------------------------------------
+    # Wine prints four classes: err, warn, fixme, trace. fixme is on by default and means
+    # "this bit is unimplemented and I am ignoring it" -- useful to a Wine developer once,
+    # useless every frame thereafter. MEASURED in a live Premiere session, two d2d FIXMEs
+    # alone were 14,000 of 20,000 sampled lines:
+    #     fixme:d2d:d2d_device_context_PushAxisAlignedClip Ignoring
+    #     fixme:d2d:d2d_device_context_DrawGeometry Ignoring
+    # ~700 formatted, locked, synchronous writes per second, from inside the render path.
+    # Turning them off took the log from 40,413 to 7,952 bytes/sec (-80%).
+    #
+    # This is not a debug-only cost: cmd_launch redirects app output to a log file on EVERY
+    # launch, so every Collider session has been paying it with nobody reading the output.
+    #
+    # ⚠️ MERGE, never assign. A debugging session passes its own WINEDEBUG, and clobbering it
+    # would silently drop the channels being asked for -- an hour of wondering why the log is
+    # empty. Skipped entirely if the caller already said anything about fixme, so
+    # `WINEDEBUG=+fixme` still works to get them back.
+    #
+    # ⚠️ err is deliberately untouched: every Neutron diagnostic (MASKFALLBACK, neutron-role,
+    # the perf reports) is ERR-level and must keep printing.
+    _wd = env.get("WINEDEBUG", "")
+    if "fixme" not in _wd:
+        env["WINEDEBUG"] = ("fixme-all," + _wd).rstrip(",") if _wd else "fixme-all"
+
+    # --- CEP plugin networking: make Node prefer IPv4 -------------------------------
+    # Adobe's CEP panels embed **Node 17.7.2**, and plugins do their HTTP through it
+    # (not through Chromium, which is why none of it shows up in DevTools' Network).
+    #
+    # Node 17 is the worst possible version here. v17.0 changed the DNS result order
+    # from `ipv4first` to `verbatim`, so it takes whatever the resolver returns first;
+    # and Happy Eyeballs (`autoSelectFamily`, which races v6 against v4 and falls back
+    # in ~250 ms) did not arrive until v18.13/v20. So Node 17 commits to the first
+    # address and, if that address is unreachable, simply fails. curl and every browser
+    # survive the same network because they all implement the fallback.
+    #
+    # That is fatal on a very common Linux setup: a VPN that blocks IPv6 without
+    # removing the ISP's IPv6 address and default route. The box still looks
+    # IPv6-capable to getaddrinfo, so AAAA records come back first, and every Node
+    # request dies with ECONNREFUSED.
+    #
+    # MEASURED 2026-08-17 inside the live Captioneer panel (VPN connected):
+    #   default            -> ERR ECONNREFUSED   (aescripts.com AAAA 2606:4700::6812:1123)
+    #   family:4 forced    -> HTTP 403           (a real TCP+TLS connection)
+    #   ipv4first          -> HTTP 403, lookup now 104.18.17.35 fam4
+    # The plugin read that unreachable-network failure as licence error 101,
+    # "please connect to the internet so the license can be activated" -- while
+    # `webreq.exe` succeeded throughout, because WinINet is a different stack.
+    # On Windows the same VPN disables IPv6 on the adapter outright, so no AAAA is
+    # ever returned and Node never sees the problem. Hence "it works on Windows".
+    #
+    # `ipv4first` is what Node did by default for its entire life before v17, so this
+    # restores long-standing behaviour rather than inventing one. Append rather than
+    # overwrite, so an explicit NODE_OPTIONS still wins and a v6-only host can override.
+    #
+    # ⚠️ **This does NOT fix the CEP panel itself — VERIFIED, do not re-propose it as one.**
+    # CEP embeds Node as a *library* inside CEF, which never runs Node's argument
+    # processing, so NODE_OPTIONS is ignored there. Measured in the live panel after a
+    # relaunch carrying this change:
+    #     NODE_OPTIONS = "--dns-result-order=ipv4first"   (delivered)
+    #     process.execArgv = []                           (embedded: no arg parsing)
+    #     dns.lookup -> 2606:4700::6812:1123 fam6         (STILL IPv6)
+    #     https.get  -> ERR ECONNREFUSED
+    # It is kept because it does apply to node CHILD PROCESSES a plugin spawns, which
+    # are ordinary Node startups. The panel's own requests can only be fixed by making
+    # the host stop handing out unreachable AAAA records.
+    #
+    # ⛔ Do NOT "fix" this in Wine. Windows' getaddrinfo prefers a global IPv6 address in
+    # exactly the same way (RFC 6724); Wine matches Windows here. It only LOOKS
+    # Windows-specific because VPN-on-Windows removes the IPv6 address from the
+    # adapter, while VPN-on-Linux blocks IPv6 and leaves the ISP address in place.
+    # Reordering DNS inside Wine would be Wine deviating from Windows for every app.
+    # The real fix is the network: `VPN tunnel set ipv6 on`, or drop IPv6 on the
+    # interface. See docs/wiki/APPS.md "Captioneer licence 101".
+    _node_opts = env.get("NODE_OPTIONS", "")
+    if "--dns-result-order" not in _node_opts:
+        env["NODE_OPTIONS"] = (_node_opts + " --dns-result-order=ipv4first").strip()
 
     # GPU-vendor ICD (NVIDIA default; TODO: generalize per detected GPU).
     if os.path.isfile(NVIDIA_EGL_ICD):
