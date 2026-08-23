@@ -37,3 +37,11 @@ webview2/
 # artifacts like webview2/, not committed — see install_mono_gecko).
 /mono/
 /gecko/
+
+# release bundles + runtime backups (large binaries, never in git)
+dist/*.run
+dist/*.run.sha256
+dist/tester-r5/
+runtime-bak-*/
+_rollback-*/
+preserved-fixes/hangs/
