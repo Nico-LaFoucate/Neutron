@@ -865,6 +865,37 @@ def resolve_runtime():
     return None
 
 
+def _sha256_file(path):
+    """Content digest. Used to report which staged builtins actually changed --
+    ⛔ never compare sizes for this: two different builds of the same DLL routinely
+    come out byte-for-byte the same LENGTH."""
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _is_wine_builtin(path):
+    """True if `path` is a Wine-BUILT PE. Wine stamps every builtin it compiles with
+    "Wine builtin DLL" in the DOS stub, so this is provenance, not a guess -- and the
+    guess is what there was before: `runtime/dlls/` mixes DXVK, vkd3d-proton, Microsoft's
+    real VC++ redist and our own wine builtins under names that collide with Wine's
+    (d3d11, dxgi, msvcp140, msxml3 ...). Staging the wrong one either downgrades a fix or
+    replaces a third-party native with a Wine stub; both look like a mass regression.
+    ⛔ Do NOT substitute a name/size test. `msvcp140_2.dll` in the current bundle is
+    byte-different from 11.10-61's and EXACTLY the same size (61709). """
+    try:
+        with open(path, "rb") as f:
+            return b"Wine builtin DLL" in f.read(512)
+    except OSError:
+        return False
+
+
 def session_is_wayland():
     return (os.environ.get("XDG_SESSION_TYPE") == "wayland"
             and bool(os.environ.get("WAYLAND_DISPLAY")))
@@ -2296,22 +2327,56 @@ def cmd_prefix_provision(args):
             log(f"runtime overrides.json unreadable: {e}")
             overrides = {}
         files_staged = 0
-        for scope in ("system32", "syswow64"):
+        # NEUTRON: the DLL bundle is a SNAPSHOT of some past prefix, and provisioning used to
+        # copy all of it over the prefix unconditionally -- including the wine builtins that
+        # were captured with it. Provisioning a prefix pinned to 11.10-58 therefore reinstated
+        # the 11.10-45 dwrite.dll (the use-after-free one) and read as a mass regression with
+        # no code change behind it. The bundle is still the right source for everything that
+        # is NOT ours (DXVK, vkd3d-proton, nvidia, Microsoft's VC++ redist); for the handful
+        # that IS ours, the PINNED RUNTIME is the authority and the bundle is merely stale.
+        # Prefer the runtime's copy per file, so this self-heals on every provision instead of
+        # waiting for someone to re-run `neutron runtime capture`.
+        rt_root = os.path.dirname(os.path.dirname(os.path.realpath(wine)))   # <rt>/bin/wine -> <rt>
+        refreshed, unrefreshable = [], []
+        for scope, pedir in (("system32", "x86_64-windows"), ("syswow64", "i386-windows")):
             srcdir = os.path.join(runtime, "dlls", scope)
             dstdir = os.path.join(prefix, "drive_c", "windows", scope)
+            rtpe = os.path.join(rt_root, "lib", "wine", pedir)
             if os.path.isdir(srcdir):
                 os.makedirs(dstdir, exist_ok=True)
                 for fn in os.listdir(srcdir):
+                    src = os.path.join(srcdir, fn)
+                    if _is_wine_builtin(src):
+                        cand = os.path.join(rtpe, fn)
+                        if os.path.isfile(cand):
+                            if _sha256_file(cand) != _sha256_file(src):
+                                refreshed.append(f"{scope}/{fn}")
+                            src = cand
+                        else:
+                            # No counterpart in the pinned runtime -- a 64-bit-only runtime has
+                            # no i386-windows tree, so every syswow64 builtin lands here. The
+                            # bundle's copy is the only one that exists; stage it, but SAY SO.
+                            # This is the one that can still rot silently.
+                            unrefreshable.append(f"{scope}/{fn}")
                     try:
-                        shutil.copyfile(os.path.join(srcdir, fn), os.path.join(dstdir, fn))
+                        shutil.copyfile(src, os.path.join(dstdir, fn))
                         files_staged += 1
                     except OSError as e:
                         log(f"stage {scope}/{fn} failed: {e}")
+        if refreshed:
+            log("staged from the pinned runtime instead of the (stale) bundle: "
+                + ", ".join(sorted(refreshed)))
+        if unrefreshable:
+            log("⚠️  bundle-only wine builtins (no counterpart in the pinned runtime, "
+                "so they cannot be refreshed here): " + ", ".join(sorted(unrefreshable))
+                + " — re-run `neutron runtime capture` if one of these is suspect")
         for name, val in overrides.items():
             reg_set(wine, prefix, r"HKCU\Software\Wine\DllOverrides", name, "REG_SZ", val)
         event(args, event="progress", stage="dlls", pct=75, msg="staged native DLL overrides from the runtime bundle")
         steps.append({"step": "dll_overrides", "source": "runtime-bundle",
-                      "overrides": len(overrides), "files_staged": files_staged, "ok": True})
+                      "overrides": len(overrides), "files_staged": files_staged, "ok": True,
+                      "builtins_refreshed": sorted(refreshed),
+                      "builtins_bundle_only": sorted(unrefreshable)})
     else:
         # No bundle yet: write the minimal override set, but the native DLL FILES
         # aren't staged (apps won't launch until `neutron runtime capture` is run).
@@ -2722,6 +2787,40 @@ def cmd_runtime_install(args):
 
     version = args.version or NEUTRON_WINE_VERSION
     repo = args.repo or NEUTRON_WINE_REPO
+    manifest = None
+
+    # NEUTRON: a --manifest NAMES the version it installs, and --manifest is documented as
+    # overriding --version. It did not: the manifest was resolved further down, AFTER the
+    # already-installed check below had already run against the CLI's compiled-in default.
+    # `neutron runtime install --manifest <newer>` therefore printed
+    # "already-installed <old default>" and installed nothing -- a silent no-op that looks
+    # like a success, which is how a build got handed over as installed when it was not.
+    # Resolve the manifest FIRST when it is the authority, and keep what we parsed so the
+    # main path below does not fetch it twice. A failure here is left to the main path,
+    # which reports it properly.
+    if args.manifest and not args.version:
+        try:
+            with tempfile.TemporaryDirectory(prefix=".mf-") as mdir:
+                mp = os.path.join(mdir, "manifest.json")
+                _download(args.manifest, mp, as_json=True)
+                with open(mp) as f:
+                    manifest = json.load(f)
+            mver = manifest.get("version")
+            if mver and str(mver) != version:
+                if not args.json:
+                    log(f"manifest names version {mver} (CLI default {version}) - installing {mver}")
+                version = str(mver)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # The manifest is the ONLY statement of which version was meant here, so a
+            # failure to resolve it cannot fall through to the already-installed check --
+            # that check would run against the CLI default and report success for a
+            # version the caller never asked for. Same silent-no-op the version fix above
+            # closes, reached by a different door.
+            die({"ok": False, "reason": f"cannot fetch/parse manifest: {e}",
+                 "manifest": args.manifest,
+                 "hint": "pass --version to install a specific runtime without a manifest"},
+                EX_FAIL, args.json)
+
     name = f"neutron-wine-{version}"
     dest_root = NEUTRON_RUNTIMES_DIR
     install_dir = os.path.join(dest_root, name)
@@ -2744,18 +2843,19 @@ def cmd_runtime_install(args):
         # 1. Resolve the manifest (download URL + sha256 live here).
         manifest_src = args.manifest or (
             f"https://github.com/{repo}/releases/download/v{version}/{name}.manifest.json")
-        if not args.json:
-            log(f"resolving manifest: {manifest_src}")
-        mpath = os.path.join(tmp, "manifest.json")
-        try:
-            _download(manifest_src, mpath, as_json=True)
-            with open(mpath) as f:
-                manifest = json.load(f)
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            die({"ok": False, "reason": f"cannot fetch/parse manifest: {e}",
-                 "manifest": manifest_src,
-                 "hint": f"is release v{version} published on {repo}?"},
-                EX_FAIL, args.json)
+        if manifest is None:
+            if not args.json:
+                log(f"resolving manifest: {manifest_src}")
+            mpath = os.path.join(tmp, "manifest.json")
+            try:
+                _download(manifest_src, mpath, as_json=True)
+                with open(mpath) as f:
+                    manifest = json.load(f)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                die({"ok": False, "reason": f"cannot fetch/parse manifest: {e}",
+                     "manifest": manifest_src,
+                     "hint": f"is release v{version} published on {repo}?"},
+                    EX_FAIL, args.json)
 
         sha_want = manifest.get("sha256")
         artifact = manifest.get("artifact") or f"{name}.tar.xz"
