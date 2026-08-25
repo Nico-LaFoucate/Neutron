@@ -2471,6 +2471,13 @@ def cmd_prefix_provision(args):
             "substitutes) — After Effects will fail at startup. Run "
             "`winetricks corefonts` against this prefix.")
 
+    # Desktop identity: a .desktop + extracted icon per installed app. Gives each app its own
+    # dock icon (StartupWMClass = Wine's app_id) instead of inheriting Collider's, and puts the
+    # suite in the application menu. See register_app_desktop_entries().
+    desktop_entries = register_app_desktop_entries(prefix)
+    steps.append({"step": "desktop_entries", "ok": True, "count": len(desktop_entries),
+                  "detail": desktop_entries})
+
     # WebView2: stage + register the runtime or Adobe's in-app web sign-in (IMS)
     # renders BLANK (the installer's Common Files copy is unregistered).
     wv2 = register_webview2(wine, prefix)
@@ -3379,6 +3386,131 @@ def _app_icon(exe):
         return None
 
 
+def register_app_desktop_entries(prefix):
+    """Give every installed app its OWN desktop identity: a .desktop entry + an icon.
+
+    TWO problems, one fix.
+
+    1. **The dock icon.** Wine advertises a Wayland `app_id` equal to the LOWERCASED EXE BASENAME
+       (`waylanddrv_main.c:wayland_init_process_name` — basename, downcased, `.exe` kept). The
+       compositor matches that against installed .desktop files to choose an icon. Nothing
+       matched, so an app launched from Collider was attributed to COLLIDER and wore its icon.
+       `StartupWMClass` is that match.
+
+    2. **Real menu entries**, so the suite can be launched without Collider at all. `Exec=` runs
+       the same `neutron launch` Collider runs, so a menu launch and a Collider launch are the
+       same launch — and Collider can adopt an app started either way (`cmd_apps` reports
+       `running`/`pid`).
+
+    ⚖️ Icons are extracted from the user's OWN installed copy, on their OWN machine, at provision
+    time. We never redistribute an Adobe icon.
+
+    Idempotent; safe to run on every provision. Returns a per-app summary.
+    """
+    apps_dir = os.path.join(HOME, ".local", "share", "applications")
+    icon_dir = os.path.join(HOME, ".local", "share", "icons", "hicolor", "256x256", "apps")
+    os.makedirs(apps_dir, exist_ok=True)
+    os.makedirs(icon_dir, exist_ok=True)
+    written = []
+
+    for app_id, p in APP_PROFILES.items():
+        exe = _resolve_app_exe(prefix, p["exe"]) if prefix else ""
+        if not (exe and os.path.isfile(exe)):
+            continue
+
+        # The app_id the compositor will see. MUST match Wine exactly or the icon will not bind.
+        wm_class = os.path.basename(exe).lower()
+
+        icon_name = "neutron-%s" % app_id
+        icon_path = os.path.join(icon_dir, icon_name + ".png")
+        have_icon = False
+        try:
+            if not (os.path.isfile(icon_path)
+                    and os.path.getmtime(icon_path) >= os.path.getmtime(exe)):
+                png = _pe_extract_icon_png(exe)
+                if png:
+                    with open(icon_path, "wb") as f:
+                        f.write(png)
+            have_icon = os.path.isfile(icon_path)
+        except OSError as e:
+            log("desktop entry: icon for %s failed: %s" % (app_id, e))
+
+        desktop = os.path.join(apps_dir, "neutron-%s.desktop" % app_id)
+        # Exec: hard-set PATH for the same reason collider.desktop does — a menu launch gets the
+        # desktop environment's PATH, not the login shell's, and would not find `neutron`.
+        body = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=%s\n"
+            "Comment=%s via Neutron\n"
+            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin neutron launch %s --prefix %s\n"
+            "Icon=%s\n"
+            "Terminal=false\n"
+            "Categories=Graphics;AudioVideo;\n"
+            # ⭐ THE LINE THAT FIXES THE DOCK ICON. Wine's app_id, verbatim.
+            "StartupWMClass=%s\n"
+            "StartupNotify=false\n"
+            % (p["name"], p["name"], HOME, app_id, prefix,
+               icon_name if have_icon else "collider", wm_class))
+        try:
+            prev = ""
+            if os.path.isfile(desktop):
+                with open(desktop) as f:
+                    prev = f.read()
+            if prev != body:
+                with open(desktop, "w") as f:
+                    f.write(body)
+                os.chmod(desktop, 0o755)
+            written.append({"app": app_id, "wm_class": wm_class, "icon": have_icon})
+        except OSError as e:
+            log("desktop entry: %s failed: %s" % (app_id, e))
+
+    if written:
+        try:
+            subprocess.run(["update-desktop-database", apps_dir],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except Exception:
+            pass
+    return written
+
+
+def _app_running_pid(exe):
+    """PID of a live process running `exe` in this prefix, or None.
+
+    ⛔ Matches on /proc/<pid>/exe and the FULL windows path in the cmdline — never a loose
+    substring of the app NAME. A cmdline match on something like "premiere" also matches the
+    grep, the launcher, and this very process; that trap has cost real time before
+    (preserved-fixes/harnesses/premiere_live.py exists because of it). Skips our own pid.
+    """
+    if not exe:
+        return None
+    want = os.path.basename(exe).lower()
+    me = os.getpid()
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return None
+    for d in pids:
+        pid = int(d)
+        if pid == me:
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                parts = f.read().split(b"\0")
+        except OSError:
+            continue
+        # argv[0] is the wine loader; the windows exe path is a later argument. Require the
+        # BASENAME to match a full path component, not appear anywhere in the string.
+        for a in parts:
+            try:
+                t = a.decode("utf-8", "replace").lower()
+            except Exception:
+                continue
+            if t.endswith(want) and ("\\" in t or "/" in t):
+                return pid
+    return None
+
+
 def cmd_apps(args):
     """List the Adobe apps Neutron can launch + their install status in a prefix.
     Powers Collider's app catalog (one tinted widget per installed app). Never
@@ -3396,6 +3528,11 @@ def cmd_apps(args):
             "export": p.get("export", False),
             "installed": installed,
             "exe": exe,
+            # Collider adopts these so an app launched from the APPLICATION MENU still shows as
+            # Running in the GUI and can be force-quit there. Without it a menu launch is
+            # invisible to Collider and clicking Launch would start a SECOND copy.
+            "running": bool(_app_running_pid(exe)) if installed else False,
+            "pid": _app_running_pid(exe) if installed else None,
             "icon": _app_icon(exe) if installed else None,   # real logo (lowest-ID group); None -> monogram
         })
     # Installed first, then alphabetical — a stable order for the widget grid.
