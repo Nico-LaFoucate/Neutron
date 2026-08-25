@@ -3257,45 +3257,122 @@ def _app_version(exe_rel):
     return ""
 
 
-def _app_icon(exe):
-    """Extract the app's REAL logo as a PNG `data:` URI, cached under
-    ~/.cache/collider/appicons. The main app icon is the LOWEST-ID group icon
-    (type 14) — verified true for every Adobe app (Ps/Pr/Ae/Ai/An/LrC/Me). Needs
-    icoutils (wrestool + icotool); returns None if absent or extraction fails ->
-    the UI falls back to the monogram badge."""
-    import base64, glob, tempfile, hashlib, re as _re, shutil as _sh
-    if not (_sh.which("wrestool") and _sh.which("icotool")):
+def _pe_extract_icon_png(exe):
+    """The app's largest icon as PNG BYTES, parsed straight out of the PE. NO EXTERNAL TOOLS.
+
+    This used to shell out to `wrestool` + `icotool` and return None when they were missing — so on
+    a machine without icoutils (a build tester's, say) Collider silently fell back to monogram
+    badges and any .desktop we write would have no icon. The installer is user-space with no root,
+    so we cannot make icoutils a dependency; parsing the PE ourselves is ~60 lines and always works.
+
+    Adobe stores its large sizes as PNG inside the .ico, so the common path lifts those bytes
+    VERBATIM — no decode, no re-encode, no quality loss. Older/smaller entries are BMP (DIB) and
+    are converted with `zlib` from the standard library.
+
+    ⚖️ We extract from the user's OWN installed copy on their OWN machine, and never redistribute
+    an Adobe icon — a deliberate decision, not an accident of implementation.
+    """
+    import struct, zlib
+
+    def u16(b, o): return struct.unpack_from("<H", b, o)[0]
+    def u32(b, o): return struct.unpack_from("<I", b, o)[0]
+
+    try:
+        with open(exe, "rb") as f:
+            d = f.read()
+        pe = u32(d, 0x3c)
+        if d[pe:pe + 4] != b"PE\0\0":
+            return None
+        nsec, optsz, opt = u16(d, pe + 6), u16(d, pe + 20), pe + 24
+        ddoff = opt + (112 if u16(d, opt) == 0x20b else 96)
+        res_rva = u32(d, ddoff + 2 * 8)
+        if not res_rva:
+            return None
+        secs = [(u32(d, opt + optsz + i * 40 + 12), u32(d, opt + optsz + i * 40 + 8),
+                 u32(d, opt + optsz + i * 40 + 20)) for i in range(nsec)]
+
+        def rva2off(r):
+            for va, vs, raw in secs:
+                if va <= r < va + max(vs, 1):
+                    return raw + (r - va)
+            return None
+
+        rbase = rva2off(res_rva)
+        if rbase is None:
+            return None
+
+        def entries(off):
+            n = u16(d, off + 12) + u16(d, off + 14)
+            return [(u32(d, off + 16 + i * 8), u32(d, off + 16 + i * 8 + 4)) for i in range(n)]
+
+        best = None   # (width, bytes, kind)
+        for eid, eoff in entries(rbase):
+            if (eid & 0x7fffffff) != 3 or not (eoff & 0x80000000):   # RT_ICON
+                continue
+            for _, noff in entries(rbase + (eoff & 0x7fffffff)):
+                if not (noff & 0x80000000):
+                    continue
+                for _, loff in entries(rbase + (noff & 0x7fffffff)):
+                    if loff & 0x80000000:
+                        continue
+                    de = rbase + loff
+                    doff, size = rva2off(u32(d, de)), u32(d, de + 4)
+                    if doff is None:
+                        continue
+                    blob = d[doff:doff + size]
+                    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+                        w = struct.unpack_from(">I", blob, 16)[0]
+                        if not best or w > best[0]:
+                            best = (w, blob, "png")
+                    elif len(blob) >= 40 and u32(blob, 0) == 40 and u16(blob, 14) == 32:
+                        w, h = u32(blob, 4), u32(blob, 8) // 2
+                        if w and h and (not best or w > best[0]):
+                            best = (w, blob, "dib")
+        if not best:
+            return None
+        w, blob, kind = best
+        if kind == "png":
+            return blob
+
+        # 32-bit BGRA DIB, bottom-up, no colour table -> minimal PNG via stdlib zlib.
+        h = u32(blob, 8) // 2
+        px = blob[40:40 + w * h * 4]
+        if len(px) < w * h * 4:
+            return None
+        raw = bytearray()
+        for y in range(h - 1, -1, -1):          # bottom-up
+            raw.append(0)                        # filter: none
+            row = px[y * w * 4:(y + 1) * w * 4]
+            for x in range(0, len(row), 4):
+                b, g, r, a = row[x:x + 4]
+                raw += bytes((r, g, b, a))
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+                + chunk(b"IEND", b""))
+    except Exception:
         return None
+
+
+def _app_icon(exe):
+    """The app's real logo as a PNG `data:` URI for Collider's widgets, cached under
+    ~/.cache/collider/appicons. Returns None only if the PE genuinely has no icon, in which case
+    the UI falls back to its monogram badge."""
+    import base64, hashlib
     try:
         cache_dir = os.path.join(HOME, ".cache", "collider", "appicons")
         os.makedirs(cache_dir, exist_ok=True)
-        # cache key includes an extraction-scheme tag so a logic change invalidates old caches
-        cached = os.path.join(cache_dir, hashlib.sha1((exe + "|lowid-v1").encode()).hexdigest()[:16] + ".png")
+        cached = os.path.join(cache_dir,
+                              hashlib.sha1((exe + "|pe-v2").encode()).hexdigest()[:16] + ".png")
         if not (os.path.isfile(cached) and os.path.getmtime(cached) >= os.path.getmtime(exe)):
-            listing = subprocess.run(["wrestool", "-l", exe], capture_output=True,
-                                     text=True, timeout=30).stdout
-            ids = sorted(int(m) for ln in listing.splitlines() if "--type=14 " in ln
-                         for m in _re.findall(r"--name=(\d+)", ln))
-            if not ids:
+            png = _pe_extract_icon_png(exe)
+            if not png:
                 return None
-            with tempfile.TemporaryDirectory() as td:
-                ico = os.path.join(td, "app.ico")
-                r = subprocess.run(["wrestool", "-x", "-t", "14", "--name", str(ids[0]), "-o", ico, exe],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-                if r.returncode != 0 or not os.path.isfile(ico):
-                    return None
-                subprocess.run(["icotool", "-x", "-o", td, ico],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-                pngs = glob.glob(os.path.join(td, "*.png"))
-                if not pngs:
-                    return None
-                def area(p):   # icotool names files ..._<idx>_<W>x<H>x<depth>.png
-                    try:
-                        wh = os.path.basename(p).rsplit("_", 1)[-1].split("x")
-                        return int(wh[0]) * int(wh[1])
-                    except Exception:
-                        return 0
-                _sh.copyfile(max(pngs, key=area), cached)
+            with open(cached, "wb") as f:
+                f.write(png)
         with open(cached, "rb") as f:
             return "data:image/png;base64," + base64.b64encode(f.read()).decode()
     except Exception:
