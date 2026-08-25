@@ -2353,7 +2353,12 @@ def cmd_prefix_provision(args):
                                 refreshed.append(f"{scope}/{fn}")
                             src = cand
                         else:
-                            # No counterpart in the pinned runtime -- a 64-bit-only runtime has
+                            # No counterpart in the pinned runtime. ⛔ This was first written as
+                            # "a 64-bit-only runtime has no i386-windows tree" -- that was read off
+                            # 11.10-61, which shipped BROKEN with an empty i386-windows; 60 and 62
+                            # carry 1,101 files and refresh all eight. A healthy runtime should hit
+                            # this path for nothing, so anything landing here is a signal that the
+                            # runtime is incomplete, not a fact of life.
                             # no i386-windows tree, so every syswow64 builtin lands here. The
                             # bundle's copy is the only one that exists; stage it, but SAY SO.
                             # This is the one that can still rot silently.
