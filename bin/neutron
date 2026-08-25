@@ -3407,6 +3407,18 @@ def register_app_desktop_entries(prefix):
 
     Idempotent; safe to run on every provision. Returns a per-app summary.
     """
+    # The runtime these entries must pin: the one resolve_wine() picks right now, taken from its
+    # path so it cannot drift from reality. Falls back to the CLI default only if unparseable.
+    pinned_version = NEUTRON_WINE_VERSION
+    try:
+        _w, _is_neutron = resolve_wine()
+        if _is_neutron and _w:
+            _root = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(_w))))
+            if _root.startswith("neutron-wine-"):
+                pinned_version = _root[len("neutron-wine-"):]
+    except Exception:
+        pass
+
     apps_dir = os.path.join(HOME, ".local", "share", "applications")
     icon_dir = os.path.join(HOME, ".local", "share", "icons", "hicolor", "256x256", "apps")
     os.makedirs(apps_dir, exist_ok=True)
@@ -3443,14 +3455,22 @@ def register_app_desktop_entries(prefix):
             "Type=Application\n"
             "Name=%s\n"
             "Comment=%s via Neutron\n"
-            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin neutron launch %s --prefix %s\n"
+            # 🚨 PIN THE RUNTIME. Without NEUTRON_WINE_VERSION a menu launch uses the CLI's
+            # compiled-in DEFAULT, which is generally NOT the runtime this prefix is stamped for —
+            # and an unpinned launch against a different-stamp runtime fires `wineboot -u`, which
+            # reverts the patched natives and reads as a mass regression (RUNBOOK, and the reason
+            # the stack bundle's own wrapper pins it). Measured 2026-08-25: these entries shipped
+            # unpinned for a few hours, the user launched from the menu, and the prefix was
+            # re-stamped from 11.10-62 back to the CLI default 11.10-59 with dwrite/dcomp/dxcore
+            # all reverted to builtins.
+            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin NEUTRON_WINE_VERSION=%s neutron launch %s --prefix %s\n"
             "Icon=%s\n"
             "Terminal=false\n"
             "Categories=Graphics;AudioVideo;\n"
             # ⭐ THE LINE THAT FIXES THE DOCK ICON. Wine's app_id, verbatim.
             "StartupWMClass=%s\n"
             "StartupNotify=false\n"
-            % (p["name"], p["name"], HOME, app_id, prefix,
+            % (p["name"], p["name"], HOME, pinned_version, app_id, prefix,
                icon_name if have_icon else "collider", wm_class))
         try:
             prev = ""
