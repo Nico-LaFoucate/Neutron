@@ -2566,10 +2566,10 @@ def cmd_prefix_provision(args):
     steps.append({"step": "desktop_entries", "ok": True,
                   "count": len(desktop_entries["entries"]),
                   "icons": sum(1 for e in desktop_entries["entries"] if e["icon"]),
-                  # Named explicitly because a tester who provisions inside a live session used
-                  # to see generic icons and report extraction as broken; now the refresh is
-                  # part of the step and its result is visible.
-                  "caches_refreshed": bool(desktop_entries["entries"]),
+                  # PER TOOL, not a boolean. A tester who provisions inside a live session used
+                  # to see generic icons and report extraction as broken; the refresh is part of
+                  # the step now, and if one of the refreshers fails the report says which.
+                  "caches": desktop_entries["caches"],
                   "superseded": desktop_entries["superseded"],
                   "claimed_types": desktop_entries["claimed_types"],
                   "detail": desktop_entries["entries"]})
@@ -3688,26 +3688,33 @@ def refresh_desktop_caches(apps_dir):
     All best-effort: each tool is absent on some desktops, and none of them failing is fatal.
     """
     icon_root = os.path.join(HOME, ".local", "share", "icons", "hicolor")
+    result = {}
     for cmd in (["update-desktop-database", apps_dir],
                 # -t/--ignore-theme-index: our hicolor tree has no index.theme of its own.
                 ["gtk-update-icon-cache", "-f", "-t", icon_root],
                 ["kbuildsycoca6", "--noincremental"],
                 ["kbuildsycoca5", "--noincremental"],
-                ["xdg-desktop-menu", "forceupdate"]):
+                ["xdg-desktop-menu", "forceupdate"],
+                # KDE caches icons per-process; this tells running KDE apps to drop theirs.
+                ["dbus-send", "--session", "--type=signal", "/KIconLoader",
+                 "org.kde.KIconLoader.iconChanged", "int32:0"]):
         if not shutil.which(cmd[0]):
+            result[cmd[0]] = "absent"
             continue
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        except Exception:
-            pass
-    # KDE caches icons per-process; this tells running KDE apps to drop theirs.
-    if shutil.which("dbus-send"):
-        try:
-            subprocess.run(["dbus-send", "--session", "--type=signal", "/KIconLoader",
-                            "org.kde.KIconLoader.iconChanged", "int32:0"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-        except Exception:
-            pass
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+            result[cmd[0]] = "ok" if r.returncode == 0 else (
+                "rc=%d %s" % (r.returncode, (r.stderr or b"").decode("utf-8", "replace").strip()[:120]))
+        except Exception as e:
+            result[cmd[0]] = "failed: %s" % e
+    # ⚠️ REPORT EACH ONE. Do not collapse this to a boolean: on the dev box
+    # `gtk-update-icon-cache -f -t` exits 1 with "The generated cache was invalid" (a 20x19
+    # directory in the tree) while every other refresh succeeds -- and a step that answered
+    # "caches refreshed: true" over that failure would be the same mistake as the bug it fixes.
+    # Harmless in this instance, because GTK compares the cache against directory mtimes and
+    # ignores a stale one (verified: Gtk.IconTheme resolves neutron-* against a June cache), but
+    # "harmless" is a conclusion for a reader to reach, not for this function to assume.
+    return result
 
 
 def register_app_desktop_entries(prefix):
@@ -3831,10 +3838,9 @@ def register_app_desktop_entries(prefix):
 
     superseded = retire_superseded_entries(apps_dir, [w["app"] for w in written])
     claimed = repair_mime_defaults(apps_dir, written)
-    if written:
-        refresh_desktop_caches(apps_dir)
+    caches = refresh_desktop_caches(apps_dir) if written else {}
     return {"entries": written, "superseded": superseded, "claimed_types": claimed,
-            "rewrote": changed}
+            "rewrote": changed, "caches": caches}
 
 
 def _app_running_pid(exe):
