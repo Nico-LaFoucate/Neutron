@@ -941,6 +941,88 @@ def resolve_wine():
     return sysw, False
 
 
+def _prefix_stamp(prefix):
+    """The runtime stamp a prefix is currently booted onto, or None.
+
+    Wine writes its `share/wine/wine.inf` mtime into `<prefix>/.update-timestamp` at wineboot and
+    compares the two on every launch: DIFFERENT stamp => it runs `wineboot -u`. That update is
+    what reverts our patched natives (dwrite/dcomp/dxcore) and reads as a mass regression with no
+    code change behind it.
+
+    ⚠️ The stamp file is CRLF. A naive read keeps the \\r and never matches -- the trap that cost
+    `preserved-fixes/harnesses/runtime_for_prefix.sh` its comment block.
+    """
+    try:
+        with open(os.path.join(prefix, ".update-timestamp")) as f:
+            digits = "".join(c for c in f.read() if c.isdigit())
+        return int(digits) if digits else None
+    except (OSError, ValueError):
+        return None
+
+
+def _runtime_stamp(wine_path):
+    """The stamp a given wine would impose on a prefix (its wine.inf mtime), or None."""
+    if not wine_path:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.realpath(wine_path)))
+    try:
+        return int(os.path.getmtime(os.path.join(root, "share", "wine", "wine.inf")))
+    except OSError:
+        return None
+
+
+def _runtimes_matching_stamp(stamp):
+    """Installed runtime versions whose wine.inf mtime equals `stamp`.
+
+    ⚠️ Deliberately a LIST, not a single answer. We pin wine.inf mtimes across releases on purpose
+    so that a prefix does not re-stamp, which means several runtimes routinely share one stamp
+    (11.10-45/58/59/60/62 all did). Resolving a runtime FROM the stamp therefore cannot be trusted
+    to pick the newest -- `adobe-smoke.sh` did exactly that and silently launched Animate on
+    11.10-23, voiding the test. So this is used to EXPLAIN a mismatch, never to choose.
+    """
+    out = []
+    try:
+        names = sorted(os.listdir(NEUTRON_RUNTIMES_DIR))
+    except OSError:
+        return out
+    for name in names:
+        if not name.startswith("neutron-wine-"):
+            continue
+        inf = os.path.join(NEUTRON_RUNTIMES_DIR, name, "share", "wine", "wine.inf")
+        try:
+            if int(os.path.getmtime(inf)) == stamp:
+                out.append(name[len("neutron-wine-"):])
+        except OSError:
+            continue
+    return out
+
+
+def stamp_mismatch(prefix, wine_path):
+    """None if this wine can launch into this prefix without re-stamping it; else an explanation.
+
+    🚨 THIS IS THE CLOBBER, MADE LOUD. Launching a prefix on a different-stamp runtime fires
+    `wineboot -u` and reverts the patched natives. It has happened repeatedly and has never once
+    announced itself -- the user sees seven apps regress at once and goes looking for a code
+    change that does not exist (2026-07-19, 2026-07-29/30, and again 2026-08-25 when generated
+    .desktop entries shipped unpinned for a few hours).
+
+    Predicted independently by the build tester 2026-08-25 as the next occurrence: install a newer
+    runtime, the wrapper's default moves, the prefix stays stamped to the old one, and every
+    launch surface that is not an explicitly pinned .desktop entry clobbers the prefix.
+
+    ⛔ Both values must be READABLE before we complain. A prefix with no stamp is a prefix that has
+    never been booted, and refusing to launch it would be inventing a problem -- the same
+    "render unknown as an answer" mistake that put "X11" in Collider's UI on a Wayland session.
+    """
+    want = _prefix_stamp(prefix)
+    have = _runtime_stamp(wine_path)
+    if want is None or have is None or want == have:
+        return None
+    return {"prefix_stamp": want, "runtime_stamp": have,
+            "runtime": os.path.dirname(os.path.dirname(os.path.realpath(wine_path))),
+            "prefix_runtimes": _runtimes_matching_stamp(want)}
+
+
 def resolve_runtime():
     """The Neutron runtime DLL bundle dir (has overrides.json + dlls/), or None."""
     for c in NEUTRON_RUNTIME_CANDIDATES:
@@ -3127,6 +3209,32 @@ def cmd_launch(args):
         log("WARNING: using system wine - Neutron patches (frame pacer / winewayland "
             "fractional-scale) are NOT present; playback/UI fixes will be inactive")
 
+    # 🚨 REFUSE A LAUNCH THAT WOULD RE-STAMP THE PREFIX. Wine compares its wine.inf mtime against
+    # <prefix>/.update-timestamp and silently runs `wineboot -u` when they differ, reverting the
+    # patched natives. Every occurrence of this has been diagnosed as a code regression first and
+    # a stamp mismatch second, at a cost of hours each time. `provision` re-stamps AND re-stages
+    # the natives, which is why it is the offered remedy rather than "just let it clobber".
+    #
+    # ⛔ Deliberately NOT "resolve the runtime from the stamp instead". Stamps are pinned across
+    # releases on purpose, so several runtimes share one and stamp-derived resolution silently
+    # picks the wrong one -- that is what voided the first Animate test. Detect, explain, stop.
+    mismatch = stamp_mismatch(prefix, wine)
+    if mismatch and not args.allow_restamp:
+        also = mismatch["prefix_runtimes"]
+        die({"launched": False,
+             "reason": "this runtime would RE-STAMP the prefix and revert its patched natives "
+                       "(wine runs `wineboot -u` when the stamps differ)",
+             "fix": "run `neutron prefix provision %s` first — it re-stamps and re-stages the "
+                    "natives — or pass --allow-restamp to accept the clobber" % prefix,
+             "prefix_is_stamped_for": (", ".join(also) if also
+                                       else "no installed runtime (stamp %d)"
+                                            % mismatch["prefix_stamp"]),
+             **mismatch}, EX_FAIL, args.json)
+    if mismatch:
+        log("WARNING: --allow-restamp: launching on a different-stamp runtime. wine will run "
+            "`wineboot -u` and REVERT the prefix's patched natives (dwrite/dcomp/dxcore). "
+            "Run `neutron prefix provision %s` afterwards to restore them." % prefix)
+
     dxvk_conf = os.path.join(prefix, profile["dxvk_conf"])
     env = dict(os.environ)
     env["WINEPREFIX"] = prefix
@@ -4003,6 +4111,21 @@ def cmd_doctor(args):
         else:
             user = prefix_user(prefix)
             check("prefix", True, prefix)
+            # Would launching this prefix on the runtime we just resolved re-stamp it? Same test
+            # `launch` refuses on, surfaced here so Collider shows it BEFORE someone clicks
+            # Launch. Silent when the prefix has never been booted.
+            _mm = stamp_mismatch(prefix, _wine)
+            if _mm is not None:
+                _also = _mm["prefix_runtimes"]
+                check("runtime-prefix-stamp", False,
+                      "this prefix is stamped for %s but the resolved runtime is %s — launching "
+                      "would run `wineboot -u` and REVERT the patched natives. Run "
+                      "`neutron prefix provision %s`."
+                      % (", ".join(_also) if _also else "stamp %d (no installed runtime)"
+                         % _mm["prefix_stamp"], os.path.basename(_mm["runtime"]), prefix))
+            elif _prefix_stamp(prefix) is not None:
+                check("runtime-prefix-stamp", True,
+                      "prefix and runtime agree (stamp %d)" % _prefix_stamp(prefix))
             # App-agnostic health: a prefix is usable if ANY known Adobe app is
             # installed (not Premiere specifically) — else a Photoshop-only prefix
             # would read as "unhealthy" and gate the whole UI.
@@ -4161,6 +4284,11 @@ def build_parser():
     pl.add_argument("--prefix", default=None)
     pl.add_argument("--project", default=None,
                     help="optional project path (Windows-style, e.g. C:\\...\\x.prproj)")
+    pl.add_argument("--allow-restamp", action="store_true",
+                    help="launch even when this runtime's stamp differs from the prefix's. Wine "
+                         "will run `wineboot -u` and REVERT the prefix's patched natives. Use "
+                         "only when deliberately moving a prefix to a new runtime, and run "
+                         "`prefix provision` afterwards.")
     pl.add_argument("project_file", nargs="?", default=None,
                     help="optional file to open, e.g. from a .desktop file association "
                          "(a Linux path is translated to a Windows Z:\\ path)")
