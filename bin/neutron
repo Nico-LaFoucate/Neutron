@@ -723,27 +723,71 @@ def collider_selected_prefix():
     return None
 
 
+# Directories never worth descending into looking for a prefix: huge, or guaranteed not to hold
+# one. Keeps the two-level scan cheap enough to run on every command.
+_DISCOVER_SKIP = {
+    ".cache", ".git", ".local", ".config", ".mozilla", ".npm", ".nvm", ".rustup", ".cargo",
+    ".steam", ".var", "node_modules", "snap", ".gradle", ".m2", ".thunderbird", ".pki",
+    "Downloads", "Music", "Pictures", "Videos", ".android", ".docker", ".vscode",
+}
+_DISCOVER_MAX_DIRS = 4000       # hard stop; a pathological home must not make the CLI feel slow
+
+
 def discover_prefixes():
-    """Every wine prefix we can see, newest-first. A prefix is a dir containing `drive_c`."""
-    seen, out = set(), []
+    """Every wine prefix we can see, newest-first. A prefix is a dir containing `drive_c`.
+
+    Scans each root **two levels deep**. One level was not enough: the build tester keeps their
+    prefix at `~/Neutron/Adobe`, so its parent is `~/Neutron` rather than `$HOME`, and discovery
+    returned **[]** on a machine with a perfectly good prefix sitting in it (2026-08-26). That is
+    a natural way to organise -- a folder named for the tool, holding its prefixes -- and Mud Hut
+    imposes no layout of its own, so it is a user choice other users will repeat.
+
+    ⚠️ It was fully masked by Collider's selection resolving first, which made
+    `~/.config/collider/config.json` a single point of failure for prefix resolution: absent,
+    reset or corrupt, and every command without `--prefix` answered "no wine prefix found" with
+    an empty candidate list -- accurate, well-explained, and still wrong. The third resolution
+    tier was dead code on that layout. Found by the tester asking discovery directly rather than
+    trusting that the tier it never reaches works.
+    """
+    seen, out, budget = set(), [], _DISCOVER_MAX_DIRS
     roots = [HOME, os.path.join(HOME, "Games"), os.path.join(HOME, ".local", "share", "wineprefixes")]
     env = os.environ.get("WINEPREFIX")
     if env:
         roots.insert(0, os.path.dirname(os.path.abspath(os.path.expanduser(env))))
+
+    def consider(d):
+        if d in seen or not os.path.isdir(os.path.join(d, "drive_c")):
+            return False
+        seen.add(d)
+        out.append(d)
+        return True
+
     for root in roots:
         if not os.path.isdir(root):
             continue
         try:
-            entries = os.listdir(root)
+            entries = sorted(os.listdir(root))
         except OSError:
             continue
         for name in entries:
+            if budget <= 0:
+                break
+            budget -= 1
             d = os.path.join(root, name)
-            if d in seen:
+            if not os.path.isdir(d):
                 continue
-            if os.path.isdir(os.path.join(d, "drive_c")):
-                seen.add(d)
-                out.append(d)
+            # A prefix itself is never descended into -- drive_c holds thousands of dirs.
+            if consider(d) or name in _DISCOVER_SKIP:
+                continue
+            try:
+                children = sorted(os.listdir(d))
+            except OSError:
+                continue
+            for sub in children:
+                if budget <= 0:
+                    break
+                budget -= 1
+                consider(os.path.join(d, sub))
     out.sort(key=lambda d: os.path.getmtime(d), reverse=True)
     return out
 
@@ -3522,8 +3566,27 @@ def cmd_launch(args):
     # A terminal caller (no --json) still inherits the tty, so `neutron launch
     # ... > my.log 2>&1` keeps working exactly as before and does NOT get a
     # second copy. Only the --json path, which had nowhere to write, gains one.
+    # 🚨 LOG UNLESS A HUMAN IS WATCHING. This used to be gated on `--json`, and the comment above
+    # reasoned about exactly two callers: Collider (passes --json, gets a log) and a terminal
+    # (inherits the tty, so `neutron launch ... > my.log` still works and gains no second copy).
+    # `provision` later added a THIRD caller the comment could not have known about -- the
+    # generated `.desktop` entries, which pass no `--json` and have no tty either. So a launch
+    # from the application menu, the dock, or a double-clicked .psd wrote NO LOG, while the
+    # README and the handoff both tell testers to look in ~/.local/share/neutron/logs/. The
+    # output was not lost -- Plasma runs .desktop entries as systemd user scopes, so it went to
+    # the journal under `app-neutron\x2dpremiere@<hash>.service`, which nobody would guess --
+    # but the documented procedure found nothing. Reported from the build tester 2026-08-26, and
+    # it matters because `provision` made the menu the NATURAL way to launch: the friction fix
+    # turned the no-diagnostics path into the default one.
+    #
+    # ⛔ Not fixed by adding `--json` to the Exec line (the tester's suggestion, and it would
+    # work): that overloads a flag meaning "emit machine-readable output" to also mean "write a
+    # log", so the next launch surface added without it silently regresses this again. The real
+    # condition is whether anyone can SEE the output. stderr-is-a-tty answers that directly.
+    interactive = sys.stderr.isatty() and not args.json
+    want_log = not args.no_log and not interactive
     log_path, log_fh = None, None
-    if args.json:
+    if want_log:
         try:
             os.makedirs(NEUTRON_LOGS_DIR, exist_ok=True)
             _prune_app_logs(NEUTRON_LOGS_DIR, args.app, keep=20)
@@ -3538,8 +3601,11 @@ def cmd_launch(args):
         # Detach so Collider supervises via PID, not via this process.
         proc = subprocess.Popen(
             cmd, env=env,
-            stdout=(log_fh or subprocess.DEVNULL) if args.json else None,
-            stderr=(subprocess.STDOUT if log_fh else subprocess.DEVNULL) if args.json else None,
+            # log file > the caller's terminal > nowhere. Never inherit a tty we are also
+            # writing to, or the log and the terminal interleave the same bytes.
+            stdout=log_fh if log_fh else (None if interactive else subprocess.DEVNULL),
+            stderr=(subprocess.STDOUT if log_fh
+                    else (None if interactive else subprocess.DEVNULL)),
             start_new_session=True,
         )
     except Exception as e:
@@ -4385,6 +4451,11 @@ def build_parser():
     pl.add_argument("--prefix", default=None)
     pl.add_argument("--project", default=None,
                     help="optional project path (Windows-style, e.g. C:\\...\\x.prproj)")
+    pl.add_argument("--no-log", action="store_true",
+                    help="do not write a session log to ~/.local/share/neutron/logs/. By default "
+                         "a log is written whenever nobody is watching the output live (menu, "
+                         "dock, Collider, file association); an interactive terminal keeps "
+                         "inheriting the tty as before.")
     pl.add_argument("--allow-restamp", action="store_true",
                     help="launch even when this runtime's stamp differs from the prefix's. Wine "
                          "will run `wineboot -u` and REVERT the prefix's patched natives. Use "
