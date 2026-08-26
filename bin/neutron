@@ -73,7 +73,7 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
-NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-59")
+NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-63")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
@@ -2563,8 +2563,16 @@ def cmd_prefix_provision(args):
     # dock icon (StartupWMClass = Wine's app_id) instead of inheriting Collider's, and puts the
     # suite in the application menu. See register_app_desktop_entries().
     desktop_entries = register_app_desktop_entries(prefix)
-    steps.append({"step": "desktop_entries", "ok": True, "count": len(desktop_entries),
-                  "detail": desktop_entries})
+    steps.append({"step": "desktop_entries", "ok": True,
+                  "count": len(desktop_entries["entries"]),
+                  "icons": sum(1 for e in desktop_entries["entries"] if e["icon"]),
+                  # Named explicitly because a tester who provisions inside a live session used
+                  # to see generic icons and report extraction as broken; now the refresh is
+                  # part of the step and its result is visible.
+                  "caches_refreshed": bool(desktop_entries["entries"]),
+                  "superseded": desktop_entries["superseded"],
+                  "claimed_types": desktop_entries["claimed_types"],
+                  "detail": desktop_entries["entries"]})
 
     # WebView2: stage + register the runtime or Adobe's in-app web sign-in (IMS)
     # renders BLANK (the installer's Common Files copy is unregistered).
@@ -2722,6 +2730,21 @@ def _build_ucrtshim(orig_path, out_path):
     return True
 
 
+def _copytree_unless_same(src, dst):
+    """copytree, but a no-op when src IS dst.
+
+    `neutron runtime capture --out ~/neutron/runtime` re-resolves mono/gecko/webview2 through
+    the same `_resolve_*` helpers `provision` uses, and those find the BUNDLE's own copy when it
+    is the only one on the machine. copytree then raises SameFileError for every file and the
+    step reports itself as failed -- so a capture that changed nothing about mono read as
+    "capture mono failed" and recorded mono as absent. Nothing was ever wrong with it.
+    """
+    if os.path.realpath(src) == os.path.realpath(dst):
+        return "same"
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    return "copied"
+
+
 def cmd_runtime_capture(args):
     """Build/refresh the Neutron runtime DLL bundle from a proven prefix. Reads
     the source prefix's DllOverrides, writes the full override manifest, and
@@ -2799,7 +2822,7 @@ def cmd_runtime_capture(args):
     wv2_ver = _webview2_version(os.path.join(wv2_src, "Application"))
     if wv2_ver:
         try:
-            shutil.copytree(wv2_src, os.path.join(out, "webview2"), dirs_exist_ok=True)
+            _copytree_unless_same(wv2_src, os.path.join(out, "webview2"))
         except OSError as e:
             log(f"capture webview2 failed: {e}")
             wv2_ver = None
@@ -2812,9 +2835,8 @@ def cmd_runtime_capture(args):
     msi = _resolve_mono_support_msi()
     if msi:  # msi = <base>/wine-mono-<ver>/support/winemono-support.msi -> copy the tree
         try:
-            shutil.copytree(os.path.dirname(os.path.dirname(msi)),
-                            os.path.join(out, "mono", f"wine-mono-{MONO_VERSION}"),
-                            dirs_exist_ok=True)
+            _copytree_unless_same(os.path.dirname(os.path.dirname(msi)),
+                                  os.path.join(out, "mono", f"wine-mono-{MONO_VERSION}"))
             mono_ver = MONO_VERSION
         except OSError as e:
             log(f"capture mono failed: {e}")
@@ -2823,8 +2845,8 @@ def cmd_runtime_capture(args):
         g = _resolve_gecko_tree(arch)
         if g:
             try:
-                shutil.copytree(g, os.path.join(out, "gecko", f"wine-gecko-{GECKO_VERSION}-{arch}"),
-                                dirs_exist_ok=True)
+                _copytree_unless_same(
+                    g, os.path.join(out, "gecko", f"wine-gecko-{GECKO_VERSION}-{arch}"))
                 gecko_arches.append(arch)
             except OSError as e:
                 log(f"capture gecko {arch} failed: {e}")
@@ -3474,6 +3496,220 @@ def _app_icon(exe):
         return None
 
 
+# ---------------------------------------------------------------------------------------------
+# Desktop integration tables + helpers.
+#
+# Split out of register_app_desktop_entries() on 2026-08-25 after the build tester reported all
+# three of these as bugs in one pass: generic icons on a live session, file associations that
+# opened the app but ignored the file, and a two-main-category warning.
+# ---------------------------------------------------------------------------------------------
+
+# ONE main category per app (Graphics or AudioVideo), plus additional ones. Two mains makes some
+# menus list the app twice.
+APP_CATEGORIES = {
+    "premiere":     "AudioVideo;Video;AudioVideoEditing;",
+    "mediaencoder": "AudioVideo;Video;AudioVideoEditing;",
+    "aftereffects": "AudioVideo;Video;AudioVideoEditing;",
+    "photoshop":    "Graphics;2DGraphics;RasterGraphics;Photography;",
+    "illustrator":  "Graphics;2DGraphics;VectorGraphics;",
+    "lightroom":    "Graphics;Photography;",
+    "animate":      "Graphics;2DGraphics;",
+}
+
+# The types each app OWNS. `image/vnd.adobe.photoshop` and `application/illustrator` come from
+# the system mime database; everything with an `x-neutron-` name is defined by us below, because
+# freedesktop has never carried .prproj/.aep/.fla/.lrcat/.psb.
+#
+# ⛔ NEVER list a type the app merely CAN open. Photoshop reads .jpg and .png; claiming those
+# would take the whole desktop's image handling away from the user's viewer.
+# Media Encoder is deliberately absent: its inputs are ordinary media types owned by the user's
+# player, and its own .epr files are presets nobody double-clicks.
+APP_MIME_TYPES = {
+    "photoshop":    ("image/vnd.adobe.photoshop", "image/x-neutron-psb"),
+    "illustrator":  ("application/illustrator",),
+    "premiere":     ("application/x-neutron-prproj",),
+    "aftereffects": ("application/x-neutron-aep",),
+    "animate":      ("application/x-neutron-fla",),
+    "lightroom":    ("application/x-neutron-lrcat",),
+}
+
+# Our own shared-mime-info package for the Adobe project formats the system does not define.
+# Glob-only (no magic): these are container formats whose signatures vary by version, and a
+# wrong magic rule mis-types a file for every application on the system, not just ours.
+# weight="60" beats the default 50 that Wine's own `x-wine-extension-*` packages use. Wine
+# generates one per registered extension and it won .psb on a tie-break, which routed the file
+# through an UNPINNED `wine start /ProgIDOpen` -- the launch path that re-stamps a prefix.
+NEUTRON_MIME_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <!-- Written by `neutron prefix provision`. Adobe project formats that freedesktop does not
+       define, so that a .desktop entry can claim them. -->
+  <mime-type type="application/x-neutron-prproj">
+    <comment>Adobe Premiere Pro project</comment>
+    <glob pattern="*.prproj" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-aep">
+    <comment>Adobe After Effects project</comment>
+    <glob pattern="*.aep" weight="60"/>
+    <glob pattern="*.aet" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-fla">
+    <comment>Adobe Animate document</comment>
+    <glob pattern="*.fla" weight="60"/>
+    <glob pattern="*.xfl" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-lrcat">
+    <comment>Lightroom Classic catalog</comment>
+    <glob pattern="*.lrcat" weight="60"/>
+  </mime-type>
+  <mime-type type="image/x-neutron-psb">
+    <comment>Adobe Photoshop large document</comment>
+    <glob pattern="*.psb" weight="60"/>
+  </mime-type>
+</mime-info>
+"""
+
+
+def install_neutron_mime_package():
+    """Define the Adobe project types in the user's mime database. Idempotent."""
+    d = os.path.join(HOME, ".local", "share", "mime", "packages")
+    target = os.path.join(d, "neutron-adobe.xml")
+    try:
+        os.makedirs(d, exist_ok=True)
+        prev = ""
+        if os.path.isfile(target):
+            with open(target) as f:
+                prev = f.read()
+        if prev == NEUTRON_MIME_XML:
+            return False
+        with open(target, "w") as f:
+            f.write(NEUTRON_MIME_XML)
+        subprocess.run(["update-mime-database", os.path.dirname(d)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        return True
+    except Exception as e:
+        log("mime package: %s" % e)
+        return False
+
+
+def retire_superseded_entries(apps_dir, app_ids):
+    """Remove the previous generation's `mudhut-<app>.desktop`, backing each one up first.
+
+    Mud Hut used to write these; they point at launchers that no longer exist and reference
+    `Icon=mudhut-*` names for which no icon file was ever installed, so they show a generic icon
+    forever. Left in place they ALSO keep `mimeapps.list` pointed at a dead handler.
+
+    ⛔ Only for an app we just wrote a working `neutron-<app>.desktop` for, and never without a
+    backup -- these are files on the user's machine, not ours to silently delete.
+    """
+    out = []
+    backup = os.path.join(HOME, ".local", "share", "neutron", "superseded-desktop-entries")
+    for app_id in app_ids:
+        stale = os.path.join(apps_dir, "mudhut-%s.desktop" % app_id)
+        if not os.path.isfile(stale):
+            continue
+        try:
+            os.makedirs(backup, exist_ok=True)
+            shutil.move(stale, os.path.join(backup, os.path.basename(stale)))
+            out.append(os.path.basename(stale))
+        except OSError as e:
+            log("retire %s: %s" % (stale, e))
+    return out
+
+
+def repair_mime_defaults(apps_dir, written):
+    """Point each Adobe type at our entry -- but ONLY where nothing live already claims it.
+
+    The rule matters. A user who set their own handler for .psd keeps it; what gets repaired is
+    the DANGLING case, where `mimeapps.list` names a .desktop file that no longer exists (which
+    is exactly what removing the mudhut generation leaves behind, and what the build tester had
+    to fix by hand on 2026-08-25).
+    """
+    path = os.path.join(HOME, ".config", "mimeapps.list")
+    want = {}
+    for w in written:
+        for m in w.get("mime", ()):
+            want[m] = "neutron-%s.desktop" % w["app"]
+    if not want:
+        return []
+
+    import configparser
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str            # mime types are case-sensitive keys
+    try:
+        if os.path.isfile(path):
+            cp.read(path)
+    except Exception as e:
+        log("mimeapps read: %s -- leaving associations alone" % e)
+        return []
+    section = "Default Applications"
+    if not cp.has_section(section):
+        cp.add_section(section)
+
+    def live(entry_list):
+        for name in entry_list.split(";"):
+            name = name.strip()
+            if not name:
+                continue
+            for root in (apps_dir, "/usr/share/applications",
+                         os.path.join(HOME, ".local", "share", "applications")):
+                if os.path.isfile(os.path.join(root, name)):
+                    return True
+        return False
+
+    claimed = []
+    for mime, entry in sorted(want.items()):
+        cur = cp.get(section, mime, fallback="")
+        if cur and live(cur):
+            continue                # someone real already handles it -- do not steal it
+        cp.set(section, mime, entry)
+        claimed.append(mime)
+    if not claimed:
+        return []
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            cp.write(f, space_around_delimiters=False)
+    except OSError as e:
+        log("mimeapps write: %s" % e)
+        return []
+    return claimed
+
+
+def refresh_desktop_caches(apps_dir):
+    """Make a LIVE desktop session actually see the entries and icons we just wrote.
+
+    🚨 This is the fix for "icon extraction is broken". It never was. Provision wrote valid
+    256x256 PNGs and the desktop showed generic icons anyway, because the running shell had
+    cached its icon lookups hours earlier -- on the build tester's machine, `plasmashell` had
+    been up for 13 hours and there was no `icon-theme.cache` in the user's hicolor tree at all.
+    Every tester who provisions inside a live session hits this and reports a bug that does not
+    exist. Writing a file is not the same as the desktop knowing about it.
+
+    All best-effort: each tool is absent on some desktops, and none of them failing is fatal.
+    """
+    icon_root = os.path.join(HOME, ".local", "share", "icons", "hicolor")
+    for cmd in (["update-desktop-database", apps_dir],
+                # -t/--ignore-theme-index: our hicolor tree has no index.theme of its own.
+                ["gtk-update-icon-cache", "-f", "-t", icon_root],
+                ["kbuildsycoca6", "--noincremental"],
+                ["kbuildsycoca5", "--noincremental"],
+                ["xdg-desktop-menu", "forceupdate"]):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except Exception:
+            pass
+    # KDE caches icons per-process; this tells running KDE apps to drop theirs.
+    if shutil.which("dbus-send"):
+        try:
+            subprocess.run(["dbus-send", "--session", "--type=signal", "/KIconLoader",
+                            "org.kde.KIconLoader.iconChanged", "int32:0"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        except Exception:
+            pass
+
+
 def register_app_desktop_entries(prefix):
     """Give every installed app its OWN desktop identity: a .desktop entry + an icon.
 
@@ -3511,7 +3747,12 @@ def register_app_desktop_entries(prefix):
     icon_dir = os.path.join(HOME, ".local", "share", "icons", "hicolor", "256x256", "apps")
     os.makedirs(apps_dir, exist_ok=True)
     os.makedirs(icon_dir, exist_ok=True)
+    # The Adobe project formats freedesktop has never heard of (.prproj, .aep, .fla, ...) have
+    # to be DEFINED before an entry can claim them; only .psd and .ai ship in the system mime
+    # database. Idempotent, and scoped to this user.
+    install_neutron_mime_package()
     written = []
+    changed = False
 
     for app_id, p in APP_PROFILES.items():
         exe = _resolve_app_exe(prefix, p["exe"]) if prefix else ""
@@ -3536,8 +3777,15 @@ def register_app_desktop_entries(prefix):
             log("desktop entry: icon for %s failed: %s" % (app_id, e))
 
         desktop = os.path.join(apps_dir, "neutron-%s.desktop" % app_id)
-        # Exec: hard-set PATH for the same reason collider.desktop does — a menu launch gets the
-        # desktop environment's PATH, not the login shell's, and would not find `neutron`.
+        # The file types this app OWNS, and therefore `%f`. Without both, a double-clicked .psd
+        # opens Photoshop and then ignores the file -- reported from the build tester's machine
+        # 2026-08-25, where the superseded mudhut entries HAD carried them. `neutron launch`
+        # already accepts a positional Linux path and converts it to Z:\ (cmd_launch), so this
+        # is purely the .desktop side of a capability that was always there.
+        # ⛔ Only ever the app's OWN formats. Photoshop opens .jpg and .png too, but claiming
+        # those would hijack the user's image viewer for the whole desktop.
+        mimes = APP_MIME_TYPES.get(app_id, ())
+        exec_arg = " %f" if mimes else ""
         body = (
             "[Desktop Entry]\n"
             "Type=Application\n"
@@ -3551,15 +3799,21 @@ def register_app_desktop_entries(prefix):
             # unpinned for a few hours, the user launched from the menu, and the prefix was
             # re-stamped from 11.10-62 back to the CLI default 11.10-59 with dwrite/dcomp/dxcore
             # all reverted to builtins.
-            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin NEUTRON_WINE_VERSION=%s neutron launch %s --prefix %s\n"
+            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin NEUTRON_WINE_VERSION=%s neutron launch %s --prefix %s%s\n"
             "Icon=%s\n"
             "Terminal=false\n"
-            "Categories=Graphics;AudioVideo;\n"
+            # One MAIN category only. `Graphics;AudioVideo;` is two, which makes a menu list the
+            # same app twice (desktop-file-validate flags it).
+            "Categories=%s\n"
+            "%s"
             # ⭐ THE LINE THAT FIXES THE DOCK ICON. Wine's app_id, verbatim.
             "StartupWMClass=%s\n"
             "StartupNotify=false\n"
-            % (p["name"], p["name"], HOME, pinned_version, app_id, prefix,
-               icon_name if have_icon else "collider", wm_class))
+            % (p["name"], p["name"], HOME, pinned_version, app_id, prefix, exec_arg,
+               icon_name if have_icon else "collider",
+               APP_CATEGORIES.get(app_id, "Graphics;"),
+               ("MimeType=%s\n" % "".join(m + ";" for m in mimes)) if mimes else "",
+               wm_class))
         try:
             prev = ""
             if os.path.isfile(desktop):
@@ -3569,17 +3823,18 @@ def register_app_desktop_entries(prefix):
                 with open(desktop, "w") as f:
                     f.write(body)
                 os.chmod(desktop, 0o755)
-            written.append({"app": app_id, "wm_class": wm_class, "icon": have_icon})
+                changed = True
+            written.append({"app": app_id, "wm_class": wm_class, "icon": have_icon,
+                            "mime": list(mimes)})
         except OSError as e:
             log("desktop entry: %s failed: %s" % (app_id, e))
 
+    superseded = retire_superseded_entries(apps_dir, [w["app"] for w in written])
+    claimed = repair_mime_defaults(apps_dir, written)
     if written:
-        try:
-            subprocess.run(["update-desktop-database", apps_dir],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except Exception:
-            pass
-    return written
+        refresh_desktop_caches(apps_dir)
+    return {"entries": written, "superseded": superseded, "claimed_types": claimed,
+            "rewrote": changed}
 
 
 def _app_running_pid(exe):
@@ -3624,6 +3879,13 @@ def cmd_apps(args):
     Powers Collider's app catalog (one tinted widget per installed app). Never
     launches anything — pure detection (scan the prefix for each profile's exe)."""
     prefix = resolve_prefix(args.prefix) or args.prefix
+    # 🚨 SAY WHY WHEN THERE IS NO PREFIX. With none resolvable this used to answer
+    # {"ok": true} with all seven apps `installed: false` -- indistinguishable from "you have
+    # nothing installed", which is exactly how the build tester read it on 2026-08-25 while all
+    # seven WERE installed one `--prefix` away. `ok` stays true and the list stays populated
+    # (Collider blanks its whole Apps view on a command failure), but the answer now carries the
+    # reason and the candidate paths.
+    why = None if prefix else bad_prefix_reason(getattr(args, "prefix", None))
     apps = []
     for app_id, p in APP_PROFILES.items():
         exe = _resolve_app_exe(prefix, p["exe"]) if prefix else ""
@@ -3645,8 +3907,50 @@ def cmd_apps(args):
         })
     # Installed first, then alphabetical — a stable order for the widget grid.
     apps.sort(key=lambda a: (not a["installed"], a["name"]))
-    emit({"ok": True, "apps": apps}, args.json)
+    out = {"ok": True, "prefix": prefix or None, "apps": apps}
+    if why:
+        out.update(why)
+    emit(out, args.json)
     return EX_OK
+
+
+def _runtime_integrity_checks(wine_path):
+    """Structural checks on an installed Neutron runtime. Returns [(name, ok, detail), ...].
+
+    Cheap on purpose -- a directory listing and one grep, so `doctor` stays fast enough for
+    Collider to call on every view. Deliberately NOT a checksum of the tree: the point is to
+    catch a build that came out structurally wrong, not to detect tampering.
+    """
+    out = []
+    root = os.path.dirname(os.path.dirname(os.path.realpath(wine_path)))
+    for arch, floor in (("x86_64-windows", 900), ("i386-windows", 900)):
+        d = os.path.join(root, "lib", "wine", arch)
+        try:
+            n = len([f for f in os.listdir(d)])
+        except OSError:
+            n = 0
+        out.append(("runtime-" + arch, n >= floor,
+                    "%d PE files" % n if n >= floor else
+                    "%d PE files (expected >=%d) -- this runtime is INCOMPLETE. 11.10-61 shipped "
+                    "with 0 here. Reinstall the runtime; do not chase app bugs against it."
+                    % (n, floor)))
+    # wine.inf drives prefix creation; a truncated one produces a prefix that looks fine and is
+    # missing registry content. `FileOpenAssociations` sits near the end of the file, so its
+    # absence is a cheap proxy for "generation stopped early".
+    inf = os.path.join(root, "share", "wine", "wine.inf")
+    ok, detail = False, "wine.inf not found at " + inf
+    try:
+        with open(inf, "rb") as f:
+            body = f.read()
+        hits = body.count(b"FileOpenAssociations")
+        ok = hits > 0
+        detail = ("%d FileOpenAssociations sections" % hits if ok else
+                  "wine.inf is TRUNCATED (0 FileOpenAssociations sections) -- prefix creation "
+                  "will be incomplete. Reinstall the runtime.")
+    except OSError as e:
+        detail = "wine.inf unreadable: %s" % e
+    out.append(("runtime-wine-inf", ok, detail))
+    return out
 
 
 def cmd_doctor(args):
@@ -3672,6 +3976,19 @@ def cmd_doctor(args):
     check("wine", bool(_wine),
           (_wine + ("  (Neutron runtime)" if _wine_is_neutron else "  (system wine)")) if _wine
           else "no wine found — install the Neutron runtime")
+
+    # 🚨 IS THE RUNTIME ITSELF INTACT? Reported from the build tester 2026-08-25: doctor returned
+    # {"ok": true, "healthy": true} against 11.10-61, a build we KNOW is defective. Resolving a
+    # wine binary was its only unconditional check, and 61's `wine` binary was fine -- what was
+    # missing was everything around it. Both defects below are what 61 actually shipped with,
+    # caused by cutting a release from an incremental make on a tree wine-tkg partially reverts:
+    #   * an EMPTY 32-bit PE tree (0 files vs 1101) -- every 32-bit Adobe helper fails to start;
+    #   * a HALF-APPLIED wine.inf -- the prefix comes out missing registry content.
+    # A check that cannot fail on a build known to be broken is worse than no check: it is the
+    # sentence "doctor says healthy" doing work it never earned.
+    if _wine and _wine_is_neutron:
+        for c in _runtime_integrity_checks(_wine):
+            check(c[0], c[1], c[2])
 
     if args.prefix:
         prefix = resolve_prefix(args.prefix)
