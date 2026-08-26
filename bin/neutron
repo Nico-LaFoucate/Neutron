@@ -43,7 +43,9 @@ EX_DEP = 4
 # dir) so a version bump or a different prefix doesn't break the contract.
 
 HOME = os.path.expanduser("~")
-DEFAULT_PREFIX = os.path.join(HOME, ".premiere2025")
+# ⛔ NO DEFAULT PREFIX PATH. Resolution is default_prefix(): $WINEPREFIX -> Collider's selection
+# -> unambiguous discovery. A hardcoded name is one machine's layout and has repeatedly broken the
+# build tester; see default_prefix() for the history.
 
 # This repo's root (bin/neutron -> ..) — used to find checked-in reproducible sources
 # like scripts/ucrtshim/ that capture builds into the runtime bundle.
@@ -679,10 +681,11 @@ def premiere_is_running():
 def collider_selected_prefix():
     """The prefix Collider is pointed at, from ~/.config/collider/config.json.
 
-    The CLI's DEFAULT_PREFIX ($HOME/.premiere2025) is a legacy dev path that exists on exactly one
-    machine. Every tester who followed our own documented log-capture command --
-    `neutron launch premiere > pp.log` -- got `invalid prefix` and could not produce a log at all,
-    which is why a build-test bug went two rounds with no diagnostics (2026-08-08)."""
+    One link in default_prefix()'s chain. This used to be the ONLY defence against a hardcoded
+    `$HOME/.premiere2025`, and it never got a chance to run because every argparse default was
+    pre-filled with that path. Testers following our own documented command --
+    `neutron launch premiere > pp.log` -- got `invalid prefix` and could produce no log at all, so
+    a build-test bug went two rounds with no diagnostics (2026-08-08). Removed for good 2026-08-25."""
     try:
         with open(os.path.join(HOME, ".config", "collider", "config.json"),
                   encoding="utf-8") as f:
@@ -694,8 +697,89 @@ def collider_selected_prefix():
     return None
 
 
+def discover_prefixes():
+    """Every wine prefix we can see, newest-first. A prefix is a dir containing `drive_c`."""
+    seen, out = set(), []
+    roots = [HOME, os.path.join(HOME, "Games"), os.path.join(HOME, ".local", "share", "wineprefixes")]
+    env = os.environ.get("WINEPREFIX")
+    if env:
+        roots.insert(0, os.path.dirname(os.path.abspath(os.path.expanduser(env))))
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for name in entries:
+            d = os.path.join(root, name)
+            if d in seen:
+                continue
+            if os.path.isdir(os.path.join(d, "drive_c")):
+                seen.add(d)
+                out.append(d)
+    out.sort(key=lambda d: os.path.getmtime(d), reverse=True)
+    return out
+
+
+def default_prefix():
+    """The prefix to use when the caller did not name one.
+
+    ⛔ THERE IS NO HARDCODED PREFIX NAME. `$HOME/.premiere2025` is one developer's directory, and
+    baking it in as the default has burned the build tester repeatedly: our own documented
+    commands (`neutron launch premiere > pp.log`) answered `invalid prefix` on their machine, so a
+    build-test bug went two rounds with no diagnostics at all (2026-08-08) — and it kept coming
+    back because the fix was added as a *helper* while every argparse default still pointed at the
+    hardcoded path and short-circuited it.
+
+    Resolution order, most explicit first:
+      1. `$WINEPREFIX`                     — the caller said so
+      2. Collider's selected prefix        — the GUI's current choice
+      3. discovery, if UNAMBIGUOUS         — exactly one prefix on the machine
+
+    Ambiguity is not resolved by guessing: with several candidates and no selection, return None
+    so the caller can fail with the list. A wrong prefix silently provisions or tears down the
+    wrong installation.
+    """
+    env = os.environ.get("WINEPREFIX")
+    if env:
+        p = os.path.abspath(os.path.expanduser(env))
+        if os.path.isdir(os.path.join(p, "drive_c")):
+            return p
+    sel = collider_selected_prefix()
+    if sel:
+        return sel
+    found = discover_prefixes()
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
+def bad_prefix_reason(given):
+    """Why we have no prefix, and what the caller can do — never a bare "invalid prefix".
+
+    A tester following our own documented command hit exactly that message, with no indication
+    that a prefix even had to be chosen, and produced no diagnostics for two rounds. If we cannot
+    resolve one, the error must carry the candidates."""
+    if given:
+        return {"reason": "invalid prefix (no drive_c): %s" % given}
+    found = discover_prefixes()
+    if not found:
+        return {"reason": "no wine prefix found",
+                "hint": "pass one explicitly, set $WINEPREFIX, or select one in Collider",
+                "candidates": []}
+    return {"reason": "several wine prefixes found and none selected — refusing to guess",
+            "hint": "pass the path, set $WINEPREFIX, or pick one in Collider "
+                    "(a wrong prefix would provision or tear down the wrong installation)",
+            "candidates": found[:10]}
+
+
 def resolve_prefix(path):
-    """Validate a prefix path; return the absolute, real path or None."""
+    """Validate a prefix path; return the absolute, real path or None.
+
+    With no path, falls back to default_prefix() — never to a hardcoded name."""
+    if not path:
+        path = default_prefix()
     if not path:
         return None
     p = os.path.abspath(os.path.expanduser(path))
@@ -1893,7 +1977,8 @@ def cmd_teardown(args, _emitted=False):
     by literal pid -> clear stale server dirs. NEVER -k9 first: that orphans children mid-wait."""
     prefix = resolve_prefix(args.prefix)
     if not prefix:
-        die({"ok": False, "reason": "invalid prefix"}, EX_BADPREFIX, args.json)
+        die({"ok": False, **bad_prefix_reason(getattr(args, "prefix", None) or getattr(args, "path", None))},
+            EX_BADPREFIX, args.json)
     wine, _ = resolve_wine()
     env = dict(os.environ, WINEPREFIX=prefix)
     import time as _t
@@ -2057,7 +2142,8 @@ def cmd_apply_display_fix(args):
     """Write DS.DisableDirectXDisplay=true into Debug Database.txt. Idempotent."""
     prefix = resolve_prefix(args.path)
     if not prefix:
-        die({"changed": False, "reason": "invalid prefix"}, EX_BADPREFIX, args.json)
+        die({"changed": False, **bad_prefix_reason(getattr(args, "prefix", None) or getattr(args, "path", None))},
+            EX_BADPREFIX, args.json)
 
     if premiere_is_running():
         die({"changed": False, "already_applied": False,
@@ -2258,7 +2344,8 @@ def cmd_prefix_provision(args):
     desktop-entry/MIME creation. Those are the remaining P1 chunks."""
     prefix = resolve_prefix(args.path)
     if not prefix:
-        die({"ok": False, "reason": "invalid prefix (no drive_c)"}, EX_BADPREFIX, args.json)
+        die({"ok": False, **bad_prefix_reason(getattr(args, "prefix", None) or getattr(args, "path", None))},
+            EX_BADPREFIX, args.json)
 
     wine, is_neutron = resolve_wine()
     if not wine:
@@ -2640,7 +2727,7 @@ def cmd_runtime_capture(args):
     copies every native DLL file (system32 + syswow64) into the bundle. This is
     the reproducible source `neutron prefix provision` stages into new prefixes."""
     import re
-    src = resolve_prefix(args.from_prefix or DEFAULT_PREFIX)
+    src = resolve_prefix(args.from_prefix)
     if not src:
         die({"ok": False, "reason": "invalid --from prefix"}, EX_BADPREFIX, args.json)
     out = os.path.abspath(os.path.expanduser(
@@ -3731,23 +3818,23 @@ def build_parser():
     psub = pp.add_subparsers(dest="subcmd", required=True)
 
     pi = psub.add_parser("info", help="report paths Collider needs")
-    pi.add_argument("path", nargs="?", default=DEFAULT_PREFIX)
+    pi.add_argument("path", nargs="?", default=None)
     pi.set_defaults(func=cmd_prefix_info)
 
     pa = psub.add_parser("apply-display-fix",
                          help="write DS.DisableDirectXDisplay=true (idempotent)")
-    pa.add_argument("path", nargs="?", default=DEFAULT_PREFIX)
+    pa.add_argument("path", nargs="?", default=None)
     pa.set_defaults(func=cmd_apply_display_fix)
 
     pv = psub.add_parser("provision",
                          help="make a staged prefix Neutron-ready (idempotent)")
-    pv.add_argument("path", nargs="?", default=DEFAULT_PREFIX)
+    pv.add_argument("path", nargs="?", default=None)
     pv.set_defaults(func=cmd_prefix_provision)
 
     # launch
     pl = sub.add_parser("launch", help="launch an app through the Neutron stack")
     pl.add_argument("app", help="app to launch (" + ", ".join(APP_PROFILES) + ")")
-    pl.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pl.add_argument("--prefix", default=None)
     pl.add_argument("--project", default=None,
                     help="optional project path (Windows-style, e.g. C:\\...\\x.prproj)")
     pl.add_argument("project_file", nargs="?", default=None,
@@ -3764,13 +3851,13 @@ def build_parser():
 
     # apps: catalog + install status for Collider's per-app widgets
     pap = sub.add_parser("apps", help="list apps + install status in a prefix")
-    pap.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pap.add_argument("--prefix", default=None)
     pap.set_defaults(func=cmd_apps)
 
     # teardown
     pt = sub.add_parser("teardown",
                         help="close a prefix cleanly (apps save prefs) and leave nothing running")
-    pt.add_argument("--prefix", default=DEFAULT_PREFIX)
+    pt.add_argument("--prefix", default=None)
     pt.add_argument("--app", default=None,
                     help="close ONLY this app (e.g. premiere), leaving the prefix's other apps "
                          "running. This is the routine case -- all apps share one prefix, so the "
@@ -3792,7 +3879,7 @@ def build_parser():
     rsub = prt.add_subparsers(dest="subcmd", required=True)
     rc = rsub.add_parser("capture",
                          help="build the DLL bundle from a proven prefix")
-    rc.add_argument("--from", dest="from_prefix", default=DEFAULT_PREFIX,
+    rc.add_argument("--from", dest="from_prefix", default=None,
                     help="source prefix to capture from")
     rc.add_argument("--out", default=None,
                     help="bundle output dir (default ~/neutron/runtime)")
