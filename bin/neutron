@@ -2072,8 +2072,9 @@ def cmd_prefix_info(args):
     """
     prefix = resolve_prefix(args.path)
     if not prefix:
-        die({"valid": False, "reason": "no drive_c found at path"},
-            EX_BADPREFIX, args.json)
+        # Was a bare "no drive_c found at path" — which names no path, lists nothing, and is the
+        # same dead end the tester hit. Explain, and offer the candidates.
+        die({"valid": False, **bad_prefix_reason(args.path)}, EX_BADPREFIX, args.json)
 
     user = prefix_user(prefix)
     if not user:
