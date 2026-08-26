@@ -375,6 +375,32 @@ def _resolve_app_exe(prefix, exe_rel):
         return max((int(y) for y in yrs), default=0)
     return max(hits, key=_year)
 
+def _resolve_app_dxvk_conf(prefix, profile):
+    """Absolute path to this app's DXVK config, version-agnostically.
+
+    🚨 Premiere's conf lives INSIDE its install directory, so its subpath carries the year --
+    `Adobe Premiere Pro 2025/dxvk.conf`. The exe went through `_resolve_app_exe()` and follows the
+    suite to 2026; this did not. On a 2026 install `launch` would export `DXVK_CONFIG_FILE`
+    pointing at a directory that does not exist -- and it exports it **unconditionally, with no
+    existence check**, so DXVK silently falls back to its defaults and reports the WRONG GPU
+    VENDOR. Nothing errors; Premiere just quietly loses its tuning. Provision would likewise write
+    the conf into the 2025 directory nobody reads.
+
+    Found 2026-08-26 while preparing the 2026-suite smoke test, before it could waste a day of it.
+
+    Anchored to the RESOLVED EXE's directory rather than year-globbed separately, so the conf can
+    never end up beside a different version of the app than the one we are about to launch.
+    """
+    rel = profile.get("dxvk_conf") or ""
+    if not rel:
+        return ""
+    # Prefix-root confs (the shared ones) have no version in them -- nothing to resolve.
+    if os.sep not in rel:
+        return os.path.join(prefix, rel)
+    exe = _resolve_app_exe(prefix, profile["exe"])
+    return os.path.join(os.path.dirname(exe), os.path.basename(rel))
+
+
 APP_PROFILES = {
     "premiere": {
         "name": "Premiere Pro",
@@ -2759,7 +2785,7 @@ def cmd_prefix_provision(args):
         if not os.path.isfile(_resolve_app_exe(prefix, _p["exe"])):
             per_app[_app_id] = "app-not-installed"
             continue
-        target = os.path.join(prefix, rel)
+        target = _resolve_app_dxvk_conf(prefix, _p)
         if os.path.isfile(target):
             # ⚠️ Existing is NOT the same as correct. `ensure_dxvk_gpl` creates a one-line conf on
             # first launch; skipping any file that exists would leave that stub in place forever,
@@ -3310,7 +3336,7 @@ def cmd_launch(args):
             "`wineboot -u` and REVERT the prefix's patched natives (dwrite/dcomp/dxcore). "
             "Run `neutron prefix provision %s` afterwards to restore them." % prefix)
 
-    dxvk_conf = os.path.join(prefix, profile["dxvk_conf"])
+    dxvk_conf = _resolve_app_dxvk_conf(prefix, profile)
     env = dict(os.environ)
     env["WINEPREFIX"] = prefix
     env["DXVK_CONFIG_FILE"] = dxvk_conf
