@@ -998,7 +998,7 @@ def _runtimes_matching_stamp(stamp):
 
 
 def stamp_mismatch(prefix, wine_path):
-    """None if this wine can launch into this prefix without re-stamping it; else an explanation.
+    r"""None if this wine can launch into this prefix without re-stamping it; else an explanation.
 
     🚨 THIS IS THE CLOBBER, MADE LOUD. Launching a prefix on a different-stamp runtime fires
     `wineboot -u` and reverts the patched natives. It has happened repeatedly and has never once
@@ -1013,6 +1013,26 @@ def stamp_mismatch(prefix, wine_path):
     ⛔ Both values must be READABLE before we complain. A prefix with no stamp is a prefix that has
     never been booted, and refusing to launch it would be inventing a problem -- the same
     "render unknown as an answer" mistake that put "X11" in Collider's UI on a Wayland session.
+    Failing open also happens to be exactly right for wine's own opt-out: a `.update-timestamp`
+    containing the word `disable` turns wine's update check off permanently
+    (`programs/wineboot/wineboot.c:update_timestamp`). That file has no digits, so we read None and
+    stay quiet -- which is correct, because wine will not re-stamp such a prefix either.
+
+    ⭐ WHERE THE CLOBBER CAN ACTUALLY HAPPEN, read out of wine's source 2026-08-26 rather than
+    guessed (the build tester asked, and the honest answer needed the code, not an experiment on
+    the only working installation):
+      * `wine <prog>` with no wine parent -> `build_initial_params()` -> `run_wineboot()`
+        UNCONDITIONALLY (`dlls/ntdll/unix/env.c`).
+      * `run_wineboot()` first does `NtCreateEvent(\KernelObjects\__wineboot_event, OBJ_OPENIF)`.
+        If that event ALREADY EXISTS it jumps straight to `wait` and **never launches
+        wineboot.exe**.
+      * wineboot creates that event with `OBJ_INHERIT` "to be inherited by services.exe", and
+        services.exe lives as long as the wine session.
+      * Only wineboot.exe compares `.update-timestamp` and reinstalls wine.inf.
+    => **A prefix can only be re-stamped by the FIRST wine process into a COLD prefix.** Once a
+    session is up, no later `wine` invocation can clobber it. That makes `launch` (cold) and
+    `provision` (deliberate) the complete set of entry points, which is exactly where the
+    handling is.
     """
     want = _prefix_stamp(prefix)
     have = _runtime_stamp(wine_path)
@@ -1992,6 +2012,13 @@ def _teardown_app(args, prefix, wine, env):
             if exe.lower().endswith(".exe") and exe not in images:
                 images.append(exe)
         for im in images:
+            # ⚠️ No stamp guard here, and that is deliberate -- audited 2026-08-26 after the
+            # build tester flagged teardown as an unguarded `wine` spawn. It cannot clobber:
+            # we only reach this line when app processes exist, which means a wine session is
+            # up, which means `__wineboot_event` exists, which makes `run_wineboot()` skip
+            # launching wineboot entirely. See stamp_mismatch() for the full chain out of
+            # wine's source. ⛔ Do NOT "fix" this by refusing a teardown -- if teardown can be
+            # blocked, a stuck prefix cannot be recovered.
             try:
                 subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2092,6 +2119,13 @@ def cmd_teardown(args, _emitted=False):
             except Exception:
                 pass
         for im in images:
+            # ⚠️ No stamp guard here, and that is deliberate -- audited 2026-08-26 after the
+            # build tester flagged teardown as an unguarded `wine` spawn. It cannot clobber:
+            # we only reach this line when app processes exist, which means a wine session is
+            # up, which means `__wineboot_event` exists, which makes `run_wineboot()` skip
+            # launching wineboot entirely. See stamp_mismatch() for the full chain out of
+            # wine's source. ⛔ Do NOT "fix" this by refusing a teardown -- if teardown can be
+            # blocked, a stuck prefix cannot be recovered.
             try:
                 subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2825,6 +2859,47 @@ def _copytree_unless_same(src, dst):
         return "same"
     shutil.copytree(src, dst, dirs_exist_ok=True)
     return "copied"
+
+
+def cmd_runtime_which(args):
+    """The wine this CLI would use, and the version tag that goes with it.
+
+    Exists so OTHER tools do not have to guess. Mud Hut creates prefixes and boots them, and it
+    resolved wine independently: newest NUMERIC installed runtime when the prefix is new. That
+    agrees with us by coincidence on a machine where the newest runtime is also the pinned one,
+    and disagrees the moment a newer runtime is installed than the drop pinned -- at which point
+    Mud Hut stamps a brand-new prefix for the newer build and every `neutron launch` refuses.
+    Raised by the build tester 2026-08-26 as the worst possible first-run experience.
+
+    ⭐ One authority. Ask, do not re-derive.
+
+    With --prefix, also reports whether launching that prefix on this wine would re-stamp it.
+    """
+    wine, is_neutron = resolve_wine()
+    out = {"ok": bool(wine), "wine": wine, "is_neutron_runtime": is_neutron,
+           "version": None, "stamp": _runtime_stamp(wine),
+           "pinned_by": ("NEUTRON_WINE" if os.environ.get("NEUTRON_WINE")
+                         else "NEUTRON_WINE_VERSION" if os.environ.get("NEUTRON_WINE_VERSION")
+                         else "compiled-in default")}
+    if wine and is_neutron:
+        root = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(wine))))
+        if root.startswith("neutron-wine-"):
+            out["version"] = root[len("neutron-wine-"):]
+    if getattr(args, "prefix", None):
+        prefix = resolve_prefix(args.prefix)
+        if not prefix:
+            out.update(bad_prefix_reason(args.prefix))
+        else:
+            mm = stamp_mismatch(prefix, wine)
+            out["prefix"] = prefix
+            out["prefix_stamp"] = _prefix_stamp(prefix)
+            out["would_restamp"] = mm is not None
+            if mm:
+                out["prefix_is_stamped_for"] = mm["prefix_runtimes"]
+    if not wine:
+        die({**out, "reason": "no wine found — install the Neutron runtime"}, EX_DEP, args.json)
+    emit(out, args.json)
+    return EX_OK
 
 
 def cmd_runtime_capture(args):
@@ -4348,6 +4423,12 @@ def build_parser():
     ri.add_argument("--force", action="store_true",
                     help="reinstall even if this version is already present")
     ri.set_defaults(func=cmd_runtime_install)
+
+    rw = rsub.add_parser("which",
+                         help="the wine this CLI would use (so other tools can agree with it)")
+    rw.add_argument("--prefix", default=None,
+                    help="also report whether launching this prefix would re-stamp it")
+    rw.set_defaults(func=cmd_runtime_which)
 
     return p
 
