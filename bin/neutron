@@ -3455,6 +3455,38 @@ def cmd_launch(args):
 
     dxvk_conf = _resolve_app_dxvk_conf(prefix, profile)
     env = dict(os.environ)
+
+    # ⭐ PER-PREFIX GATE OVERRIDES: <prefix>/neutron-env.conf, `KEY=VALUE` per line.
+    #
+    # Every behaviour change this project ships is env-gated so it can be A/B'd without a
+    # rebuild -- and that is worthless on the launch surfaces a tester actually uses. A menu
+    # entry, the dock and a file association all run a fixed `Exec=` line with no way to set a
+    # variable, and Collider's launch button has no field for one. So the only surface that
+    # could be A/B'd was a terminal -- which is useless precisely when the surface itself is
+    # what differs, as with the build tester's 2026-08-27 report that Premiere's splash renders
+    # half white from the application menu but not from Collider.
+    #
+    # Applied BEFORE the profile's own gates, which use setdefault -- so this wins over a
+    # profile default. The caller's real environment still wins over this, so a terminal
+    # `NEUTRON_FOO=1 neutron launch ...` overrides the file for a one-off.
+    _envconf = os.path.join(prefix, "neutron-env.conf")
+    _applied = {}
+    try:
+        if os.path.isfile(_envconf):
+            with open(_envconf) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#") or "=" not in ln:
+                        continue
+                    k, v = ln.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k and k not in os.environ:
+                        env[k] = v
+                        _applied[k] = v
+            if _applied:
+                log("neutron-env.conf: %s" % " ".join("%s=%s" % kv for kv in sorted(_applied.items())))
+    except OSError as e:
+        log("neutron-env.conf unreadable (%s); ignoring" % e)
     env["WINEPREFIX"] = prefix
     env["DXVK_CONFIG_FILE"] = dxvk_conf
     if profile["overrides"]:                     # empty => leave unset (match the proven minimal launch)
