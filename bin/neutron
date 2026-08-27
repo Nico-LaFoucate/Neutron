@@ -231,6 +231,26 @@ PROVISION_DXVK_CONF_PREMIERE = (
     "dxgi.nvapiHack = False\n"
     "dxgi.enableDummyCompositionSwapchain = True\n"
     "dxvk.enableGraphicsPipelineLibrary = False\n"
+    "\n"
+    # 🚨 CEF PANELS -- WITHOUT THIS, OPENING AN EXTENSION PANEL FREEZES PREMIERE.
+    # Reported from the build tester 2026-08-27 (RC1 week, day 1), 3/3 reproductions: the app
+    # wedged with every process alive in futex_wait and the log still being written. Their
+    # capture is the documented signature verbatim -- `PresentBase m_window=0`, then
+    # `calls=43 blits=1 skips=42 (gate ENGAGED)`: one frame painted, every present after it
+    # skipped, forever.
+    #
+    # ⭐ ROOT CAUSE, AND IT IS OUR OMISSION. `enableDummyCompositionSwapchain = True` above is
+    # required by Premiere ITSELF, and CEPHtmlEngine.exe INHERITS it. The shared conf and AE's
+    # conf have both carried a [CEPHtmlEngine.exe] override since the Animate fix.
+    # **Premiere's own conf never got it** -- Premiere is the one app with a private conf, and
+    # the fix landed on the two files that were not this one. Same defect, opposite outcomes.
+    #
+    # ⛔ NOT fixable by a dxvk.conf beside CEPHtmlEngine.exe: `launch` exports DXVK_CONFIG_FILE
+    # and children inherit it, so DXVK never looks beside the child's exe. The tester tried
+    # exactly that and it silently did nothing. A per-exe SECTION in the inherited file is the
+    # only vector that works.
+    "[CEPHtmlEngine.exe]\n"
+    "dxgi.enableDummyCompositionSwapchain = False\n"
 )
 
 PROVISION_DXVK_CONF_AE = (
@@ -2838,15 +2858,40 @@ def cmd_prefix_provision(args):
             try:
                 with open(target) as f:
                     have = f.read()
-                missing = [ln for ln in body.splitlines()
+                # ⛔ Only the keys BEFORE the first [section] header. A per-exe section repeats
+                # keys with different values on purpose, and appending those at top level would
+                # apply a CHILD's override to the HOST app -- e.g. denying Premiere itself the
+                # composition swapchain it requires.
+                _global_body = body.split("\n[", 1)[0]
+                _have_global = have.split("\n[", 1)[0]
+                missing = [ln for ln in _global_body.splitlines()
                            if any(ln.startswith(k) for k in DXVK_REQUIRED_KEYS)
-                           and ln.split("=")[0].strip() not in have]
-                if missing:
+                           and ln.split("=")[0].strip() not in _have_global]
+                # 🚨 A WHOLE MISSING SECTION is invisible to the key check above, because the key
+                # it contains (`dxgi.enableDummyCompositionSwapchain`) is already present at the
+                # top level with the OPPOSITE value. That is exactly how Premiere's conf sat
+                # without its [CEPHtmlEngine.exe] override while the shared and AE confs had one:
+                # every key "existed", so nothing was ever repaired, and opening an extension
+                # panel froze the app (build tester, 2026-08-27, 3/3). Repair by SECTION too.
+                missing_sections = []
+                for _sec in re.findall(r"^\[[^\]]+\]$", body, re.M):
+                    if _sec not in have:
+                        _blk = body.split(_sec, 1)[1].split("\n[", 1)[0]
+                        missing_sections.append(_sec + _blk.rstrip("\n"))
+                if missing or missing_sections:
                     with open(target, "a") as f:
-                        f.write("\n# NEUTRON repair: keys missing from this conf (a first-launch\n"
-                                "# stub pins none of them, so DXVK ran on defaults).\n")
-                        f.write("\n".join(missing) + "\n")
-                    per_app[_app_id] = f"repaired({len(missing)})"
+                        if missing:
+                            f.write("\n# NEUTRON repair: keys missing from this conf (a first-launch\n"
+                                    "# stub pins none of them, so DXVK ran on defaults).\n")
+                            f.write("\n".join(missing) + "\n")
+                        for _s in missing_sections:
+                            f.write("\n# NEUTRON repair: per-exe section missing from this conf.\n"
+                                    "# Without it a child process inherits the HOST app's settings\n"
+                                    "# through DXVK_CONFIG_FILE -- which froze Premiere on every\n"
+                                    "# extension panel until 2026-08-27.\n")
+                            f.write(_s + "\n")
+                    per_app[_app_id] = "repaired(%d keys, %d sections)" % (
+                        len(missing), len(missing_sections))
                 else:
                     per_app[_app_id] = "present"
             except OSError as e:
