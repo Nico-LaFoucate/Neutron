@@ -1173,8 +1173,36 @@ def _is_wine_builtin(path):
 
 
 def session_is_wayland():
-    return (os.environ.get("XDG_SESSION_TYPE") == "wayland"
-            and bool(os.environ.get("WAYLAND_DISPLAY")))
+    """Is there a real Wayland session to render into?
+
+    🚨 THE TEST IS THE SOCKET, not two environment variables agreeing. This used to require
+    BOTH `XDG_SESSION_TYPE == "wayland"` AND `WAYLAND_DISPLAY`, and a launch that failed it fell
+    through to the X11 branch -- which writes `Graphics=x11` into the PREFIX and turns on the
+    software frame pacer. That is a persistent, app-visible change to the user's installation,
+    made silently, on the strength of an environment variable being absent.
+
+    It matters because launch surfaces do not share an environment. Collider inherits the login
+    session's; a `.desktop` launch inherits the **systemd user manager's**, which is populated by
+    whatever the desktop imported at start-up. `XDG_SESSION_TYPE` is present there on the dev box
+    and is NOT guaranteed to be -- it comes from PAM/the session, not from the compositor. So the
+    same machine could run Wayland from Collider and X11 from the application menu, flip-flopping
+    the prefix's graphics driver on every launch.
+
+    ⛔ X11 is a HARD NEVER on this project (HOME.md). A missing variable must not be able to
+    select it. `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` existing is direct evidence a compositor is
+    there; `XDG_SESSION_TYPE` is corroboration, never a veto.
+    """
+    disp = os.environ.get("WAYLAND_DISPLAY")
+    if disp:
+        if disp.startswith("/"):          # absolute path form
+            return os.path.exists(disp)
+        rt = os.environ.get("XDG_RUNTIME_DIR")
+        if rt and os.path.exists(os.path.join(rt, disp)):
+            return True
+        # No XDG_RUNTIME_DIR to check against: trust the variable rather than
+        # downgrade the prefix to X11 on a technicality.
+        return True
+    return os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
 
 def reg_set(wine, prefix, key, name, vtype, data):
@@ -3575,6 +3603,16 @@ def cmd_launch(args):
         log(f"display: wayland | scale={scale} LogPixels={logpixels}")
     else:
         display_mode = "x11"
+        # ⛔ SAY SO, LOUDLY. This rewrites the prefix's graphics driver and changes the whole
+        # render path; it must never happen quietly because one variable was missing from one
+        # launch surface's environment. The provenance header in the log records the outcome too.
+        log("WARNING: no Wayland session detected -- falling back to X11 and setting "
+            "Graphics=x11 IN THE PREFIX. WAYLAND_DISPLAY=%r XDG_SESSION_TYPE=%r "
+            "XDG_RUNTIME_DIR=%r. If you expected Wayland, this launch surface has a different "
+            "environment from the one that works (Collider inherits the login session; a .desktop "
+            "launch inherits the systemd user manager)."
+            % (os.environ.get("WAYLAND_DISPLAY"), os.environ.get("XDG_SESSION_TYPE"),
+               os.environ.get("XDG_RUNTIME_DIR")))
         reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "x11")
         env["NEUTRON_PRESENT_PACE"] = "1"   # X11 software frame pacer
         env.setdefault("DISPLAY", ":0")
