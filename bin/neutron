@@ -3593,6 +3593,37 @@ def cmd_launch(args):
             log_path = os.path.join(
                 NEUTRON_LOGS_DIR, f"{args.app}-{time.strftime('%Y%m%d-%H%M%S')}.log")
             log_fh = open(log_path, "wb")
+            # ⭐ MAKE THE LOG SELF-DESCRIBING. The `[neutron] launching: …` line is the PARENT's
+            # stderr, so it never appears inside the child's log -- on a menu launch it goes to
+            # the journal, on a Collider launch Collider captures it. Confirmed by the build
+            # tester 2026-08-26: 0 of 3 real session logs contained it. That means a log someone
+            # sends us has, on its own, no record of WHICH runtime, prefix or gates produced it,
+            # and every one of those has been the answer to a bug at least once. Write the
+            # provenance into the file itself, before the child inherits the fd.
+            _gates = " ".join("%s=%s" % (k, v) for k, v in sorted(env.items())
+                              if k.startswith("NEUTRON_")) or "(none)"
+            # ⛔ Report the runtime we RESOLVED, never NEUTRON_WINE_VERSION. That variable is what
+            # was ASKED FOR; the binary is what ran. Caught in testing 2026-08-26 when a scratch
+            # XDG_DATA_HOME moved the runtimes directory, resolution fell through to the dev build
+            # tree, and this header cheerfully said "11.10-63" over a completely different wine.
+            # A provenance header that can be wrong about provenance is worse than none --
+            # [[state-written-before-the-fact]] in the one place built to prevent it.
+            _rtroot = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(wine))))
+            _rtname = (_rtroot[len("neutron-wine-"):] if _rtroot.startswith("neutron-wine-")
+                       else ("system wine" if not is_neutron else "unrecognised layout: " + _rtroot))
+            log_fh.write(("=== neutron runtime %s | %s\n"
+                          "    app     : %s (%s)\n"
+                          "    exe     : %s\n"
+                          "    prefix  : %s  (stamp %s)\n"
+                          "    wine    : %s\n"
+                          "    display : %s\n"
+                          "    gates   : %s\n"
+                          "=== everything below this line is the application's own output\n\n"
+                          % (_rtname, time.strftime("%Y-%m-%d %H:%M:%S"),
+                             args.app, profile["name"], exe, prefix,
+                             _prefix_stamp(prefix), wine, display_mode, _gates)
+                          ).encode("utf-8", "replace"))
+            log_fh.flush()
         except OSError as e:
             # Never let logging break a launch. Fall back to the old behaviour.
             log(f"app log unavailable ({e}); output discarded")
