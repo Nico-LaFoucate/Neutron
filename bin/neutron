@@ -3004,6 +3004,102 @@ def _copytree_unless_same(src, dst):
     return "copied"
 
 
+# ---------------------------------------------------------------------------------------------
+# GATES — the fixes you can turn off, as a first-class CLI surface.
+#
+# 🚨 WHY THIS EXISTS. The engine reads 62 different NEUTRON_* environment variables, and they are
+# three unrelated things wearing one costume:
+#
+#   1. PER-APP CONFIGURATION -- NEUTRON_D2D_DCDIRECT, NEUTRON_GDI_PRESENT, NEUTRON_DISABLE_BTW.
+#      These are already baked into the launch: they live in APP_PROFILES and `launch` sets them.
+#      Nobody should ever type one. This is what "like everything else" looks like.
+#   2. DEVELOPER TRACES -- *_TRACE, *_DIAG, *_PROBE. Instruments, off by default, no user surface.
+#   3. KILL SWITCHES FOR SHIPPED FIXES -- the odd one out, and the operator was right to object.
+#      These are the ONLY ones a tester ever needs, and until 2026-08-27 they had no interface at
+#      all: the name lived in a handoff document, had to be typed exactly, could not be set on a
+#      menu or dock launch, and a typo silently did nothing while looking like a clean negative
+#      result. That is the same shape as every "harness was broken, not the code" incident in
+#      INCIDENTS.md.
+#
+# So the env var stays as the TRANSPORT to the C code -- that is just how a DLL reads a setting --
+# and stops being the INTERFACE. `neutron gates` lists them; `launch --without <name>` sets one,
+# validated, with the applied value visible in the log's provenance header so there is proof it
+# reached the code. A wrong name is now an error listing the right ones instead of a no-op.
+#
+# ⛔ Only list a gate here once its fix has SHIPPED. This is the bisect surface for released
+# behaviour, not a dumping ground for every getenv in the tree.
+NEUTRON_GATES = {
+    "wic-seed-skip": {
+        "env": "NEUTRON_WIC_SEED_SKIP", "default": True,
+        "what": "skip the acquire-time upload when a WIC bitmap comes back untouched",
+        "why": "the Premiere splash rendering half white was traced to this in 11.10-61 "
+               "(TODO.md P1o). Turn it off first if any UI region paints blank and then "
+               "self-corrects on redraw.",
+    },
+    "owned-subsurface": {
+        "env": "NEUTRON_OWNED_SUBSURFACE", "default": True,
+        "what": "owned windows become compositor-child surfaces so WE set their position",
+        "why": "widest blast radius of the 11.10-63 changes. Turn it off if a floating panel "
+               "stacks wrongly, will not repaint after hide/reshow, or cannot be raised.",
+    },
+    "owned-subsurface-captioned": {
+        "env": "NEUTRON_OWNED_SUBSURFACE_CAPTIONED", "default": True,
+        "what": "extend the above to owned windows that have a title bar",
+        "why": "new 2026-08-27, for docking Premiere's extension panel. Turn it off if a "
+               "captioned dialog misbehaves; caption-less windows keep the fix.",
+    },
+    "d2d-stencil": {
+        "env": "NEUTRON_D2D_STENCIL", "default": True,
+        "what": "real stencilled layer masks instead of the mask's bounding box",
+        "why": "turn it off if a masked region paints too much or too little.",
+    },
+    "popup-slide": {
+        "env": "NEUTRON_POPUP_SLIDE", "default": False,
+        "what": "let a menu popup slide along its anchor to stay on screen",
+        "why": "an experiment left in, gated OFF -- it chased rounding noise and oscillated. "
+               "Do not enable it to 'fix' a misplaced menu without measuring first.",
+    },
+    "dock-owned": {
+        "env": "NEUTRON_DOCK_OWNED", "default": False,
+        "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
+        "why": "superseded by owned-subsurface-captioned. Kept for comparison.",
+    },
+}
+
+
+def gate_env(name, on):
+    """The env assignment that forces gate `name` on/off, or raise ValueError naming the valid set.
+
+    ⛔ A wrong name must never be silently ignored. `NEUTRON_WIC_SEED_SKP=0` looks exactly like a
+    clean negative result and is how a session gets spent proving nothing.
+    """
+    g = NEUTRON_GATES.get(name)
+    if not g:
+        raise ValueError("unknown gate %r -- known gates: %s"
+                         % (name, ", ".join(sorted(NEUTRON_GATES))))
+    return g["env"], ("1" if on else "0")
+
+
+def cmd_gates(args):
+    """List the shipped fixes that can be turned off, and how."""
+    out = []
+    for name in sorted(NEUTRON_GATES):
+        g = NEUTRON_GATES[name]
+        out.append({"gate": name, "env": g["env"], "default": "on" if g["default"] else "off",
+                    "what": g["what"], "why": g["why"]})
+    if args.json:
+        emit({"ok": True, "gates": out}, True)
+        return EX_OK
+    print("Fixes you can turn off for a launch. Use --with/--without on `neutron launch`,")
+    print("or put `<ENV>=0` in <prefix>/neutron-env.conf to affect EVERY launch surface")
+    print("(menu, dock, file association, Collider) -- which a flag cannot reach.\n")
+    for g in out:
+        print("  %-28s default %-3s  (%s)" % (g["gate"], g["default"], g["env"]))
+        print("      %s" % g["what"])
+        print("      %s\n" % g["why"])
+    return EX_OK
+
+
 def cmd_runtime_which(args):
     """The wine this CLI would use, and the version tag that goes with it.
 
@@ -3469,6 +3565,21 @@ def cmd_launch(args):
     # Applied BEFORE the profile's own gates, which use setdefault -- so this wins over a
     # profile default. The caller's real environment still wins over this, so a terminal
     # `NEUTRON_FOO=1 neutron launch ...` overrides the file for a one-off.
+    # --with / --without: the named form of the same thing. Applied FIRST so an explicit flag
+    # beats both the per-prefix file and the profile default -- the flag is the most deliberate
+    # statement of intent available, and a bisect is worthless if something quietly overrides it.
+    _from_flag = set()
+    for _name, _on in ([(n, False) for n in (getattr(args, "without", None) or [])] +
+                       [(n, True) for n in (getattr(args, "with_", None) or [])]):
+        try:
+            _k, _v = gate_env(_name, _on)
+        except ValueError as e:
+            die({"launched": False, "reason": str(e),
+                 "known_gates": sorted(NEUTRON_GATES)}, EX_FAIL, args.json)
+        env[_k] = _v
+        _from_flag.add(_k)
+        log("gate: --%s %s -> %s=%s" % ("with" if _on else "without", _name, _k, _v))
+
     _envconf = os.path.join(prefix, "neutron-env.conf")
     _applied = {}
     try:
@@ -3480,7 +3591,7 @@ def cmd_launch(args):
                         continue
                     k, v = ln.split("=", 1)
                     k, v = k.strip(), v.strip()
-                    if k and k not in os.environ:
+                    if k and k not in os.environ and k not in _from_flag:
                         env[k] = v
                         _applied[k] = v
             if _applied:
@@ -4643,6 +4754,13 @@ def build_parser():
     pl.add_argument("--prefix", default=None)
     pl.add_argument("--project", default=None,
                     help="optional project path (Windows-style, e.g. C:\\...\\x.prproj)")
+    pl.add_argument("--without", action="append", metavar="GATE",
+                    help="turn a shipped fix OFF for this launch (repeatable). "
+                         "`neutron gates` lists them. An unknown name is an error, never a "
+                         "silent no-op.")
+    pl.add_argument("--with", dest="with_", action="append", metavar="GATE",
+                    help="turn a gate ON for this launch (repeatable) -- for the ones that ship "
+                         "off by default.")
     pl.add_argument("--no-log", action="store_true",
                     help="do not write a session log to ~/.local/share/neutron/logs/. By default "
                          "a log is written whenever nobody is watching the output live (menu, "
@@ -4686,6 +4804,10 @@ def build_parser():
     pt.set_defaults(func=cmd_teardown)
 
     # doctor
+    pg = sub.add_parser("gates",
+                        help="list the shipped fixes that can be turned off, and how")
+    pg.set_defaults(func=cmd_gates)
+
     pd = sub.add_parser("doctor", help="health check")
     pd.add_argument("--prefix", default=None)
     pd.set_defaults(func=cmd_doctor)
