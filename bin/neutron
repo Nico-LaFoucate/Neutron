@@ -3602,17 +3602,40 @@ def cmd_launch(args):
         env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
         log(f"display: wayland | scale={scale} LogPixels={logpixels}")
     else:
+        # ⛔ NO AUTOMATIC X11. EVER.
+        #
+        # This used to fall through to X11: write `Graphics=x11` into the PREFIX, turn on the
+        # software frame pacer, and launch. It did that on the strength of an environment
+        # variable being absent -- and launch surfaces do not share an environment (Collider
+        # inherits the login session's, a .desktop launch inherits the systemd user manager's),
+        # so the same machine could run Wayland from Collider and X11 from the application menu,
+        # rewriting the prefix's graphics driver on every launch.
+        #
+        # X11 is a HARD NEVER on this project (HOME.md): the winewayland work -- fractional
+        # scale, the present path, decorations, drag-and-drop, the owned-window coordinate
+        # fixes -- is where every fix of the last two months lives. Silently degrading into the
+        # one configuration we have ruled out, and persisting it into the user's installation,
+        # is not a fallback. It is the thing the rule exists to prevent, automated.
+        #
+        # So: STOP, and say exactly what is missing. Refusing is recoverable; a silently
+        # re-configured prefix is discovered days later as "the app looks wrong now".
+        if os.environ.get("NEUTRON_ALLOW_X11") != "1":
+            die({"launched": False,
+                 "reason": "no Wayland session detected, and Neutron does not fall back to X11",
+                 "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
+                 "xdg_session_type": os.environ.get("XDG_SESSION_TYPE"),
+                 "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR"),
+                 "hint": "Neutron requires a Wayland session — every graphics fix it ships lives "
+                         "in winewayland. If you ARE on Wayland, this launch surface has a "
+                         "different environment from one that works: compare it with a launch "
+                         "from Collider or a terminal. Set NEUTRON_ALLOW_X11=1 only if you "
+                         "deliberately want the unsupported X11 path, which will also rewrite "
+                         "this prefix's graphics driver."},
+                EX_DEP, args.json)
         display_mode = "x11"
-        # ⛔ SAY SO, LOUDLY. This rewrites the prefix's graphics driver and changes the whole
-        # render path; it must never happen quietly because one variable was missing from one
-        # launch surface's environment. The provenance header in the log records the outcome too.
-        log("WARNING: no Wayland session detected -- falling back to X11 and setting "
-            "Graphics=x11 IN THE PREFIX. WAYLAND_DISPLAY=%r XDG_SESSION_TYPE=%r "
-            "XDG_RUNTIME_DIR=%r. If you expected Wayland, this launch surface has a different "
-            "environment from the one that works (Collider inherits the login session; a .desktop "
-            "launch inherits the systemd user manager)."
-            % (os.environ.get("WAYLAND_DISPLAY"), os.environ.get("XDG_SESSION_TYPE"),
-               os.environ.get("XDG_RUNTIME_DIR")))
+        log("WARNING: NEUTRON_ALLOW_X11=1 -- taking the UNSUPPORTED X11 path and setting "
+            "Graphics=x11 IN THE PREFIX. Every winewayland fix is inactive here. A later "
+            "Wayland launch will set the driver back.")
         reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "x11")
         env["NEUTRON_PRESENT_PACE"] = "1"   # X11 software frame pacer
         env.setdefault("DISPLAY", ":0")
@@ -4395,6 +4418,29 @@ def cmd_doctor(args):
             # Would launching this prefix on the runtime we just resolved re-stamp it? Same test
             # `launch` refuses on, surfaced here so Collider shows it BEFORE someone clicks
             # Launch. Silent when the prefix has never been booted.
+            # 🚨 IS THIS PREFIX STILL ON THE WAYLAND DRIVER? Every graphics fix Neutron ships
+            # lives in winewayland, and until 2026-08-27 a launch from a surface whose
+            # environment lacked XDG_SESSION_TYPE would silently write Graphics=x11 here. A
+            # prefix can therefore already be in that state from a menu launch, and the symptom
+            # is "the app looks wrong now" days later with nothing to point at. The automatic
+            # fallback is gone; this is how an existing casualty is found.
+            try:
+                with open(os.path.join(prefix, "user.reg"), encoding="utf-8",
+                          errors="replace") as _f:
+                    _reg = _f.read()
+                _m = re.search(r'\[Software\\\\Wine\\\\Drivers\](.*?)(\n\[|\Z)', _reg, re.S)
+                _gfx = None
+                if _m:
+                    _g = re.search(r'"Graphics"="([^"]*)"', _m.group(1))
+                    _gfx = _g.group(1) if _g else None
+                if _gfx is not None:
+                    check("graphics-driver", "wayland" in _gfx,
+                          _gfx if "wayland" in _gfx else
+                          "prefix is set to %r, not wayland -- every winewayland fix is INACTIVE. "
+                          "A Wayland launch sets it back; `neutron launch` no longer falls back "
+                          "to X11 automatically." % _gfx)
+            except OSError:
+                pass
             _mm = stamp_mismatch(prefix, _wine)
             if _mm is not None:
                 _also = _mm["prefix_runtimes"]
