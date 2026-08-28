@@ -73,7 +73,7 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
-NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-64")
+NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-68")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
@@ -3043,10 +3043,26 @@ NEUTRON_GATES = {
                "stacks wrongly, will not repaint after hide/reshow, or cannot be raised.",
     },
     "owned-subsurface-captioned": {
-        "env": "NEUTRON_OWNED_SUBSURFACE_CAPTIONED", "default": True,
-        "what": "extend the above to owned windows that have a title bar",
-        "why": "new 2026-08-27, for docking Premiere's extension panel. Turn it off if a "
-               "captioned dialog misbehaves; caption-less windows keep the fix.",
+        "env": "NEUTRON_OWNED_SUBSURFACE_CAPTIONED", "default": False,
+        "what": "extend owned-subsurface to owned windows that have a title bar",
+        "why": "⛔ DEFAULT OFF since 11.10-65. Shipped ON in 11.10-64 for one extension panel and "
+               "promoted ~1000 windows a session, because Premiere's VST plugin windows and its "
+               "dialogs are captioned owned windows too: plugin windows sank behind the Program "
+               "Monitor and a file-browse dialog wedged the app. Docking that panel remains OPEN.",
+    },
+    "owned-subsurface-modal": {
+        "env": "NEUTRON_OWNED_SUBSURFACE_MODAL", "default": False,
+        "what": "also promote owned windows carrying WS_EX_DLGMODALFRAME",
+        "why": "those are the ones that wedge Premiere on a file-browse dialog. The build "
+               "tester's census separated them perfectly (597 with the bit, all dialogs; 1302 "
+               "without, none). Only meaningful with owned-subsurface-captioned on.",
+    },
+    "owned-zorder": {
+        "env": "NEUTRON_OWNED_ZORDER", "default": False,
+        "what": "mirror win32 z-order onto promoted owned windows' subsurfaces",
+        "why": "the attempted fix for plugin windows sinking. It demonstrably reaches the code "
+               "now (they appear in the applied order) but does NOT fix the symptom, so it stays "
+               "off. Only meaningful with owned-subsurface-captioned on.",
     },
     "d2d-stencil": {
         "env": "NEUTRON_D2D_STENCIL", "default": True,
