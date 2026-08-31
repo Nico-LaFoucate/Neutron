@@ -46,6 +46,11 @@ runtime-bak-*/
 _rollback-*/
 preserved-fixes/hangs/
 
-# Tester handoffs are correspondence, not source. Kept locally in ~/neutron-handoffs and
-# sent by hand over Drive; they must never reach the repo or GitHub.
+# CORRESPONDENCE NEVER GOES IN THIS REPO.
+# Handoffs we send, and the reports that come back, are correspondence -- not source. They live in
+# ~/neutron-handoffs on the dev box and are sent by hand over Drive. They name people's machines and
+# would become public along with the repo.
 dist/HANDOFF-*.md
+dist/FIELD-REPORT-*.md
+dist/REPLY-TESTER-*.md
+docs/HANDOFF-*.md
