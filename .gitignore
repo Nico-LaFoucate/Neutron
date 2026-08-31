@@ -45,3 +45,7 @@ dist/tester-r5/
 runtime-bak-*/
 _rollback-*/
 preserved-fixes/hangs/
+
+# Tester handoffs are correspondence, not source. Kept locally in ~/neutron-handoffs and
+# sent by hand over Drive; they must never reach the repo or GitHub.
+dist/HANDOFF-*.md
