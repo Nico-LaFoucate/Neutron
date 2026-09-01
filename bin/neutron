@@ -1621,15 +1621,47 @@ def _prune_app_logs(log_dir, app, keep=20):
         pass
 
 
-def _cooltype_cache_dirs(prefix):
-    """CoolType's per-app `Typesupport` cache dirs inside a prefix (they hold
-    AdobeFnt_OSFonts.lst / AdobeFnt_CMaps.lst)."""
+def _cooltype_cache_files(prefix):
+    """Every CoolType font cache file in a prefix, found by the ARTEFACT name rather
+    than by Adobe's per-app directory name.
+
+    🚨 2026-09-01, build tester. This used to collect only directories basename-equal
+    to `typesupport`, which finds 3 of the 6 live caches on a full suite prefix:
+
+        Premiere / After Effects / Media Encoder  AppData/Local/Temp/.../Typesupport   ✅
+        Photoshop 2025                            AppData/Roaming/.../CT Font Cache    ❌
+        Illustrator 29 / AIRobin 29.7.1           AppData/Roaming/.../en_US/x64        ❌
+
+    Observed live: `provision` reported `cooltype_cache_invalidate: {"count": 2}` while
+    11 AdobeFnt*.lst files sat on disk, six of them live caches. After a font install,
+    Premiere would see the new font and Photoshop and Illustrator would NOT -- with
+    every file-level and registry-level check passing. That is exactly the failure
+    invalidate_cooltype_caches() exists to prevent, and it was reporting ok:true while
+    doing a third of the job.
+
+    ⭐ The directory name varies by app and version; the cache FILE name does not. That
+    predicate was already being applied inside each directory -- hoisting it out is the
+    whole fix. The two Roaming locations are also never cleared incidentally, because
+    nothing else prunes Roaming the way Temp gets pruned.
+    """
     out = []
     users = os.path.join(prefix, "drive_c", "users")
-    for root, dirs, _files in os.walk(users):
-        if os.path.basename(root).lower() == "typesupport":
-            out.append(root)
-            dirs[:] = []
+    for root, _dirs, files in os.walk(users):
+        for fn in files:
+            low = fn.lower()
+            if low.startswith("adobefnt") and low.endswith(".lst"):
+                out.append(os.path.join(root, fn))
+    return out
+
+
+def _cooltype_cache_dirs(prefix):
+    """Directories that actually hold a CoolType cache, deduped, order-stable."""
+    seen, out = set(), []
+    for f in _cooltype_cache_files(prefix):
+        d = os.path.dirname(f)
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
     return out
 
 
@@ -1816,14 +1848,12 @@ def invalidate_cooltype_caches(prefix):
     make and still fails, which is precisely how three days were lost. Returns
     the number of files removed."""
     n = 0
-    for d in _cooltype_cache_dirs(prefix):
-        for fn in os.listdir(d):
-            if fn.lower().startswith("adobefnt") and fn.lower().endswith(".lst"):
-                try:
-                    os.remove(os.path.join(d, fn))
-                    n += 1
-                except OSError:
-                    pass
+    for f in _cooltype_cache_files(prefix):
+        try:
+            os.remove(f)
+            n += 1
+        except OSError:
+            pass
     return n
 
 
