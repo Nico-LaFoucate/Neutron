@@ -73,10 +73,58 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   <NEUTRON_RUNTIMES_DIR>/neutron-wine-<version>/  (has bin/wine, self-stamps
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
-NEUTRON_WINE_VERSION = os.environ.get("NEUTRON_WINE_VERSION", "11.10-70")
 NEUTRON_RUNTIMES_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "runtimes")
+
+
+def _installed_runtime_versions():
+    """Installed runtime versions, newest first. Only numeric releases (11.10-72);
+    dev trees like `neutron-wine-11.10-gpufix` are never auto-selected."""
+    out = []
+    try:
+        names = os.listdir(NEUTRON_RUNTIMES_DIR)
+    except OSError:
+        return []
+    for name in names:
+        if not name.startswith("neutron-wine-"):
+            continue
+        ver = name[len("neutron-wine-"):]
+        m = re.match(r"^(\d+)\.(\d+)-(\d+)$", ver)
+        if not m:
+            continue
+        if not os.path.isfile(os.path.join(NEUTRON_RUNTIMES_DIR, name, "bin", "wine")):
+            continue
+        out.append((tuple(int(g) for g in m.groups()), ver))
+    out.sort(reverse=True)
+    return [v for _, v in out]
+
+
+def _default_wine_version():
+    """The runtime version to use when $NEUTRON_WINE_VERSION is unset.
+
+    🚨 2026-09-01, build tester. This was a hardcoded literal, and it had gone stale by two
+    drops: it still said "11.10-70" while the shipped wrapper exported 11.10-72. The wrapper
+    hid it, so the only way to hit it was to invoke bin/neutron directly -- which our own
+    LAUNCHERS.md documented as a launcher pattern. One direct `prefix provision` then staged
+    70's natives, stamped the prefix with 70's wine.inf mtime, and rewrote ALL SEVEN desktop
+    entries to pin 11.10-70, silently repointing every launch surface at an old runtime.
+
+    ⛔ `doctor` could not catch it: it reported 14/14 healthy including "prefix and runtime
+    agree". That was TRUE -- they agreed on the wrong runtime. Doctor validates internal
+    consistency, never "is this the runtime that was installed".
+
+    So: derive it from what is actually on disk, newest first. A constant that has to be bumped
+    by hand every drop will go stale again -- it already did, twice. Returns None when nothing
+    is installed, and callers must refuse rather than silently pick."""
+    env = os.environ.get("NEUTRON_WINE_VERSION")
+    if env:
+        return env
+    versions = _installed_runtime_versions()
+    return versions[0] if versions else None
+
+
+NEUTRON_WINE_VERSION = _default_wine_version()
 
 # Where `neutron launch --json` writes each app's wine log. Sibling of runtimes so
 # it follows XDG_DATA_HOME and a fake-HOME clean-room test the same way.
@@ -86,8 +134,8 @@ NEUTRON_LOGS_DIR = os.path.join(
 
 NEUTRON_WINE_CANDIDATES = [
     os.environ.get("NEUTRON_WINE"),
-    os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{NEUTRON_WINE_VERSION}",
-                 "bin", "wine"),
+    (os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{NEUTRON_WINE_VERSION}",
+                  "bin", "wine") if NEUTRON_WINE_VERSION else None),
     os.path.join(HOME, "neutron", "dist", "wine", "bin", "wine"),
     os.path.join(HOME, "wine-tkg-git", "wine-tkg-git", "src",
                  "wine-tkg-staging-ntsync-git-64-build", "wine"),
@@ -3350,6 +3398,13 @@ def cmd_runtime_install(args):
     import urllib.error
 
     version = args.version or NEUTRON_WINE_VERSION
+    if not version:
+        # No installed runtime to derive from and no explicit version: refuse rather than
+        # silently choose. A wrong default here repoints every launch surface (see
+        # _default_wine_version()).
+        die({"ok": False, "reason": "no runtime version: none installed and "
+                                    "NEUTRON_WINE_VERSION unset; pass --version"},
+            EX_FAIL, getattr(args, "json", False))
     repo = args.repo or NEUTRON_WINE_REPO
     manifest = None
 
@@ -4872,7 +4927,7 @@ def build_parser():
     ri = rsub.add_parser("install",
                          help="download + verify + unpack a neutron-wine release")
     ri.add_argument("--version", default=None,
-                    help=f"release version (default: {NEUTRON_WINE_VERSION})")
+                    help="release version (default: newest installed runtime)")
     ri.add_argument("--repo", default=None,
                     help=f"GitHub owner/repo (default: {NEUTRON_WINE_REPO})")
     ri.add_argument("--manifest", default=None,
