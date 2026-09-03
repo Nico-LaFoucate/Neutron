@@ -15,7 +15,7 @@ Premiere Pro · After Effects · Photoshop · Lightroom · Illustrator · Animat
 
 <br>
 
-![Status](https://img.shields.io/badge/status-experimental_alpha-orange)
+![Status](https://img.shields.io/badge/status-beta-2BB673)
 ![Platform](https://img.shields.io/badge/platform-Linux-informational)
 ![Built on Wine](https://img.shields.io/badge/built_on-Wine-8A2BE2)
 ![GPU](https://img.shields.io/badge/GPU-Vulkan_·_CUDA_·_NVENC-76B900)
@@ -26,11 +26,11 @@ Premiere Pro · After Effects · Photoshop · Lightroom · Illustrator · Animat
 ---
 
 > [!WARNING]
-> **Neutron is in experimental alpha.** Everything here is early, in-progress research on a
-> single development machine — an NVIDIA RTX 5070 (nvidia-open) on CachyOS with KDE Wayland.
-> Nothing below is validated across hardware, distributions, or application versions. Things
-> break, and you must bring your own legally licensed Adobe software. Treat this as a look at
-> where the project is headed, not a finished product.
+> **Neutron is in beta, on one machine.** The applications below are used for real work —
+> including paid client work — but everything here is observed on a single development machine:
+> an NVIDIA RTX 5070 (nvidia-open) on CachyOS with KDE Wayland. Nothing is validated across
+> hardware, distributions, or application versions. Things break, and you must bring your own
+> legally licensed Adobe software.
 
 ---
 
@@ -74,31 +74,40 @@ patched Wine foundation and shipping the fixes those applications need to run.
 ## Compatibility
 
 > [!NOTE]
-> These are **early results from active development**, observed on one machine. Every entry has
-> rough edges. "Alpha" means it boots and does real work in testing — not that it is stable or
-> complete.
+> These are results observed on one machine, and every entry has rough edges. Tiers match the
+> [status board](https://neutronproject.org), which is canonical:
+>
+> | Tier | Meaning |
+> | :--- | :--- |
+> | 🟢 `Beta` | Usable for real work |
+> | 🟡 `Partial` | Launches, major gaps |
+> | 🔵 `Likely` | Inherits fixes from another release, unverified |
+> | 🔴 `Not working` | Confirmed broken |
+> | ⚪ `Untested` | Assume broken |
+>
+> Support is tracked **per release** — a fix landing on one version does not automatically carry
+> to the next.
 
 | Application / Feature | Status | Notes |
 | :--- | :--- | :--- |
-| **Premiere Pro 2025** | 🟢 `Alpha` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. Frame pacing and third-party plugins are still rough. |
-| **After Effects 2025** | 🟢 `Alpha` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers/guides overlay is disabled pending CUDA↔D3D11 interop. |
-| **Photoshop 2025** | 🟢 `Alpha` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). Some warm-up lag remains. |
-| **Lightroom Classic** | 🟢 `Alpha` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
-| **Illustrator 2025** | 🟢 `Alpha` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
-| **Media Encoder 2025** | 🟢 `Alpha` | Queue, render and export end-to-end, including native muxing. |
-| **Animate 2024** | 🟢 `Alpha` | Canvas, panels and playback. Its home screen is blank — that is Adobe's own bug, blank on Windows too; File → New works. |
-| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Alpha` | Full round trip, no engine changes required — both applications must be running. |
-| **CEP / UXP panels** | 🟢 `Alpha` | Third-party panels render and stay interactive inside their docks. |
-| **Pen / tablet input** | 🟢 `Alpha` | Pressure, tilt and eraser via WinTab. The first stroke after a tool switch can stray. |
-| **Drag and drop from the file manager** | 🟢 `Alpha` | Dropping files from Dolphin/Nautilus into an application. |
-| **NVIDIA (CUDA / NVENC)** | 🟢 `Alpha` | The primary hardware used in development (RTX 5070, nvidia-open). |
+| **Premiere Pro 2025** | 🟢 `Beta` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. Frame pacing and third-party plugins are still rough. |
+| **After Effects 2025** | 🟢 `Beta` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers/guides overlay is disabled pending CUDA↔D3D11 interop. |
+| **Photoshop 2025** | 🟢 `Beta` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). Some warm-up lag remains. |
+| **Lightroom Classic** | 🟢 `Beta` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
+| **Illustrator 2025** | 🟢 `Beta` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
+| **Media Encoder 2025** | 🟢 `Beta` | Queue, render and export end-to-end, including native muxing. |
+| **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is blank — that is Adobe's own bug, blank on Windows too; File → New works. |
+| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, no engine changes required — both applications must be running. |
+| **CEP / UXP panels** | 🟢 `Beta` | Third-party panels render and stay interactive inside their docks. |
+| **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab. The first stroke after a tool switch can stray. |
+| **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin/Nautilus into an application. |
+| **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
 | **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. NVENC in particular is NVIDIA-only. |
 | **Third-party plugins** | ⚪ `Untested` | Core application stability comes first. |
 
 ### Creative Cloud 2026
 
-Support is tracked **per release** — a fix landing on one version does not automatically carry to
-the next. The table above is the 2025 line; 2026 is being brought up separately.
+The table above is the 2025 line; 2026 is being brought up separately.
 
 | Application | Status | Notes |
 | :--- | :--- | :--- |
