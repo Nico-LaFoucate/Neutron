@@ -1002,14 +1002,34 @@ def find_debug_databases(prefix, user):
         hits = glob.glob(os.path.join(base, subdir, "*", "Debug Database.txt"))
         hits = [h for h in hits if ".bak" not in h and "Team Projects" not in h]
 
-        def vkey(p):
+        # 🚨 Pick the REAL database, not the highest version number.
+        #
+        # After Effects 2026 keeps TWO: the genuine one at 26.0 (184 keys, carrying
+        # AEDebugDatabaseVersion) and a 3-line stub at 26.3. Sorting by version
+        # descending picked the STUB, so `apply-display-fix` wrote
+        # DS.DisableDirectXDisplay into a file AE never reads -- and AE 2026's
+        # composition panel stayed black while 2025's worked. 2025 was right only
+        # by luck: it has a single database (25.0), so there was nothing to choose
+        # between. Collider re-applies this on every launch, so the fix was being
+        # written to the wrong file over and over.
+        #
+        # Rank: has the AEDebugDatabaseVersion marker > more keys > higher version.
+        def rank(p):
+            try:
+                with open(p, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                raw = b""
+            real = b"AEDebugDatabaseVersion" in raw
+            keys = raw.count(b"\n")
             ver = os.path.basename(os.path.dirname(p))
             try:
-                return tuple(int(x) for x in ver.split("."))
+                v = tuple(int(x) for x in ver.split("."))
             except ValueError:
-                return (0,)
+                v = (0,)
+            return (real, keys, v)
 
-        hits.sort(key=vkey, reverse=True)
+        hits.sort(key=rank, reverse=True)
         out.append((label, hits[0] if hits else None, installed))
     return out
 
