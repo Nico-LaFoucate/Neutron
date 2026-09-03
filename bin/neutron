@@ -4571,8 +4571,22 @@ def register_app_desktop_entries(prefix):
                 legacy_body = ""
             # Ours, superseded by the qualified name -> retire it. Another
             # prefix's -> leave it alone; it is that prefix's only launcher.
-            if ("--prefix %s " % prefix) in legacy_body or legacy_body.rstrip().endswith(
-                    "--prefix %s" % prefix):
+            #
+            # ⛔ Match the Exec line's TOKENS, not a substring. An app with no MIME
+            # types gets no trailing " %f", so its Exec ends immediately after the
+            # path -- a " --prefix <path> " probe with a trailing space misses it
+            # and leaves a duplicate launcher behind (Media Encoder, every time).
+            def _launches_this_prefix(body, want):
+                for line in body.splitlines():
+                    if not line.startswith("Exec="):
+                        continue
+                    toks = line.split()
+                    for i, t in enumerate(toks):
+                        if t == "--prefix" and i + 1 < len(toks) and toks[i + 1] == want:
+                            return True
+                return False
+
+            if _launches_this_prefix(legacy_body, prefix):
                 try:
                     os.remove(legacy)
                 except OSError as e:
