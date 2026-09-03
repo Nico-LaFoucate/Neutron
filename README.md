@@ -99,7 +99,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is blank — that is Adobe's own bug, blank on Windows too; File → New works. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, no engine changes required — both applications must be running. |
 | **CEP / UXP panels** | 🟢 `Beta` | Third-party panels render and stay interactive inside their docks. |
-| **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab. The first stroke after a tool switch can stray. |
+| **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab, at the tablet's native resolution. The first-stroke stray is fixed — Wine's WinTab context declared `lcOutExt` in tablet units where a real Wacom declares screen pixels, a factor-of-UPP error in the mapping Photoshop uses before it calibrates. |
 | **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin/Nautilus into an application. |
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
 | **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. NVENC in particular is NVIDIA-only. |
