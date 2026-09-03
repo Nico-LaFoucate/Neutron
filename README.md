@@ -113,6 +113,7 @@ The table above is the 2025 line; 2026 is being brought up separately.
 | :--- | :--- | :--- |
 | **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. Not yet used for a paid job on this release. |
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
+| **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job on this release. |
 
 Everything else in the 2026 line is untested. The
 [status board](https://neutronproject.org) tracks both releases and is the canonical view.
