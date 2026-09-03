@@ -2838,6 +2838,33 @@ def cmd_prefix_provision(args):
                 except OSError as e:
                     log(f"roman-default repair of {fn} failed: {e}")
             unrepaired.append(fn)
+        # 🚨 If NOTHING on this host could supply a genuine face, copying cannot
+        # help and the prefix stays fatally broken -- we would only print
+        # "run `winetricks corefonts`" and call it a day, which is how a build
+        # tester ends up with an install that reported success and cannot launch
+        # Premiere, AE or Media Encoder.
+        #
+        # Fetch them. Gated on the prefix ALREADY being broken, so a healthy
+        # prefix pays nothing, and corefonts brings georgia/verdana/impact/trebuc
+        # too -- which the video trio needs and _ROMAN_DEFAULTS (times/arial/cour)
+        # never covered.
+        if unrepaired and shutil.which("winetricks"):
+            log("no genuine Roman face on this host — fetching the real Microsoft "
+                "core fonts (`winetricks corefonts`); this downloads ~10 MB")
+            try:
+                subprocess.run(["winetricks", "-q", "-f", "corefonts"],
+                               env={**os.environ, "WINE": wine, "WINEPREFIX": prefix,
+                                    "WINEDEBUG": "-all", "W_OPT_UNATTENDED": "1"},
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=600, check=False)
+            except Exception as e:                        # never fail provisioning on this
+                log(f"winetricks corefonts failed: {e}")
+            # Re-evaluate: whatever landed changes the verdict below, and the
+            # CoolType cache invalidation after this block must see the NEW files.
+            roman = _roman_default_status(prefix)
+            newly = [fn for fn, state, _ in roman if state == "real" and fn in unrepaired]
+            repaired.extend(newly)
+            unrepaired = [fn for fn in unrepaired if fn not in newly]
         if repaired:
             register_prefix_fonts(wine, prefix)   # re-register the replaced files
     # 🚨 UNCONDITIONALLY, even when nothing was repaired. CoolType's cache is
