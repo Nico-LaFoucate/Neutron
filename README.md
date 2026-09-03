@@ -95,6 +95,19 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. NVENC in particular is NVIDIA-only. |
 | **Third-party plugins** | ⚪ `Untested` | Core application stability comes first. |
 
+### Creative Cloud 2026
+
+Support is tracked **per release** — a fix landing on one version does not automatically carry to
+the next. The table above is the 2025 line; 2026 is being brought up separately.
+
+| Application | Status | Notes |
+| :--- | :--- | :--- |
+| **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. Not yet used for a paid job on this release. |
+| **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
+
+Everything else in the 2026 line is untested. The
+[status board](https://neutronproject.org) tracks both releases and is the canonical view.
+
 > [!NOTE]
 > Even where a specific app is untested, the core fixes built for the apps above — licensing and
 > daemon isolation, GPU/compute mapping, font rendering, IPC, and native display/present paths —
