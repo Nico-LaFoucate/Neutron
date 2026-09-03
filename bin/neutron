@@ -4057,6 +4057,13 @@ def _app_version(exe_rel):
     return ""
 
 
+# Bump whenever _pe_extract_icon_png's SELECTION changes, so already-cached icons
+# are re-extracted instead of being kept because they are merely newer than the exe.
+#   1 -> widest RT_ICON anywhere (picked Premiere's "LAUNCH" file-type icon)
+#   2 -> lowest-numbered RT_GROUP_ICON, i.e. the application icon, as Windows does
+_ICON_EXTRACTOR_VERSION = "2"
+
+
 def _pe_extract_icon_png(exe):
     """The app's largest icon as PNG BYTES, parsed straight out of the PE. NO EXTERNAL TOOLS.
 
@@ -4105,11 +4112,21 @@ def _pe_extract_icon_png(exe):
             n = u16(d, off + 12) + u16(d, off + 14)
             return [(u32(d, off + 16 + i * 8), u32(d, off + 16 + i * 8 + 4)) for i in range(n)]
 
-        best = None   # (width, bytes, kind)
+        # 🚨 Collect BOTH icon resources and icon GROUPS, then pick the way Windows
+        # does: the application icon is the LOWEST-NUMBERED RT_GROUP_ICON, and the
+        # largest member OF THAT GROUP.
+        #
+        # Taking the widest RT_ICON anywhere in the file is wrong, and visibly so:
+        # Adobe ships file-type icons in the same executable, so Premiere resolved
+        # to its .prlaunch document icon -- a page with "LAUNCH" written across it --
+        # which is what Collider and the dock displayed.
+        icons = {}    # resource id -> (offset, size)
+        groups = {}   # resource id -> (offset, size)
         for eid, eoff in entries(rbase):
-            if (eid & 0x7fffffff) != 3 or not (eoff & 0x80000000):   # RT_ICON
+            rtype = eid & 0x7fffffff
+            if rtype not in (3, 14) or not (eoff & 0x80000000):   # RT_ICON, RT_GROUP_ICON
                 continue
-            for _, noff in entries(rbase + (eoff & 0x7fffffff)):
+            for nid, noff in entries(rbase + (eoff & 0x7fffffff)):
                 if not (noff & 0x80000000):
                     continue
                 for _, loff in entries(rbase + (noff & 0x7fffffff)):
@@ -4119,15 +4136,45 @@ def _pe_extract_icon_png(exe):
                     doff, size = rva2off(u32(d, de)), u32(d, de + 4)
                     if doff is None:
                         continue
-                    blob = d[doff:doff + size]
-                    if blob[:8] == b"\x89PNG\r\n\x1a\n":
-                        w = struct.unpack_from(">I", blob, 16)[0]
-                        if not best or w > best[0]:
-                            best = (w, blob, "png")
-                    elif len(blob) >= 40 and u32(blob, 0) == 40 and u16(blob, 14) == 32:
-                        w, h = u32(blob, 4), u32(blob, 8) // 2
-                        if w and h and (not best or w > best[0]):
-                            best = (w, blob, "dib")
+                    (groups if rtype == 14 else icons)[nid & 0x7fffffff] = (doff, size)
+                    break
+
+        def decode(blob):
+            """(width, bytes, kind) for one icon resource, or None."""
+            if blob[:8] == b"\x89PNG\r\n\x1a\n":
+                return (struct.unpack_from(">I", blob, 16)[0], blob, "png")
+            if len(blob) >= 40 and u32(blob, 0) == 40 and u16(blob, 14) == 32:
+                w, h = u32(blob, 4), u32(blob, 8) // 2
+                if w and h:
+                    return (w, blob, "dib")
+            return None
+
+        best = None   # (width, bytes, kind)
+        if groups:
+            gid = min(groups)                     # lowest id == the app icon group
+            goff, gsize = groups[gid]
+            g = d[goff:goff + gsize]
+            # GRPICONDIR: reserved,type,count then count x 14-byte GRPICONDIRENTRY,
+            # whose last field is the RT_ICON resource id of that member.
+            count = u16(g, 4) if len(g) >= 6 else 0
+            for i in range(count):
+                e = 6 + i * 14
+                if e + 14 > len(g):
+                    break
+                nid = u16(g, e + 12)
+                if nid not in icons:
+                    continue
+                doff, size = icons[nid]
+                got = decode(d[doff:doff + size])
+                if got and (not best or got[0] > best[0]):
+                    best = got
+        if not best:
+            # No usable group (or a malformed one) -> fall back to the old
+            # widest-anywhere behaviour rather than losing the icon entirely.
+            for doff, size in icons.values():
+                got = decode(d[doff:doff + size])
+                if got and (not best or got[0] > best[0]):
+                    best = got
         if not best:
             return None
         w, blob, kind = best
@@ -4299,6 +4346,21 @@ def retire_superseded_entries(apps_dir, app_ids):
     return out
 
 
+
+def _prefix_slug(prefix):
+    """A stable, filename-safe id for a prefix, for desktop-entry naming.
+
+    🚨 Desktop entries used to be keyed on app_id ALONE. A second prefix holding
+    the same app therefore OVERWROTE the first one's launcher and icon: installing
+    Premiere 2026 into a new prefix silently removed the user's working Premiere
+    2025 entry from the dock and the app menu, with no error anywhere. Side-by-side
+    versions are a supported layout -- Collider even defaults new prefixes to a
+    sibling directory -- so the launcher identity has to say WHICH prefix it opens.
+    """
+    base = os.path.basename(os.path.normpath(prefix or "")) or "prefix"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", base).strip("-").lower()
+    return slug or "prefix"
+
 def repair_mime_defaults(apps_dir, written):
     """Point each Adobe type at our entry -- but ONLY where nothing live already claims it.
 
@@ -4311,7 +4373,7 @@ def repair_mime_defaults(apps_dir, written):
     want = {}
     for w in written:
         for m in w.get("mime", ()):
-            want[m] = "neutron-%s.desktop" % w["app"]
+            want[m] = w.get("file") or ("neutron-%s.desktop" % w["app"])
     if not want:
         return []
 
@@ -4452,21 +4514,73 @@ def register_app_desktop_entries(prefix):
         # The app_id the compositor will see. MUST match Wine exactly or the icon will not bind.
         wm_class = os.path.basename(exe).lower()
 
-        icon_name = "neutron-%s" % app_id
+        slug = _prefix_slug(prefix)
+        icon_name = "neutron-%s-%s" % (app_id, slug)
         icon_path = os.path.join(icon_dir, icon_name + ".png")
         have_icon = False
+        # 🚨 The mtime guard alone is not enough. When the EXTRACTOR changes, every
+        # already-cached icon is stale by logic rather than by age -- and a wrong
+        # icon is exactly the case that needs replacing. Premiere shipped the
+        # ".prlaunch" document icon (a page reading "LAUNCH") and no amount of
+        # re-provisioning would have replaced it, because the file was newer than
+        # the exe. Same lesson as CoolType's cache: invalidate the CONSUMER with
+        # the repair. The stamp keeps the expensive path rare -- extraction reads
+        # the whole PE, and Premiere's is ~800 MB.
+        # Kept OUT of the icon theme dir: gtk-update-icon-cache and friends scan
+        # that directory, and it should contain images only.
+        stamp_dir = os.path.join(HOME, ".local", "share", "neutron", "icon-stamps")
+        stamp_path = os.path.join(stamp_dir, icon_name + ".v")
         try:
-            if not (os.path.isfile(icon_path)
-                    and os.path.getmtime(icon_path) >= os.path.getmtime(exe)):
+            cur_stamp = open(stamp_path).read().strip()
+        except OSError:
+            cur_stamp = ""
+        fresh = (os.path.isfile(icon_path)
+                 and os.path.getmtime(icon_path) >= os.path.getmtime(exe)
+                 and cur_stamp == _ICON_EXTRACTOR_VERSION)
+        try:
+            if not fresh:
                 png = _pe_extract_icon_png(exe)
                 if png:
                     with open(icon_path, "wb") as f:
                         f.write(png)
+                    try:
+                        os.makedirs(stamp_dir, exist_ok=True)
+                        with open(stamp_path, "w") as f:
+                            f.write(_ICON_EXTRACTOR_VERSION)
+                    except OSError:
+                        pass
             have_icon = os.path.isfile(icon_path)
         except OSError as e:
             log("desktop entry: icon for %s failed: %s" % (app_id, e))
 
-        desktop = os.path.join(apps_dir, "neutron-%s.desktop" % app_id)
+        entry_file = "neutron-%s-%s.desktop" % (app_id, slug)
+        desktop = os.path.join(apps_dir, entry_file)
+        # Another prefix already publishes this app? Then BOTH need to be
+        # distinguishable, so qualify ours. The sibling keeps its own name until
+        # its prefix is next provisioned -- correcting someone else's entry from
+        # here would edit a launcher this run knows nothing about.
+        import glob as _glob
+        siblings = [f for f in _glob.glob(os.path.join(apps_dir, "neutron-%s-*.desktop" % app_id))
+                    if os.path.basename(f) != entry_file]
+        legacy = os.path.join(apps_dir, "neutron-%s.desktop" % app_id)
+        if os.path.isfile(legacy):
+            try:
+                with open(legacy) as f:
+                    legacy_body = f.read()
+            except OSError:
+                legacy_body = ""
+            # Ours, superseded by the qualified name -> retire it. Another
+            # prefix's -> leave it alone; it is that prefix's only launcher.
+            if ("--prefix %s " % prefix) in legacy_body or legacy_body.rstrip().endswith(
+                    "--prefix %s" % prefix):
+                try:
+                    os.remove(legacy)
+                except OSError as e:
+                    log("desktop entry: retiring legacy %s failed: %s" % (legacy, e))
+            else:
+                siblings.append(legacy)
+        disp_name = ("%s (%s)" % (p["name"], os.path.basename(os.path.normpath(prefix)))
+                     if siblings else p["name"])
         # The file types this app OWNS, and therefore `%f`. Without both, a double-clicked .psd
         # opens Photoshop and then ignores the file -- reported from the build tester's machine
         # 2026-08-25, where the superseded mudhut entries HAD carried them. `neutron launch`
@@ -4499,7 +4613,7 @@ def register_app_desktop_entries(prefix):
             # ⭐ THE LINE THAT FIXES THE DOCK ICON. Wine's app_id, verbatim.
             "StartupWMClass=%s\n"
             "StartupNotify=false\n"
-            % (p["name"], p["name"], HOME, pinned_version, app_id, prefix, exec_arg,
+            % (disp_name, p["name"], HOME, pinned_version, app_id, prefix, exec_arg,
                icon_name if have_icon else "collider",
                APP_CATEGORIES.get(app_id, "Graphics;"),
                ("MimeType=%s\n" % "".join(m + ";" for m in mimes)) if mimes else "",
@@ -4515,7 +4629,7 @@ def register_app_desktop_entries(prefix):
                 os.chmod(desktop, 0o755)
                 changed = True
             written.append({"app": app_id, "wm_class": wm_class, "icon": have_icon,
-                            "mime": list(mimes)})
+                            "mime": list(mimes), "file": entry_file})
         except OSError as e:
             log("desktop entry: %s failed: %s" % (app_id, e))
 
