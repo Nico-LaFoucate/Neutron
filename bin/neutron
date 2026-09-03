@@ -692,8 +692,14 @@ APP_PROFILES = {
         # launch -- Premiere's splash is also an owned #32770 owned by an unmapped root, so the
         # ownership-depth predicate cannot tell the two apps apart. ⚠️ Do NOT add this to another
         # profile without launching that app and checking for a ghost window behind its splash.
+        # NEUTRON_D2D_CLIPCHILDREN=1 was the ONE variable `~/ae-best.sh` set that this
+        # profile did not, so a menu/Collider launch never matched the config the
+        # composition was proven to render under, and APPS.md had to carry "a plain
+        # `neutron launch aftereffects` is BLACK". Folded in so the default launch IS
+        # the known-good one.
         "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_DXVK_EXPORT_TEXTURES": "1",
-                               "NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_GDI_PRESENT": "1",
+                               "NEUTRON_D2D_DCDIRECT": "1", "NEUTRON_D2D_CLIPCHILDREN": "1",
+                               "NEUTRON_GDI_PRESENT": "1",
                                "NEUTRON_DCOMP_NATIVE": "1", "NEUTRON_CEF_MAX_FPS": "24",
                                "NEUTRON_WL_ORPHAN_TOPLEVEL": "1"},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
