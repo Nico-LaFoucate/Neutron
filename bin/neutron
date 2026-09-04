@@ -4087,7 +4087,12 @@ def _app_version(exe_rel):
 # are re-extracted instead of being kept because they are merely newer than the exe.
 #   1 -> widest RT_ICON anywhere (picked Premiere's "LAUNCH" file-type icon)
 #   2 -> lowest-numbered RT_GROUP_ICON, i.e. the application icon, as Windows does
-_ICON_EXTRACTOR_VERSION = "2"
+#   3 -> no selection change; exists to FLUSH the Collider appicon cache, whose
+#        hand-written "pe-v2" tag happened to collide with version 2, so the v1->v2
+#        repair never reached it and Collider kept serving the LAUNCH icon from
+#        ~/.cache/collider/appicons long after the files on disk were correct.
+#        Both caches now key off THIS constant, so a future change invalidates both.
+_ICON_EXTRACTOR_VERSION = "3"
 
 
 def _pe_extract_icon_png(exe):
@@ -4239,7 +4244,9 @@ def _app_icon(exe):
         cache_dir = os.path.join(HOME, ".cache", "collider", "appicons")
         os.makedirs(cache_dir, exist_ok=True)
         cached = os.path.join(cache_dir,
-                              hashlib.sha1((exe + "|pe-v2").encode()).hexdigest()[:16] + ".png")
+                              hashlib.sha1(
+                                  (exe + "|pe-v" + _ICON_EXTRACTOR_VERSION).encode()
+                              ).hexdigest()[:16] + ".png")
         if not (os.path.isfile(cached) and os.path.getmtime(cached) >= os.path.getmtime(exe)):
             png = _pe_extract_icon_png(exe)
             if not png:
