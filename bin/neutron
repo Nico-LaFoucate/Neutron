@@ -4354,7 +4354,7 @@ def install_neutron_mime_package():
         return False
 
 
-def retire_superseded_entries(apps_dir, app_ids):
+def retire_superseded_entries(apps_dir, app_ids, prefix):
     """Remove the previous generation's `mudhut-<app>.desktop`, backing each one up first.
 
     Mud Hut used to write these; they point at launchers that no longer exist and reference
@@ -4376,6 +4376,61 @@ def retire_superseded_entries(apps_dir, app_ids):
             out.append(os.path.basename(stale))
         except OSError as e:
             log("retire %s: %s" % (stale, e))
+
+    # 🚨 winemenubuilder's own launchers, under applications/wine/Programs/.
+    #
+    # Wine mirrors the prefix's Start Menu there, and those entries run BARE `wine`
+    # from PATH -- distro wine, not the pinned runtime -- so a menu or dock launch
+    # fires `wineboot -u` and reverts the prefix's patched natives. That is the bug
+    # LAUNCHERS.md was written for, arriving by a route the 2026-08-08 rewrite did
+    # not cover because Wine generates these itself, after the fact.
+    #
+    # They also carry the SAME StartupWMClass as ours, so KDE cannot tell them
+    # apart and one can quietly take over a dock pin: a user's pinned Premiere 2025
+    # became 2026 the moment the 2026 suite was installed.
+    #
+    # Only ever retire an entry whose Exec names a prefix we manage, and always to
+    # the backup dir -- these are files on the user's machine, not ours to delete.
+    # "Adobe <profile name>" is how Adobe names both the install dir and the Start
+    # Menu entry, so it matches the winemenubuilder filename.
+    replaced_prefixes = {
+        "Adobe " + APP_PROFILES[a]["name"] for a in app_ids if a in APP_PROFILES
+    }
+    wine_progs = os.path.join(apps_dir, "wine", "Programs")
+    menus_dir = os.path.join(HOME, ".config", "menus", "applications-merged")
+    if os.path.isdir(wine_progs):
+        for root, _dirs, files in os.walk(wine_progs):
+            for fn in files:
+                if not fn.endswith(".desktop"):
+                    continue
+                path = os.path.join(root, fn)
+                try:
+                    with open(path, errors="replace") as f:
+                        body = f.read()
+                except OSError:
+                    continue
+                if ("WINEPREFIX=%s" % prefix) not in body:
+                    continue           # another prefix's, or not ours at all
+                # ⛔ ONLY retire an app we actually REPLACE. These entries are
+                # dangerous, but a user's only launcher for something we do not
+                # ship a replacement for is worse than a dangerous one: After
+                # Effects bundles Cinema 4D Lite, and a first pass here retired
+                # "Maxon Cinema 4D 2026" and its Team Render entries, leaving no
+                # way to start them at all.
+                if not any(dp.lower() in fn.lower() for dp in replaced_prefixes):
+                    continue
+                try:
+                    os.makedirs(backup, exist_ok=True)
+                    shutil.move(path, os.path.join(backup, fn))
+                    out.append("wine/Programs/" + fn)
+                    # KDE keys the launcher off a generated .menu file; leaving it
+                    # behind keeps a dangling entry in the menu and the dock.
+                    stem = os.path.splitext(fn)[0]
+                    menu = os.path.join(menus_dir, "wine-Programs-%s.menu" % stem)
+                    if os.path.isfile(menu):
+                        os.remove(menu)
+                except OSError as e:
+                    log("retire %s: %s" % (path, e))
     return out
 
 
@@ -4680,7 +4735,7 @@ def register_app_desktop_entries(prefix):
         except OSError as e:
             log("desktop entry: %s failed: %s" % (app_id, e))
 
-    superseded = retire_superseded_entries(apps_dir, [w["app"] for w in written])
+    superseded = retire_superseded_entries(apps_dir, [w["app"] for w in written], prefix)
     claimed = repair_mime_defaults(apps_dir, written)
     caches = refresh_desktop_caches(apps_dir) if written else {}
     return {"entries": written, "superseded": superseded, "claimed_types": claimed,
