@@ -115,8 +115,17 @@ The table above is the 2025 line; 2026 is being brought up separately.
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
 | **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job on this release. |
 
-Everything else in the 2026 line is untested. The
-[status board](https://neutronproject.org) tracks both releases and is the canonical view.
+| **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
+| **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
+| **Lightroom Classic 2026** | 🔵 `Likely` | Installed, deliberately **not launched yet** — opening it upgrades the catalog, which is not worth doing mid-backlog. Deferred by choice, not blocked. |
+| **Animate** | ⚪ `n/a` | Adobe has not shipped a 2026 Animate. The 2024 build is current and is covered under the 2025 line above. |
+
+The whole planned 2026 support list is confirmed working, and every one of these was installed
+through Mud Hut's **offline path** from a disc image — so the suite bring-up and the offline
+installer were proven in the same exercise. Dynamic Link's prerequisites (Premiere + After Effects)
+both run on 2026, but the round trip has not been exercised on this release yet.
+
+The [status board](https://neutronproject.org) tracks both releases and is the canonical view.
 
 > [!NOTE]
 > Even where a specific app is untested, the core fixes built for the apps above — licensing and
