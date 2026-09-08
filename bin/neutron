@@ -2151,7 +2151,7 @@ def _prefix_procs(prefix):
     return out
 
 
-def _app_dir_token(app_id):
+def _app_dir_token(app_id, prefix=None):
     """The install-directory segment that identifies a process as belonging to ONE app,
     e.g. 'Adobe Premiere Pro 2025' from 'drive_c/Program Files/Adobe/Adobe Premiere Pro 2025/...'.
 
@@ -2162,9 +2162,17 @@ def _app_dir_token(app_id):
     prof = APP_PROFILES.get(app_id)
     if not prof:
         return None
-    parts = prof["exe"].replace("\\", "/").split("/")
+    # Resolve the profile's VERSION-LOCKED exe against the prefix first. The profiles are pinned to
+    # the year they were written (…2025) and stay that way deliberately -- _resolve_app_exe is what
+    # makes them version-agnostic. Reading prof["exe"] raw skips that, so on a 2026 install the token
+    # was 'Adobe Photoshop 2025', matched no live process, and every app-scoped teardown became a
+    # silent no-op that still reported success. Found by a build tester 2026-09-08.
+    exe = _resolve_app_exe(prefix, prof["exe"]) if prefix else ""
+    parts = (exe or prof["exe"]).replace("\\", "/").split("/")
     try:
-        return parts[parts.index("Adobe") + 1]
+        # LAST 'Adobe' segment: the install dir is <...>/Program Files/Adobe/<app dir>, and a prefix
+        # path can itself contain an 'Adobe' component once we resolve to an absolute path.
+        return parts[len(parts) - parts[::-1].index("Adobe")]
     except (ValueError, IndexError):
         return None
 
@@ -2181,7 +2189,7 @@ def _proc_win_exe(pid):
 
 def _app_procs(prefix, app_id):
     """Live pids in this prefix that belong to ONE app: [(pid, comm)]."""
-    token = _app_dir_token(app_id)
+    token = _app_dir_token(app_id, prefix)
     if not token:
         return []
     needle = "/" + token + "/"
@@ -2194,7 +2202,7 @@ def _running_app_ids(prefix):
     exes = {pid: _proc_win_exe(pid) for pid, _c, is_app in _prefix_procs(prefix) if is_app}
     out = []
     for app_id in APP_PROFILES:
-        token = _app_dir_token(app_id)
+        token = _app_dir_token(app_id, prefix)
         if token and any(("/" + token + "/") in e for e in exes.values()):
             out.append(app_id)
     return out
@@ -2220,7 +2228,13 @@ def _teardown_app(args, prefix, wine, env):
 
     before = _app_procs(prefix, app_id)
     if not before:
-        emit({"ok": True, "app": app_id, "torn_down": True, "already_clean": True, "killed": 0,
+        # Report finding nothing as FINDING NOTHING, not as a successful teardown, and say what we
+        # matched on. The old message claimed torn_down:True with killed:0, so a token that matched
+        # no process was indistinguishable from an app that was already closed -- which is exactly
+        # how the 2025/2026 token bug stayed invisible.
+        emit({"ok": True, "app": app_id, "torn_down": False, "already_clean": True, "killed": 0,
+              "matched_token": _app_dir_token(app_id, prefix),
+              "note": "no live processes matched this app's install directory",
               "still_running": _running_app_ids(prefix)}, args.json)
         return
 
