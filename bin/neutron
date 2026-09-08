@@ -3713,8 +3713,18 @@ def cmd_launch(args):
         die({"launched": False,
              "reason": "this runtime would RE-STAMP the prefix and revert its patched natives "
                        "(wine runs `wineboot -u` when the stamps differ)",
-             "fix": "run `neutron prefix provision %s` first — it re-stamps and re-stages the "
-                    "natives — or pass --allow-restamp to accept the clobber" % prefix,
+             # ⚠️ Do NOT claim provision re-stages the natives. It does not: its own docstring
+             # says staging the native DLL *files* (dxcore/dcomp/nvapi64) is NOT yet automated
+             # and is reported under `deferred`, and its FIRST action is the `wineboot -u` that
+             # reverts them. A build tester followed this advice on 2026-09-08, backed the
+             # natives up by hand first, and only got away with it because 11.10-77 happened to
+             # ship its own copies of all three. A drop that shipped none would have left a hole
+             # with no automated recovery -- which is exactly what the docstring warns about.
+             "fix": "back up the prefix's patched natives (dcomp/dxcore/nvapi64) FIRST, then run "
+                    "`neutron prefix provision %s` — it re-stamps and bakes the registry, but "
+                    "does NOT restage native DLL files (see `deferred` in its output); restore "
+                    "any the new runtime does not ship. Or pass --allow-restamp to accept the "
+                    "clobber knowingly." % prefix,
              "prefix_is_stamped_for": (", ".join(also) if also
                                        else "no installed runtime (stamp %d)"
                                             % mismatch["prefix_stamp"]),
