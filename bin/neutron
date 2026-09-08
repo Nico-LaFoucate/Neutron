@@ -3776,7 +3776,14 @@ def cmd_launch(args):
     env["WINEPREFIX"] = prefix
     env["DXVK_CONFIG_FILE"] = dxvk_conf
     if profile["overrides"]:                     # empty => leave unset (match the proven minimal launch)
-        env["WINEDLLOVERRIDES"] = profile["overrides"]
+        # MERGE, never assign. This used to be a bare assignment, which silently discarded any
+        # WINEDLLOVERRIDES the caller set or that neutron-env.conf had just applied -- and
+        # `neutron gates` advertises neutron-env.conf as reaching EVERY launch surface, so the
+        # one variable it did not cover was invisible. A build tester lost a test run to this on
+        # 2026-09-08 and had to go around us via the registry. The profile's own overrides come
+        # LAST so they still win a same-DLL conflict; anything naming a different DLL survives.
+        _pre = env.get("WINEDLLOVERRIDES", "").strip(";")
+        env["WINEDLLOVERRIDES"] = (_pre + ";" + profile["overrides"]) if _pre else profile["overrides"]
     if profile.get("nvapi"):
         env["DXVK_ENABLE_NVAPI"] = "1"
     # setdefault, NOT assignment: an explicitly pre-set NEUTRON_* in the caller's environment
