@@ -5078,6 +5078,29 @@ def cmd_doctor(args):
                         applied = False
                 check("display_fix", applied)
 
+    # Wiki integrity. HOME.md is the mandatory first read and it links the other pages; a link
+    # pointing at a file that does not exist is silently invisible to a reader who trusts it.
+    # On 2026-09-08 HOME.md's TESTERS.md link had been dead since the file was moved out of the
+    # repo, and the page it pointed at was the one that answers "is this a fair thing to ask a
+    # build tester for". The wrong ask went out 15 minutes after HOME.md was read. A dangling
+    # mandatory link is now a FAILING check, not a silent one.
+    _wiki = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "wiki")
+    if os.path.isdir(_wiki):
+        import re as _re
+        _dangling = []
+        for _page in sorted(f for f in os.listdir(_wiki) if f.endswith(".md")):
+            try:
+                with open(os.path.join(_wiki, _page), encoding="utf-8", errors="replace") as _f:
+                    _body = _f.read()
+            except OSError:
+                continue
+            for _t in _re.findall(r"\]\((?!https?:|#)([^)#]+\.md)(?:#[^)]*)?\)", _body):
+                if not os.path.isfile(os.path.join(_wiki, _t)):
+                    _dangling.append("%s -> %s" % (_page, _t))
+        check("wiki-links", not _dangling,
+              ("%d dangling: %s" % (len(_dangling), "; ".join(_dangling[:5]))) if _dangling
+              else "no dangling internal links")
+
     healthy = all(c["ok"] for c in checks
                   if c["name"] not in ("exiftool",))  # exiftool is optional
     emit({"ok": True, "healthy": healthy, "checks": checks,
