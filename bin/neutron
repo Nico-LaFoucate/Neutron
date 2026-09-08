@@ -3174,12 +3174,16 @@ NEUTRON_GATES = {
                "stacks wrongly, will not repaint after hide/reshow, or cannot be raised.",
     },
     "owned-subsurface-captioned": {
-        "env": "NEUTRON_OWNED_SUBSURFACE_CAPTIONED", "default": False,
+        "env": "NEUTRON_OWNED_SUBSURFACE_CAPTIONED", "default": True,
         "what": "extend owned-subsurface to owned windows that have a title bar",
-        "why": "⛔ DEFAULT OFF since 11.10-65. Shipped ON in 11.10-64 for one extension panel and "
-               "promoted ~1000 windows a session, because Premiere's VST plugin windows and its "
-               "dialogs are captioned owned windows too: plugin windows sank behind the Program "
-               "Monitor and a file-browse dialog wedged the app. Docking that panel remains OPEN.",
+        "why": "DEFAULT ON since 11.10-73 (2026-09-01); set =0 to disable. It was OFF from "
+               "11.10-65 because shipping it ON in 11.10-64 promoted ~1000 windows a session: "
+               "Premiere's VST plugin windows sank behind the Program Monitor and a file-browse "
+               "dialog wedged the app. Both causes are fixed -- the sinking was the "
+               "place_above(parent) demote, and modal dialogs are excluded by "
+               "owned-subsurface-modal. Build tester on 11.10-72 with it on: six consecutive "
+               "plugin-panel docks and a File dialog opened/dismissed, no freeze. Turn it OFF "
+               "first when triaging a stacking, repaint-after-reshow or dock-drag problem.",
     },
     "owned-subsurface-modal": {
         "env": "NEUTRON_OWNED_SUBSURFACE_MODAL", "default": False,
@@ -3189,11 +3193,14 @@ NEUTRON_GATES = {
                "without, none). Only meaningful with owned-subsurface-captioned on.",
     },
     "owned-zorder": {
-        "env": "NEUTRON_OWNED_ZORDER", "default": False,
+        "env": "NEUTRON_OWNED_ZORDER", "default": True,
         "what": "mirror win32 z-order onto promoted owned windows' subsurfaces",
-        "why": "the attempted fix for plugin windows sinking. It demonstrably reaches the code "
-               "now (they appear in the applied order) but does NOT fix the symptom, so it stays "
-               "off. Only meaningful with owned-subsurface-captioned on.",
+        "why": "DEFAULT ON since 11.10-73 (2026-09-01); set =0 to disable. Without it, promoted "
+               "owned windows are never ordered at all and keep whatever stacking they were "
+               "inserted with. It was OFF because place_above against a non-sibling is a FATAL "
+               "protocol error (kwin kills the client with no Wine backtrace, measured "
+               "2026-08-27); now guarded twice, by the sibling-validity check in restack_apply "
+               "and the union role guard. Only meaningful with owned-subsurface-captioned on.",
     },
     "d2d-stencil": {
         "env": "NEUTRON_D2D_STENCIL", "default": True,
