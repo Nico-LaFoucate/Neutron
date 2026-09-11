@@ -5024,6 +5024,18 @@ def cmd_theme_apply(args):
         die({"ok": False, "reason": "resolved wine is not a Neutron runtime; refusing to touch the "
                                     "prefix (distro wine would wineboot-clobber it)"},
             EX_DEP, args.json)
+    # ⛔ THE SAME GUARD `launch` USES. Importing a .reg means starting wine against the prefix, and
+    # a FIRST wine process into a COLD prefix whose stamp differs runs `wineboot -u` and reverts the
+    # patched natives. A cosmetic theme write must never be able to do that.
+    mismatch = stamp_mismatch(prefix, wine)
+    if mismatch and not getattr(args, "allow_restamp", False):
+        die({"ok": False,
+             "reason": "this runtime would RE-STAMP the prefix and revert its patched natives; "
+                       "refusing to write a theme through it",
+             "hint": "run it with the runtime this prefix is stamped for: "
+                     "NEUTRON_WINE_VERSION=<ver> neutron theme apply --prefix %s" % prefix,
+             **mismatch}, EX_FAIL, args.json)
+
     res = apply_theme(wine, prefix, colors)
     res["prefix"] = prefix
     res["source"] = "custom" if colors else "default"
@@ -5421,6 +5433,9 @@ def build_parser():
     tsub = pt.add_subparsers(dest="subcmd", required=True)
     ta = tsub.add_parser("apply", help="write the theme into a prefix (palette + visual-style off)")
     ta.add_argument("--prefix", dest="path", default=None)
+    ta.add_argument("--allow-restamp", action="store_true",
+                    help="proceed even if the runtime would re-stamp the prefix (it will "
+                         "wineboot -u and revert patched natives)")
     ta.add_argument("--colors", default=None,
                     help="JSON file of {key: \"R G B\"} overrides, or - for stdin; "
                          "omit for the default theme")
