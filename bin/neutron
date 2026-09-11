@@ -5126,7 +5126,13 @@ def cmd_doctor(args):
     #
     # ⛔ Skips silently off Arch: build testers run Fedora/Ubuntu boxes and must not see a red
     # check for a package manager they do not have. This is a DEV-BOX check.
-    if shutil.which("pacman") and os.path.isdir(os.path.join(HOME, "neutron-wine")):
+    # ⛔ DEV-BOX ONLY, and the gate is what makes that true. Keyed on the wine SOURCE repo's
+    # build script — a tester's machine gets ~/neutron (CLI + wiki) and a prebuilt runtime from
+    # the stack bundle, and never ~/neutron-wine/build/build.sh. Nothing below is installed or
+    # needed to RUN Neutron: the runtime is self-contained, Collider ships as an AppImage and
+    # Mud Hut as a static binary. These are the packages required to BUILD those three.
+    if shutil.which("pacman") and os.path.isfile(
+            os.path.join(HOME, "neutron-wine", "build", "build.sh")):
         _need = [
             # wine-tkg makedepends that are not part of base-devel
             "meson", "ninja", "glslang", "fontforge", "mingw-w64-gcc",
@@ -5135,13 +5141,16 @@ def cmd_doctor(args):
             # Tauri's tray/indicator chain — Collider's BUILD.md calls for these
             "libayatana-appindicator", "libayatana-indicator", "ayatana-ido", "webkit2gtk-4.1",
             "librsvg", "openssl",
-            # Mud Hut mounts ISOs and reads Windows installs
-            "ntfs-3g",
             # 32-bit audio for the i386 half of the runtime. ⚠️ Only packages STILL IN THE REPOS
             # belong here: lib32-giflib, lib32-mpg123 and lib32-sdl2-compat were dropped upstream,
             # and the 11.10-82 build proved they cost nothing (file-for-file identical coverage
             # against 11.10-78, which was built while they were still installed).
             "lib32-libpulse",
+            # ⛔ NOT ntfs-3g. It was listed here on the guess that Mud Hut "reads Windows
+            # installs"; it does not. Mud Hut mounts ISOs through `udisksctl` (udisks2) and
+            # ISO9660 is a kernel filesystem — it never touches NTFS (verified in src/iso.rs).
+            # udisks2 IS a real dependency, but a RUNTIME one for every machine, not a build dep,
+            # so it does not belong in this check.
         ]
         try:
             _inst = set(subprocess.run(["pacman", "-Qq"], capture_output=True, text=True,
