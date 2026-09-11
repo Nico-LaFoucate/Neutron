@@ -5111,6 +5111,61 @@ def cmd_doctor(args):
               ("%d dangling: %s" % (len(_dangling), "; ".join(_dangling[:5]))) if _dangling
               else "no dangling internal links")
 
+    # ---- build dependencies, and whether the distro is about to eat them ----------------
+    #
+    # 🚨 2026-09-11. A routine CachyOS cleanup (`pacman -Rns` over `pacman -Qdtq`) removed 72
+    # orphans, and `rust`, `meson`, `ninja`, `fontforge` and the ayatana libs went with them —
+    # the whole Rust toolchain that builds Collider and Mud Hut, gone, with no warning until a
+    # build was attempted. Nobody did anything wrong: back in 2025-12, `paru` installed rust as a
+    # build dep for an AUR package and marked it `--asdeps`, which is exactly what an AUR helper
+    # is supposed to do. It then sat in the orphan list for nine months waiting to be swept.
+    #
+    # The durable fix is install reason, not vigilance: a package marked EXPLICIT is never an
+    # orphan. This check reports both halves — what is already missing, and what is installed but
+    # orphan-flagged, i.e. what the NEXT cleanup will take.
+    #
+    # ⛔ Skips silently off Arch: build testers run Fedora/Ubuntu boxes and must not see a red
+    # check for a package manager they do not have. This is a DEV-BOX check.
+    if shutil.which("pacman") and os.path.isdir(os.path.join(HOME, "neutron-wine")):
+        _need = [
+            # wine-tkg makedepends that are not part of base-devel
+            "meson", "ninja", "glslang", "fontforge", "mingw-w64-gcc",
+            # the Rust stack: Collider (Tauri) and Mud Hut
+            "rust", "rust-src", "rust-bindgen", "nodejs", "npm",
+            # Tauri's tray/indicator chain — Collider's BUILD.md calls for these
+            "libayatana-appindicator", "libayatana-indicator", "ayatana-ido", "webkit2gtk-4.1",
+            "librsvg", "openssl",
+            # Mud Hut mounts ISOs and reads Windows installs
+            "ntfs-3g",
+            # 32-bit audio for the i386 half of the runtime. ⚠️ Only packages STILL IN THE REPOS
+            # belong here: lib32-giflib, lib32-mpg123 and lib32-sdl2-compat were dropped upstream,
+            # and the 11.10-82 build proved they cost nothing (file-for-file identical coverage
+            # against 11.10-78, which was built while they were still installed).
+            "lib32-libpulse",
+        ]
+        try:
+            _inst = set(subprocess.run(["pacman", "-Qq"], capture_output=True, text=True,
+                                       timeout=30).stdout.split())
+            _orph = set(subprocess.run(["pacman", "-Qdtq"], capture_output=True, text=True,
+                                       timeout=30).stdout.split())
+        except Exception as e:
+            _inst = _orph = None
+            check("build-deps", True, "pacman query failed (%s); skipped" % e)
+        if _inst is not None:
+            _missing = [d for d in _need if d not in _inst]
+            # installed, but flagged as a dependency with nothing needing it => next sweep takes it
+            _at_risk = [d for d in _need if d in _inst and d in _orph]
+            if _missing:
+                check("build-deps", False, "MISSING: %s  — restore with: sudo pacman -S --needed "
+                      "--asexplicit %s" % (" ".join(_missing), " ".join(_missing)))
+            elif _at_risk:
+                check("build-deps", False, "orphan-flagged, the next cleanup will REMOVE these: %s"
+                      "  — pin with: sudo pacman -D --asexplicit %s"
+                      % (" ".join(_at_risk), " ".join(_at_risk)))
+            else:
+                check("build-deps", True,
+                      "%d build deps present and explicitly installed" % len(_need))
+
     healthy = all(c["ok"] for c in checks
                   if c["name"] not in ("exiftool",))  # exiftool is optional
     emit({"ok": True, "healthy": healthy, "checks": checks,
