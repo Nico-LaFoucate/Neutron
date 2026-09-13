@@ -1307,8 +1307,13 @@ def wineserver_wait(wine, prefix, timeout=240):
         env.setdefault("DISPLAY", ":0")
         subprocess.run([srv, "-w"], env=env, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        log(f"wineserver -w: still running after {timeout}s; registry files may lag")
+        return False
     except Exception as e:
         log(f"wineserver -w failed (non-fatal): {e}")
+        return False
 
 
 def resolve_webview2():
@@ -1565,7 +1570,19 @@ def _host_font_files():
 
 
 def font_postscript_names(path):
-    """EVERY nameID 6 (PostScript name) in a TrueType/OpenType `name` table, as a
+    """EVERY nameID 6 (PostScript name) -- see _font_name_records()."""
+    return _font_name_records(path, 6)
+
+
+def font_family_names(path):
+    """EVERY family name a font declares: nameID 1 (legacy family, what GDI and Wine's
+    replacement map key on) plus nameID 16 (typographic family, e.g. "Adobe Clean" on a face
+    whose nameID 1 is "Adobe Clean Black"). Used to verify a replacement TARGET exists."""
+    return _font_name_records(path, 1) | _font_name_records(path, 16)
+
+
+def _font_name_records(path, want_nid):
+    """EVERY nameID `want_nid` (6 = PostScript name) in a TrueType/OpenType `name` table, as a
     set. Dependency-free — this has to run on a build tester's box.
 
     ⚠️ Returns a SET, and reads every record, because the real Microsoft core
@@ -1600,7 +1617,7 @@ def font_postscript_names(path):
         for i in range(count):
             r = name_off + 6 + 12 * i
             _pid, _eid, _lid, nid, ln, o = struct.unpack(">HHHHHH", d[r:r + 12])
-            if nid != 6:
+            if nid != want_nid:
                 continue
             raw = d[name_off + str_off + o:name_off + str_off + o + ln]
             for enc in ("utf-16-be", "latin1"):
@@ -2060,6 +2077,560 @@ def register_prefix_fonts(wine, prefix):
         log(f"font registry import failed (non-fatal): {e}")
         return 0
     return len(entries)
+
+
+
+def _winetricks_corefonts(wine, prefix):
+    """Run `winetricks corefonts` against the prefix with THIS runtime's wine. Returns True when
+    winetricks ran (not whether it succeeded -- callers re-read the files and judge from those).
+    `-f` forces a reinstall even when winetricks.log already says corefonts: the state we repair
+    is one where the log says done and the files say otherwise."""
+    if not shutil.which("winetricks"):
+        return False
+    try:
+        subprocess.run(["winetricks", "-q", "-f", "corefonts"],
+                       env={**os.environ, "WINE": wine, "WINEPREFIX": prefix,
+                            "WINEDEBUG": "-all", "W_OPT_UNATTENDED": "1"},
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=600, check=False)
+    except Exception as e:                        # never fail the caller on this
+        log(f"winetricks corefonts failed: {e}")
+    return True
+
+
+def _repair_roman_defaults(wine, prefix):
+    """Make at least one of times/arial/cour a genuine Microsoft face. Returns
+    (repaired, unrepaired, ran_winetricks).
+
+    Extracted verbatim from `prefix provision` on 2026-09-13 so that `neutron fonts repair` and
+    provision share ONE implementation. Behaviour unchanged: copy a genuine face from the host or
+    the prefix's own Fonts dir; only when nothing on this host can supply one, fetch the real
+    Microsoft core fonts. We only ever copy a font whose PostScript name is genuinely the one
+    CoolType wants, so this cannot make a prefix worse."""
+    roman = _roman_default_status(prefix)
+    fake = [fn for fn, state, _ in roman if state != "real"]
+    repaired, unrepaired, ran_winetricks = [], [], False
+    if fake:
+        fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+        for fn in fake:
+            # The prefix's own Fonts dir is searched too: a `--method windows`
+            # copy often carries the genuine face under a different filename
+            # (e.g. "Times New Roman.ttf"), which repairs with no download.
+            src = _find_real_roman_font(_ROMAN_DEFAULTS[fn], extra_dirs=(fd,))
+            if src:
+                try:
+                    shutil.copyfile(src, os.path.join(fd, fn))
+                    repaired.append(fn)
+                    continue
+                except OSError as e:
+                    log(f"roman-default repair of {fn} failed: {e}")
+            unrepaired.append(fn)
+        # 🚨 If NOTHING on this host could supply a genuine face, copying cannot
+        # help and the prefix stays fatally broken -- we would only print
+        # "run `winetricks corefonts`" and call it a day, which is how a build
+        # tester ends up with an install that reported success and cannot launch
+        # Premiere, AE or Media Encoder.
+        #
+        # Fetch them. Gated on the prefix ALREADY being broken, so a healthy
+        # prefix pays nothing, and corefonts brings georgia/verdana/impact/trebuc
+        # too -- which the video trio needs and _ROMAN_DEFAULTS (times/arial/cour)
+        # never covered.
+        if unrepaired and shutil.which("winetricks"):
+            log("no genuine Roman face on this host — fetching the real Microsoft "
+                "core fonts (`winetricks corefonts`); this downloads ~10 MB")
+            ran_winetricks = _winetricks_corefonts(wine, prefix)
+            # Re-evaluate: whatever landed changes the verdict below, and the
+            # CoolType cache invalidation after this block must see the NEW files.
+            roman = _roman_default_status(prefix)
+            newly = [fn for fn, state, _ in roman if state == "real" and fn in unrepaired]
+            repaired.extend(newly)
+            unrepaired = [fn for fn in unrepaired if fn not in newly]
+        if repaired:
+            register_prefix_fonts(wine, prefix)   # re-register the replaced files
+    return repaired, unrepaired, ran_winetricks
+
+
+
+# --- fonts: re-verify + repair (`neutron fonts check|repair`) ------------------------------------
+# Fonts are the highest-value check in the stack because the failures are severe and the symptom
+# never mentions fonts (wiki ROADMAP item 2, built 2026-09-13):
+#   * After Effects dies at startup ("EGG Constructor IEggApp failed") when CoolType cannot
+#     resolve its default Roman face -- _roman_default_status() / _stale_roman_cache_records().
+#   * Premiere / Media Encoder / AE do not start without the real Microsoft core fonts. Wine's
+#     substitutes ship under the REAL filenames, so presence of arial.ttf proves nothing; the six
+#     names below are the ones msttcorefonts ships and Wine does not.
+#   * Photoshop's menu bar comes up blank when a font is COPIED into windows/Fonts but never
+#     REGISTERED -- Wine only offers dwrite the fonts written to the HKLM Fonts key.
+# `check` is READ-ONLY and never starts wine: Collider runs it for every prefix on the Prefixes
+# tab, and starting wine against a cold prefix on a different-stamp runtime fires `wineboot -u`.
+# Only `repair` touches the prefix, behind the same guards `theme apply` uses.
+
+_MS_CORE_FONTS = ("georgia", "verdana", "impact", "trebuc", "comic", "andalemo")
+
+
+def _ms_core_fonts_status(prefix):
+    """(present, missing) among the six msttcorefonts filenames Wine ships NOTHING under.
+
+    A presence test BY DESIGN: it answers "did the real core fonts ever land here", which a
+    check of times/arial/cour cannot (Wine's substitutes carry those exact filenames). It is
+    blind to a faked times/arial/cour -- that is _roman_default_status()'s job. The two are
+    complementary, never interchangeable (INCIDENTS.md 2026-08-11)."""
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    try:
+        have_files = {f.lower() for f in os.listdir(fd)}
+    except OSError:
+        have_files = set()
+    present = [n for n in _MS_CORE_FONTS if n + ".ttf" in have_files]
+    missing = [n for n in _MS_CORE_FONTS if n + ".ttf" not in have_files]
+    return present, missing
+
+
+def _reg_unescape(s):
+    return s.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _reg_section_values(reg_file, section):
+    """{name: value} of the string values under ONE key of a Wine .reg file ON DISK -- never
+    through wine. `section` takes single backslashes. None when the file is unreadable, {} when
+    the key is absent.
+
+    ⚠️ Wine's wineserver writes these files periodically and at exit, so while a session is live
+    in the prefix the file can lag a registry write by up to ~30 s; fonts_verdict() says so and
+    repair_prefix_fonts() waits for the server before judging."""
+    try:
+        with open(reg_file, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    key = re.escape(section.replace("\\", "\\\\"))
+    m = re.search(r"^\[" + key + r"\][^\n]*\n(.*?)(?=^\[|\Z)", text, re.S | re.M)
+    if not m:
+        return {}
+    out = {}
+    for name, val in re.findall(r'^"((?:[^"\\]|\\.)*)"="((?:[^"\\]|\\.)*)"', m.group(1), re.M):
+        out[_reg_unescape(name)] = _reg_unescape(val)
+    return out
+
+
+def _registered_font_basenames(prefix):
+    """Lower-cased basenames of every value under HKLM\\...\\CurrentVersion\\Fonts (system.reg),
+    or None when the file cannot be read."""
+    vals = _reg_section_values(os.path.join(prefix, "system.reg"),
+                               r"Software\Microsoft\Windows NT\CurrentVersion\Fonts")
+    if vals is None:
+        return None
+    return {v.replace("\\", "/").rsplit("/", 1)[-1].lower() for v in vals.values()}
+
+
+def expected_font_replacements(runtime=None):
+    """The replacement map a prefix should carry: the runtime's fonts.json when present, else
+    the builtin PROVISION_FONT_REPLACEMENTS. ONE definition, shared by `prefix provision` (which
+    writes it) and `fonts check` (which verifies it), so both agree on what "intact" means."""
+    fonts = dict(PROVISION_FONT_REPLACEMENTS)
+    if runtime:
+        try:
+            with open(os.path.join(runtime, "fonts.json")) as f:
+                bundled = json.load(f)
+            if bundled:
+                fonts = bundled
+        except Exception as e:
+            log(f"runtime fonts.json unreadable ({e}); using builtin map")
+    return fonts
+
+
+def _prefix_font_replacements(prefix):
+    """The HKCU\\Software\\Wine\\Fonts\\Replacements map as the prefix has it (user.reg), or
+    None when unreadable."""
+    return _reg_section_values(os.path.join(prefix, "user.reg"), r"Software\Wine\Fonts\Replacements")
+
+
+def _family_registered_files(prefix, family):
+    """Registered font files whose family name is `family`, as basenames.
+
+    This is the check on a replacement TARGET: a map that says Segoe UI -> Adobe Clean is only a
+    fix if Adobe Clean is actually present AND registered; pointing at a family that is not
+    there is the original failure with an extra step. Looks at registered files in windows/Fonts
+    and at registered host paths; parses name tables (nameID 1 + 16), filename-likely ones first
+    and everything only if that finds nothing."""
+    reg_vals = _reg_section_values(os.path.join(prefix, "system.reg"),
+                                   r"Software\Microsoft\Windows NT\CurrentVersion\Fonts") or {}
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    paths = []
+    for v in reg_vals.values():
+        p = v.replace("\\", "/")
+        if p[1:3] == ":/":                      # Z:/host/path or C:/windows/Fonts/x
+            p = p[2:] if p[0].upper() == "Z" else os.path.join(fd, p.rsplit("/", 1)[-1])
+        else:
+            p = os.path.join(fd, p.rsplit("/", 1)[-1])
+        if os.path.splitext(p)[1].lower() in (".ttf", ".otf", ".ttc") and os.path.isfile(p):
+            paths.append(p)
+    key = re.sub(r"[^a-z0-9]", "", family.lower())
+    likely = [p for p in paths if key in re.sub(r"[^a-z0-9]", "", os.path.basename(p).lower())]
+    hits = [os.path.basename(p) for p in likely if family in font_family_names(p)]
+    if not hits:
+        hits = [os.path.basename(p) for p in paths if p not in likely and family in font_family_names(p)]
+    return sorted(set(hits))
+
+
+def _unregistered_prefix_fonts(prefix):
+    """Font files in windows/Fonts that no HKLM Fonts value names, or None when system.reg is
+    unreadable. Copying a font in is not enough (register_prefix_fonts() explains why)."""
+    reg = _registered_font_basenames(prefix)
+    if reg is None:
+        return None
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    try:
+        files = sorted(os.listdir(fd))
+    except OSError:
+        return []
+    return [f for f in files
+            if os.path.splitext(f)[1].lower() in _FONT_REG_SUFFIX and f.lower() not in reg]
+
+
+def fonts_verdict(prefix):
+    """The plain-English font verdict for a prefix. Read-only; never starts wine.
+
+    Returns {status, summary, checks, repair, apps_running, note?} where status is
+      bad   an Adobe app will fail to start (or Photoshop's menu bar will be blank),
+      warn  the apps start, but something in the prefix is invisible to them,
+      good  nothing for Repair to do.
+    `summary` is the one sentence Collider shows; each check carries its own `detail`.
+    `repair` lists what `neutron fonts repair` would do, in order -- empty when good."""
+    checks, repair = [], []
+
+    def add(name, status, detail, **extra):
+        checks.append({"name": name, "status": status, "detail": detail, **extra})
+
+    # 1. CoolType's default Roman face -- by PostScript name, never by filename or family.
+    roman = _roman_default_status(prefix)
+    genuine = [fn for fn, st, _ in roman if st == "real"]
+    per_file = ", ".join(f"{fn}={st}" for fn, st, _ in roman)
+    rows = [{"file": fn, "state": st, "detail": d} for fn, st, d in roman]
+    if genuine:
+        add("roman-default", "good",
+            "CoolType can pick a genuine default face from " + ", ".join(genuine) +
+            " (" + per_file + ")", files=rows)
+    else:
+        add("roman-default", "bad",
+            "none of times.ttf, arial.ttf or cour.ttf is a genuine Microsoft font (" + per_file +
+            "). CoolType then has no default Roman face, so After Effects fails at startup with "
+            "'EGG Constructor IEggApp failed'; Premiere and Media Encoder share CoolType. Repair "
+            "copies a genuine face from this machine, or installs the real Microsoft core fonts.",
+            files=rows)
+        repair.append("restore a genuine Times New Roman / Arial / Courier New")
+
+    # 2. CoolType's cache -- the state our own remedy creates. Files can be genuine while the
+    #    cache still serves Wine's substitutes; a files-only check passes on exactly that prefix.
+    stale = _stale_roman_cache_records(prefix)
+    caches = _cooltype_cache_dirs(prefix)
+    if stale:
+        served = sorted({s[1] for s in stale})
+        add("cooltype-cache", "bad",
+            "CoolType's cache offers no genuine default Roman face (it serves " +
+            ", ".join(served) + "), so the apps never read the " +
+            ("genuine files that are on disk" if genuine else "font files") +
+            " -- After Effects fails at startup regardless of the files. Repair deletes the "
+            "cache; Adobe rebuilds it on the next launch.",
+            stale=[{"font": w, "cached": c, "cache": p} for w, c, p in stale])
+        repair.append("delete CoolType's stale font cache (Adobe rebuilds it)")
+    elif not caches:
+        add("cooltype-cache", "good", "no CoolType cache on disk yet (Adobe writes one on first launch)")
+    else:
+        add("cooltype-cache", "good",
+            "%d CoolType cache%s on disk, each naming a genuine default Roman face"
+            % (len(caches), "" if len(caches) == 1 else "s"))
+
+    # 3. The real Microsoft core fonts -- the video trio's startup requirement.
+    present, missing = _ms_core_fonts_status(prefix)
+    if missing:
+        add("ms-core-fonts", "bad",
+            "%d of the 6 Microsoft core fonts are missing (%s). Premiere, After Effects and Media "
+            "Encoder are known to fail at startup without the real set, and Wine's own substitutes "
+            "do not count. Repair installs them (`winetricks corefonts`, ~10 MB on first use)."
+            % (len(missing), ", ".join(missing)), present=present, missing=missing)
+        repair.append("install the Microsoft core fonts (winetricks corefonts)")
+    else:
+        add("ms-core-fonts", "good", "all 6 Microsoft core fonts present (" +
+            ", ".join(_MS_CORE_FONTS) + ")", present=present, missing=[])
+
+    # 4. The font replacement map (HKCU\\Software\\Wine\\Fonts\\Replacements). Adobe asks for
+    #    Segoe UI, Calibri, MS Gothic, the Noto CJK set... none of which is redistributable and
+    #    none of which is in any prefix; the redirect to Adobe Clean is permanent infrastructure.
+    #    Without it dwrite's FindFamilyName returns NULL, AdobeOwl dereferences it, a critsec
+    #    leaks and Photoshop deadlocks at startup / on File > New -- and nothing on screen says
+    #    "font". Both halves are verified: the entries, AND that the target they point at is
+    #    present and registered (a map pointing at an absent family is the same failure with an
+    #    extra step). Added 2026-09-13 at the operator's request.
+    expected = expected_font_replacements(resolve_runtime())
+    have = _prefix_font_replacements(prefix)
+    rep_missing, rep_differ, rep_absent = [], {}, []
+    if have is None:
+        add("replacements", "warn", "user.reg is unreadable, so the font replacement map is unknown")
+    else:
+        rep_missing = [k for k in expected if k not in have]
+        rep_differ = {k: have[k] for k in expected if k in have and have[k] != expected[k]}
+        targets = sorted(set(expected.values()) | set(rep_differ.values()))
+        reg_readable = _registered_font_basenames(prefix) is not None
+        target_files = {t: (_family_registered_files(prefix, t) if reg_readable else []) for t in targets}
+        rep_absent = [t for t in targets if not target_files[t]] if reg_readable else []
+        n_exp, exp_targets = len(expected), ", ".join(sorted(set(expected.values())))
+        shown = ", ".join(rep_missing[:4]) + (" and %d more" % (len(rep_missing) - 4) if len(rep_missing) > 4 else "")
+        if rep_missing:
+            add("replacements", "bad",
+                "%d of the %d font replacements are missing (%s). Adobe asks for these fonts, "
+                "which are not redistributable and are not in the prefix; without the redirect to "
+                "%s dwrite returns nothing and Photoshop deadlocks at startup. Repair restores the map."
+                % (len(rep_missing), n_exp, shown, exp_targets)
+                + ("" if not rep_absent else " Also, %s is not present and registered in this prefix."
+                   % ", ".join(rep_absent)),
+                missing=rep_missing, absent_targets=rep_absent, differ=rep_differ)
+            repair.append("restore %d font replacement entries" % len(rep_missing))
+        elif rep_absent:
+            add("replacements", "bad",
+                "all %d font replacements are present, but they point at %s, which is not present "
+                "and registered in this prefix -- the same Photoshop deadlock with an extra step. "
+                "Repair registers what is in windows/Fonts; if the family is not there at all, the "
+                "Adobe install that ships it must be repaired."
+                % (n_exp, ", ".join(rep_absent)), missing=[], absent_targets=rep_absent, differ=rep_differ)
+            repair.append("register the replacement target (%s)" % ", ".join(rep_absent))
+        elif not reg_readable:
+            add("replacements", "warn",
+                "all %d font replacements are present, but system.reg is unreadable so whether %s "
+                "is registered could not be verified" % (n_exp, exp_targets),
+                missing=[], absent_targets=[], differ=rep_differ)
+        elif rep_differ:
+            add("replacements", "warn",
+                "%d font replacement%s point%s somewhere other than the runtime's map (%s); the "
+                "targets exist, so the apps start. Repair restores the map."
+                % (len(rep_differ), "" if len(rep_differ) == 1 else "s", "s" if len(rep_differ) == 1 else "",
+                   "; ".join("%s -> %s" % (k, v) for k, v in sorted(rep_differ.items())[:3])),
+                missing=[], absent_targets=[], differ=rep_differ)
+            repair.append("restore %d font replacement entries" % len(rep_differ))
+        else:
+            add("replacements", "good",
+                "all %d font replacements intact, pointing at %s (present and registered: %s)"
+                % (n_exp, exp_targets, ", ".join(sorted({f for fs in target_files.values() for f in fs})[:3])),
+                missing=[], absent_targets=[], differ={})
+
+    # 5. Registration -- a font the prefix merely HAS is invisible to the apps.
+    unreg = _unregistered_prefix_fonts(prefix)
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    try:
+        n_files = len([f for f in os.listdir(fd)
+                       if os.path.splitext(f)[1].lower() in _FONT_REG_SUFFIX])
+    except OSError:
+        n_files = 0
+    if unreg is None:
+        add("registered", "warn", "system.reg is unreadable, so which fonts are registered is unknown")
+    elif unreg:
+        clean = [f for f in unreg if "adobeclean" in f.lower().replace("-", "").replace("_", "")]
+        shown = ", ".join(unreg[:5]) + (" and %d more" % (len(unreg) - 5) if len(unreg) > 5 else "")
+        if clean:
+            add("registered", "bad",
+                "Adobe Clean is in windows/Fonts but not registered (%s), so Photoshop's menu "
+                "bar comes up blank. %d file%s unregistered in total: %s. Repair registers them."
+                % (clean[0], len(unreg), "" if len(unreg) == 1 else "s", shown), files=unreg)
+        else:
+            add("registered", "warn",
+                "%d font file%s in windows/Fonts %s not registered, so the apps cannot see %s: "
+                "%s. Repair registers them."
+                % (len(unreg), "" if len(unreg) == 1 else "s", "is" if len(unreg) == 1 else "are",
+                   "it" if len(unreg) == 1 else "them", shown), files=unreg)
+        repair.append("register %d font file%s with Wine" % (len(unreg), "" if len(unreg) == 1 else "s"))
+    else:
+        add("registered", "good",
+            "all %d font files in windows/Fonts are registered" % n_files if n_files
+            else "no font files in windows/Fonts yet", files=[])
+
+    status = ("bad" if any(c["status"] == "bad" for c in checks)
+              else "warn" if any(c["status"] == "warn" for c in checks) else "good")
+    by = {c["name"]: c for c in checks}
+    if by["roman-default"]["status"] == "bad":
+        summary = ("After Effects will not start: none of Times New Roman, Arial or Courier New "
+                   "in this prefix is a genuine Microsoft font")
+    elif by["cooltype-cache"]["status"] == "bad":
+        summary = ("After Effects will not start: CoolType's cache still points at Wine's "
+                   "substitute fonts" + (" (the files themselves are genuine)" if genuine else ""))
+    elif by["ms-core-fonts"]["status"] == "bad":
+        summary = ("Premiere, After Effects and Media Encoder may not start: %d of the 6 "
+                   "Microsoft core fonts are missing" % len(missing))
+    elif by["replacements"]["status"] == "bad":
+        summary = ("Photoshop will deadlock at startup: the font replacement map (Segoe UI and "
+                   "others -> Adobe Clean) " +
+                   ("is missing %d of %d entries" % (len(rep_missing), len(expected)) if rep_missing
+                    else "points at %s, which is not in this prefix" % ", ".join(rep_absent)))
+    elif by["registered"]["status"] == "bad":
+        summary = "Photoshop's menu bar will be blank: Adobe Clean is in the prefix but not registered"
+    elif by["replacements"]["status"] == "warn" and rep_differ:
+        summary = ("%d font replacement%s differ from the runtime's map; the apps start, Repair "
+                   "restores it" % (len(rep_differ), "" if len(rep_differ) == 1 else "s"))
+    elif by["registered"]["status"] == "warn":
+        summary = ("%d font file%s in the prefix %s not registered, so the apps cannot see %s"
+                   % (len(unreg or []), "" if len(unreg or []) == 1 else "s",
+                      "is" if len(unreg or []) == 1 else "are", "it" if len(unreg or []) == 1 else "them")
+                   if unreg else "which fonts are registered could not be determined")
+    else:
+        summary = ("Fonts are good: genuine Microsoft core fonts, CoolType's default face resolves, "
+                   "the replacement map is intact, all %d font files registered" % n_files)
+
+    out = {"status": status, "summary": summary, "checks": checks, "repair": repair}
+    # `registered` last so the row reads: files -> cache -> core set -> map -> registration.
+    # Collider greys out Repair while an app is running in the prefix; the CLI refuses anyway.
+    procs = _prefix_procs(prefix)
+    out["apps_running"] = sorted({comm for _pid, comm, is_app in procs if is_app})
+    if procs:
+        out["note"] = ("a wine session is live in this prefix; the registry file can lag a "
+                       "font registration by up to ~30 s, and the apps only read fonts at startup")
+    return out
+
+
+def repair_prefix_fonts(wine, prefix):
+    """Repair everything fonts_verdict() can flag, in order, and re-verify. Returns
+    {before, steps, after}. Every step's `ok` is judged from a RE-READ of the prefix after the
+    step, never from intent -- a step that reports what it meant to do is a guess.
+
+    The cache is invalidated UNCONDITIONALLY, even when nothing else changed: CoolType's cache is
+    keyed on filename, so any font overwritten in place (ours, or a `winetricks corefonts` the
+    user ran by hand) leaves a record pointing at what used to be there. Repairing the files and
+    leaving the cache is how a build tester lost three days (INCIDENTS.md 2026-08-12)."""
+    before = fonts_verdict(prefix)
+    steps = []
+
+    repaired, unrepaired, ran = _repair_roman_defaults(wine, prefix)
+    roman = _roman_default_status(prefix)
+    steps.append({"step": "roman_default", "ok": any(st == "real" for _f, st, _d in roman),
+                  "repaired": repaired, "unrepaired": unrepaired, "winetricks": ran,
+                  "detail": ", ".join(f"{fn}={st}" for fn, st, _ in roman)})
+
+    present, missing = _ms_core_fonts_status(prefix)
+    if missing:
+        ran2 = ran or _winetricks_corefonts(wine, prefix)   # the same fetch covers both
+        present, missing = _ms_core_fonts_status(prefix)
+        step = {"step": "ms_core_fonts", "ok": not missing, "winetricks": ran2,
+                "present": present, "missing": missing}
+        if not ran2:
+            step["needs"] = "winetricks"
+            step["detail"] = ("winetricks is not installed, so the Microsoft core fonts could not "
+                              "be fetched. Install winetricks (or run `WINE=%s WINEPREFIX=%s "
+                              "winetricks corefonts`) and repair again." % (wine, prefix))
+        steps.append(step)
+    else:
+        steps.append({"step": "ms_core_fonts", "ok": True, "present": present, "missing": []})
+
+    # The replacement map: rewrite every entry that is missing or differs from the expected map.
+    expected = expected_font_replacements(resolve_runtime())
+    have = _prefix_font_replacements(prefix) or {}
+    to_write = [k for k in expected if have.get(k) != expected[k]]
+    for k in to_write:
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", k, "REG_SZ", expected[k])
+    rep_step = {"step": "font_replacements", "ok": None, "restored": to_write}
+    steps.append(rep_step)          # `ok` judged from a re-read after the registry has reached disk
+
+    # Always: idempotent, and it is the only way a hand-copied font becomes visible.
+    n = register_prefix_fonts(wine, prefix)
+    steps.append({"step": "font_register", "ok": n > 0, "count": n})
+    # 🚨 WAIT FOR THE REGISTRY TO REACH DISK before judging. `reg import` returns as soon as its
+    # own process exits, but the prefix's wineserver lingers ~3 s behind wine's system processes
+    # and only writes system.reg when it shuts down. The first version of this function re-read
+    # the file inside that window and reported "Adobe Clean not registered -- Photoshop's menu
+    # bar will be blank" right after a repair that had just registered it (throwaway prefix,
+    # 2026-09-13). Only system processes can be alive here (an app makes the caller refuse), so
+    # the server exits on its own; the timeout is a safety net, not an expected path.
+    settled = wineserver_wait(wine, prefix, timeout=30)
+    if not settled:
+        steps.append({"step": "registry_flush", "ok": False,
+                      "detail": "a wine session is still live in this prefix, so system.reg "
+                                "may lag the registration by up to ~30 s; re-run "
+                                "`neutron fonts check` in a moment"})
+
+    have = _prefix_font_replacements(prefix) or {}
+    rep_step["ok"] = all(have.get(k) == v for k, v in expected.items())
+    rep_step["detail"] = ("%d/%d entries as expected" % (sum(1 for k, v in expected.items() if have.get(k) == v),
+                                                        len(expected)))
+
+    ncache = invalidate_cooltype_caches(prefix)
+    steps.append({"step": "cooltype_cache_invalidate", "ok": True, "count": ncache})
+
+    after = fonts_verdict(prefix)
+    return {"before": before, "steps": steps, "after": after}
+
+
+def _print_fonts_verdict(v, indent=""):
+    mark = {"good": "[ OK ]", "warn": "[WARN]", "bad": "[BAD ]"}
+    print(f"{indent}fonts: {v['status'].upper()} -- {v['summary']}")
+    for c in v["checks"]:
+        print(f"{indent}  {mark[c['status']]} {c['name']:<16} {c['detail']}")
+    if v.get("note"):
+        print(f"{indent}  note: {v['note']}")
+
+
+def cmd_fonts_check(args):
+    """Re-verify a prefix's fonts. Read-only, never starts wine; exit 1 when status is bad
+    (the same status-through-exit-code convention as doctor)."""
+    prefix = resolve_prefix(args.prefix)
+    if not prefix:
+        die({"ok": False, **bad_prefix_reason(getattr(args, "prefix", None))},
+            EX_BADPREFIX, args.json)
+    v = fonts_verdict(prefix)
+    if args.json:
+        emit({"ok": True, "prefix": prefix, **v}, True)
+    else:
+        print(f"prefix: {prefix}")
+        _print_fonts_verdict(v)
+        if v["repair"]:
+            print("repair would: " + "; ".join(v["repair"]))
+            print(f"run: neutron fonts repair --prefix {prefix}")
+    return EX_OK if v["status"] != "bad" else EX_FAIL
+
+
+def cmd_fonts_repair(args):
+    """Repair a prefix's fonts (see repair_prefix_fonts). Refuses to touch the prefix through a
+    runtime that would re-stamp it, and while an Adobe app is running in it."""
+    prefix = resolve_prefix(args.prefix)
+    if not prefix:
+        die({"ok": False, **bad_prefix_reason(getattr(args, "prefix", None))},
+            EX_BADPREFIX, args.json)
+    wine, is_neutron = resolve_wine()
+    if not wine:
+        die({"ok": False, "reason": "no wine resolved"}, EX_DEP, args.json)
+    if not is_neutron:
+        die({"ok": False, "reason": "resolved wine is not a Neutron runtime; refusing to touch the "
+                                    "prefix (distro wine would wineboot-clobber it)"},
+            EX_DEP, args.json)
+    mismatch = stamp_mismatch(prefix, wine)
+    if mismatch and not getattr(args, "allow_restamp", False):
+        die({"ok": False,
+             "reason": "this runtime would RE-STAMP the prefix and revert its patched natives; "
+                       "refusing to repair fonts through it",
+             "hint": "run it with the runtime this prefix is stamped for: "
+                     "NEUTRON_WINE_VERSION=<ver> neutron fonts repair --prefix %s" % prefix,
+             **mismatch}, EX_FAIL, args.json)
+    # Adobe reads fonts and writes CoolType's cache during startup; a repair under a running app
+    # can neither take effect nor be verified until the app restarts, and the app could write
+    # the stale cache straight back at exit. Same rule (and exit code) as apply-display-fix.
+    running = sorted({comm for _pid, comm, is_app in _prefix_procs(prefix) if is_app})
+    if running:
+        die({"ok": False, "reason": "an Adobe app is running in this prefix (%s); close it, then "
+                                    "repair" % ", ".join(running), "apps_running": running},
+            EX_RUNNING, args.json)
+
+    res = repair_prefix_fonts(wine, prefix)
+    ok = res["after"]["status"] != "bad"
+    out = {"ok": ok, "prefix": prefix, **res}
+    if not ok:
+        out["reason"] = "still broken after repair: " + res["after"]["summary"]
+    if args.json:
+        emit(out, True)
+    else:
+        print(f"prefix: {prefix}")
+        print(f"before: {res['before']['status'].upper()} -- {res['before']['summary']}")
+        for s in res["steps"]:
+            extra = {k: v for k, v in s.items() if k not in ("step", "ok")}
+            print(f"  {'[ OK ]' if s['ok'] else '[FAIL]'} {s['step']:<26} " +
+                  ", ".join(f"{k}={v}" for k, v in extra.items()))
+        print("after:")
+        _print_fonts_verdict(res["after"], indent="  ")
+    return EX_OK if ok else EX_FAIL
 
 
 def detect_scale():
@@ -2923,15 +3494,7 @@ def cmd_prefix_provision(args):
                       "count": len(PROVISION_DLL_OVERRIDES), "ok": True,
                       "note": "no runtime bundle; native DLL files NOT staged"})
 
-    fonts = dict(PROVISION_FONT_REPLACEMENTS)
-    if runtime:
-        try:
-            with open(os.path.join(runtime, "fonts.json")) as f:
-                bundled = json.load(f)
-            if bundled:
-                fonts = bundled
-        except Exception as e:
-            log(f"runtime fonts.json unreadable ({e}); using builtin map")
+    fonts = expected_font_replacements(runtime)
     for name, repl in fonts.items():
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
     event(args, event="progress", stage="fonts", pct=82, msg="applied the Adobe font replacement map")
@@ -2952,53 +3515,27 @@ def cmd_prefix_provision(args):
     # Repro'd and reversed in the clean room 2026-08-11; see
     # _roman_default_status(). We only ever copy a font whose PostScript name is
     # genuinely the one CoolType wants, so this cannot make a prefix worse.
-    roman = _roman_default_status(prefix)
-    fake = [fn for fn, state, _ in roman if state != "real"]
-    repaired, unrepaired = [], []
-    if fake:
-        fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
-        for fn in fake:
-            # The prefix's own Fonts dir is searched too: a `--method windows`
-            # copy often carries the genuine face under a different filename
-            # (e.g. "Times New Roman.ttf"), which repairs with no download.
-            src = _find_real_roman_font(_ROMAN_DEFAULTS[fn], extra_dirs=(fd,))
-            if src:
-                try:
-                    shutil.copyfile(src, os.path.join(fd, fn))
-                    repaired.append(fn)
-                    continue
-                except OSError as e:
-                    log(f"roman-default repair of {fn} failed: {e}")
-            unrepaired.append(fn)
-        # 🚨 If NOTHING on this host could supply a genuine face, copying cannot
-        # help and the prefix stays fatally broken -- we would only print
-        # "run `winetricks corefonts`" and call it a day, which is how a build
-        # tester ends up with an install that reported success and cannot launch
-        # Premiere, AE or Media Encoder.
-        #
-        # Fetch them. Gated on the prefix ALREADY being broken, so a healthy
-        # prefix pays nothing, and corefonts brings georgia/verdana/impact/trebuc
-        # too -- which the video trio needs and _ROMAN_DEFAULTS (times/arial/cour)
-        # never covered.
-        if unrepaired and shutil.which("winetricks"):
-            log("no genuine Roman face on this host — fetching the real Microsoft "
-                "core fonts (`winetricks corefonts`); this downloads ~10 MB")
-            try:
-                subprocess.run(["winetricks", "-q", "-f", "corefonts"],
-                               env={**os.environ, "WINE": wine, "WINEPREFIX": prefix,
-                                    "WINEDEBUG": "-all", "W_OPT_UNATTENDED": "1"},
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=600, check=False)
-            except Exception as e:                        # never fail provisioning on this
-                log(f"winetricks corefonts failed: {e}")
-            # Re-evaluate: whatever landed changes the verdict below, and the
-            # CoolType cache invalidation after this block must see the NEW files.
-            roman = _roman_default_status(prefix)
-            newly = [fn for fn, state, _ in roman if state == "real" and fn in unrepaired]
-            repaired.extend(newly)
-            unrepaired = [fn for fn in unrepaired if fn not in newly]
-        if repaired:
-            register_prefix_fonts(wine, prefix)   # re-register the replaced files
+    repaired, unrepaired, _ran_winetricks = _repair_roman_defaults(wine, prefix)
+    # ⭐ 2026-09-13 (operator's decision): ALSO fetch when ANY of the six Microsoft core fonts is
+    # missing, not only when the Roman defaults could not be repaired locally. Before this, a
+    # host with a genuine Times but no msttcorefonts produced a freshly provisioned prefix that
+    # `fonts check` reads RED until someone presses Repair. The gate's spirit is kept: a prefix
+    # that already has the six pays nothing, and a winetricks failure never fails provisioning.
+    _present, _missing = _ms_core_fonts_status(prefix)
+    _core_fetched = False
+    if _missing and not _ran_winetricks and shutil.which("winetricks"):
+        log("Microsoft core fonts incomplete (missing %s) -- fetching the real set "
+            "(`winetricks corefonts`); this downloads ~10 MB on first use" % ", ".join(_missing))
+        _core_fetched = _winetricks_corefonts(wine, prefix)
+        _present, _missing = _ms_core_fonts_status(prefix)
+        if _core_fetched:
+            register_prefix_fonts(wine, prefix)   # the new files must be registered too
+    steps.append({"step": "ms_core_fonts", "ok": not _missing, "present": _present,
+                  "missing": _missing, "fetched": _core_fetched or _ran_winetricks,
+                  "detail": ("%d/6 present" % len(_present)) if not _missing else
+                            ("%d/6 present, missing %s -- Premiere, After Effects and Media Encoder "
+                             "will not start; run `neutron fonts repair <prefix>` once winetricks "
+                             "is installed" % (len(_present), ", ".join(_missing)))})
     # 🚨 UNCONDITIONALLY, even when nothing was repaired. CoolType's cache is
     # keyed on FILENAME, so any font work that overwrites a file in place --
     # ours above, or the `winetricks corefonts` we tell people to run -- leaves
@@ -5197,8 +5734,8 @@ def cmd_doctor(args):
                 check("cooltype-roman-default", False, detail +
                       "  — NO genuine Roman face: CoolType will throw and "
                       "After Effects will fail at startup with 'EGG Constructor IEggApp failed'. "
-                      "Install the real Microsoft core fonts (`winetricks corefonts`) or run "
-                      "`neutron prefix provision <prefix>` to repair from host fonts.")
+                      "Run `neutron fonts repair --prefix <prefix>` (restores a genuine face "
+                      "from this machine, or installs the real Microsoft core fonts).")
             elif stale:
                 check("cooltype-roman-default", False, detail +
                       "  — a genuine file is present but CoolType's CACHE offers NO genuine "
@@ -5206,9 +5743,26 @@ def cmd_doctor(args):
                       ", ".join(sorted({s[1] for s in stale})) +
                       "). AE will fail at startup regardless of the files. Fix: delete " +
                       os.path.dirname(stale[0][2]) + " (Adobe rebuilds it), or run "
-                      "`neutron prefix provision <prefix>`, which now does it for you.")
+                      "`neutron fonts repair --prefix <prefix>`, which does it for you.")
             else:
                 check("cooltype-roman-default", True, detail)
+            # The video trio's other startup requirement: the REAL Microsoft core fonts.
+            # Discriminated by the six names Wine ships nothing under -- a presence test by
+            # design, complementary to the authenticity test above (never a replacement for
+            # it: this one reports 6/6 on a prefix whose times/arial/cour are all fake).
+            # Until 2026-09-13 this check lived only in comments and a snapshot script.
+            _present, _missing = _ms_core_fonts_status(prefix)
+            check("ms-core-fonts", not _missing,
+                  "%d/6 present" % len(_present) if not _missing else
+                  "%d/6 present, missing %s -- Premiere, After Effects and Media Encoder "
+                  "will not start without the real Microsoft core fonts (Wine's substitutes "
+                  "do not count). Run `neutron fonts repair --prefix <prefix>`."
+                  % (len(_present), ", ".join(_missing)))
+            # The font replacement map, from the same engine `fonts check` uses (2026-09-13).
+            _rep = next(c for c in fonts_verdict(prefix)["checks"] if c["name"] == "replacements")
+            check("font-replacements", _rep["status"] != "bad",
+                  _rep["detail"] + ("" if _rep["status"] != "bad" else
+                                    "  Run `neutron fonts repair --prefix <prefix>`."))
             # CEP panel CEF flags. An extension UPDATE silently reverts these (Captioneer 1.8.1
             # did, 2026-08-15) and the only symptom is "the panel does not load" -- nothing in
             # Premiere's log says why, so without this check it costs an investigation every time.
@@ -5446,6 +6000,22 @@ def build_parser():
     ta.set_defaults(func=cmd_theme_apply)
     ts = tsub.add_parser("show", help="print the default theme")
     ts.set_defaults(func=cmd_theme_show)
+
+    # fonts: re-verify + repair. The engine half predates this command (it ran inside doctor
+    # and provision); this is the first-class surface Collider's Fonts row drives.
+    pf = sub.add_parser("fonts", help="re-verify a prefix's fonts, and repair them")
+    fsub = pf.add_subparsers(dest="subcmd", required=True)
+    fc = fsub.add_parser("check", help="verdict good/warn/bad with the reason; read-only, "
+                                       "never starts wine")
+    fc.add_argument("--prefix", default=None)
+    fc.set_defaults(func=cmd_fonts_check)
+    fr = fsub.add_parser("repair", help="restore genuine core fonts, register staged fonts, "
+                                        "and invalidate CoolType's cache; then re-verify")
+    fr.add_argument("--prefix", default=None)
+    fr.add_argument("--allow-restamp", action="store_true",
+                    help="proceed even if the runtime would re-stamp the prefix (it will "
+                         "wineboot -u and revert patched natives)")
+    fr.set_defaults(func=cmd_fonts_repair)
 
     pd = sub.add_parser("doctor", help="health check")
     pd.add_argument("--prefix", default=None)
