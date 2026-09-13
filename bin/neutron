@@ -2717,6 +2717,10 @@ DEFAULT_THEME_COLORS = {
     "MenuHilight": "64 64 64",
     # window / general
     "Window": "43 43 43", "WindowText": "224 224 224", "HilightText": "255 255 255",
+    # classic scrollbar TRACK (the thumb and arrows follow the button palette below). Never set
+    # before, so every Wine-drawn scrollbar had a light track -- the one bright strip left in the
+    # restyled file dialog (2026-09-12). Windows' default is 200 200 200.
+    "Scrollbar": "30 30 30",
     # dialogs + controls Wine draws itself. ⚠️ Darkening these is SAFE only because
     # neutron-wine zzzzzzzzzp/q/r moved the caption buttons, window frame and menu rule off the
     # button palette onto the caption/border colours. Before that, a dark ButtonFace put a white
