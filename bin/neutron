@@ -816,6 +816,12 @@ def discover_prefixes():
     a natural way to organise -- a folder named for the tool, holding its prefixes -- and Mud Hut
     imposes no layout of its own, so it is a user choice other users will repeat.
 
+    ⭐ Vindicated again 2026-09-14: the operator's own prefix sits at `~/Neutron-Prefixes/Adobe2026`
+    and THIS scan found it, while Collider's `discover()` -- one level under each of a fixed root
+    list -- could not, because the parent directory was not one of its roots. The two resolvers
+    disagreed and only this one was right. Keep the depth; when in doubt, scan wider here rather
+    than adding another special-cased root.
+
     ⚠️ It was fully masked by Collider's selection resolving first, which made
     `~/.config/collider/config.json` a single point of failure for prefix resolution: absent,
     reset or corrupt, and every command without `--prefix` answered "no wine prefix found" with
@@ -824,6 +830,10 @@ def discover_prefixes():
     trusting that the tier it never reaches works.
     """
     seen, out, budget = set(), [], _DISCOVER_MAX_DIRS
+    # ⭐ `Neutron-Prefixes` is Collider's default parent for a new prefix since 2026-09-14
+    # (it was `Neutron`, which differs from the engine's own directory only by case — see
+    # Collider `core/prefixes.rs`). Both are reachable via the two-level scan of HOME below,
+    # so they are not listed as roots; named here so the connection is findable from this side.
     roots = [HOME, os.path.join(HOME, "Games"), os.path.join(HOME, ".local", "share", "wineprefixes")]
     env = os.environ.get("WINEPREFIX")
     if env:
