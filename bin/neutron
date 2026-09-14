@@ -4660,7 +4660,14 @@ def cmd_launch(args):
     # log", so the next launch surface added without it silently regresses this again. The real
     # condition is whether anyone can SEE the output. stderr-is-a-tty answers that directly.
     interactive = sys.stderr.isatty() and not args.json
-    want_log = not args.no_log and not interactive
+    # --log forces a file even on a tty. ⭐ The reason it exists: the ONE launch surface where
+    # someone is most likely to be deliberately capturing a trace -- a human typing WINEDEBUG=... in
+    # a terminal -- was the one surface that kept no file, because "nobody is watching" is false
+    # there. On 2026-09-14 two capture rounds were lost to it (one to a Collider launch, which
+    # discards the log, and one to a terminal command with no redirect) while chasing the Premiere
+    # menu cursor bug. The redirect workaround (`> file 2>&1`) works by making stderr not a tty,
+    # which is a side effect nobody should have to know.
+    want_log = not args.no_log and (args.log or not interactive)
     log_path, log_fh = None, None
     if want_log:
         try:
@@ -5936,6 +5943,10 @@ def build_parser():
     pl.add_argument("--with", dest="with_", action="append", metavar="GATE",
                     help="turn a gate ON for this launch (repeatable) -- for the ones that ship "
                          "off by default.")
+    pl.add_argument("--log", action="store_true",
+                    help="ALWAYS write a session log, even from an interactive terminal. Use this "
+                         "when capturing a WINEDEBUG trace: without it a terminal launch keeps the "
+                         "tty and no file is kept, which cost two capture rounds on 2026-09-14.")
     pl.add_argument("--no-log", action="store_true",
                     help="do not write a session log to ~/.local/share/neutron/logs/. By default "
                          "a log is written whenever nobody is watching the output live (menu, "
