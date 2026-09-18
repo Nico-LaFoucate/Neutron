@@ -759,8 +759,8 @@ def die(obj, code, as_json):
     sys.exit(code)
 
 
-def premiere_is_running():
-    """True if any Adobe Premiere process is alive (pref edits are unsafe then).
+def premiere_is_running(prefix):
+    """True if Premiere is alive IN THIS PREFIX (its pref edits are unsafe then).
 
     ⛔ Matches the EXECUTABLE, never the command line. This used to be
     `pgrep -f "Adobe Premiere"`, which matches any process whose full cmdline merely CONTAINS
@@ -768,14 +768,16 @@ def premiere_is_running():
     path open, or the very shell running this check. A false positive made
     `prefix apply-display-fix` return exit 3 "Premiere is running; cannot edit prefs", which
     (before the display fix was made best-effort) aborted the launch of every app in the prefix.
-    Same self-match trap as `_prefix_procs`, which documents the rule."""
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        # cmdline[0] is the exe the process was started with; argv[1..] is ignored on purpose.
-        if _proc_win_exe(int(pid)).lower().endswith("/adobe premiere pro.exe"):
-            return True
-    return False
+    Same self-match trap as `_prefix_procs`, which documents the rule.
+
+    🚨 2026-09-18: it then scanned ALL of /proc with no prefix check. With Premiere 2025 running
+    from ~/.premiere2025, `prefix apply-display-fix ~/Neutron-Prefixes/Adobe2026` refused with
+    exit 3 for a prefix in which nothing was running -- so Collider's per-launch display fix was
+    skipped for the 2026 suite for as long as the 2025 one was open. Same class as
+    `_app_running_pid`: per-app where it must be per-app-PER-PREFIX. Now answered by
+    `_app_procs`: `WINEPREFIX=<prefix>` as a whole environ entry AND the app's install-directory
+    token in cmdline[0]. Validated against a synthetic known-bad in tests/test_identity.py."""
+    return bool(_app_procs(prefix, "premiere"))
 
 
 def collider_selected_prefix():
@@ -1700,18 +1702,24 @@ def _roman_default_status(prefix):
     return rows
 
 
-def _prune_app_logs(log_dir, app, keep=20):
-    """Keep only the newest `keep` logs for this app; delete the rest.
+def _prune_app_logs(log_dir, app, slug, keep=20):
+    """Keep only the newest `keep` logs for this app IN THIS PREFIX; delete the rest.
 
-    Bounded per-app so a chatty app can't starve a quiet one out of its history.
+    Bounded per app+prefix so a chatty app can't starve a quiet one out of its history.
     ⚠️ Size matters here: an Adobe wine log with debug channels on reaches
     hundreds of MB (this box has a 5.4 GB one), so an unbounded log dir would
     quietly become the biggest thing on the disk. Best-effort — a failure to
-    prune must never stop a launch."""
+    prune must never stop a launch.
+
+    2026-09-18: logs are `<app>-<prefix slug>-<ts>.log`. They used to be `<app>-<ts>.log` and
+    pruned 20-per-app ACROSS prefixes, so a busy Premiere 2025 session erased Premiere 2026's
+    history -- and a log someone sent us did not say which prefix produced it from its name.
+    Old-format files are left alone (already bounded at 20 per app; never grows again)."""
     try:
+        stem = "%s-%s-" % (app, slug)
         mine = sorted(
             (e.path for e in os.scandir(log_dir)
-             if e.is_file() and e.name.startswith(app + "-") and e.name.endswith(".log")),
+             if e.is_file() and e.name.startswith(stem) and e.name.endswith(".log")),
             key=os.path.getmtime, reverse=True)
         for old in mine[keep - 1:]:      # -1: we are about to create one more
             try:
@@ -2715,15 +2723,21 @@ def _prefix_procs(prefix):
 
     Detect by `environ WINEPREFIX=` + exe path, NEVER by cmdline substring -- wine's own system
     processes (services.exe, explorer.exe...) carry no 'wine'/'Adobe' text and would be missed,
-    which is precisely how orphans accumulated and deadlocked Lightroom's loader lock."""
+    which is precisely how orphans accumulated and deadlocked Lightroom's loader lock.
+
+    ⛔ Compare WINEPREFIX as a WHOLE NUL-separated entry, never as a substring of the joined
+    environ. 2026-09-18: the substring test made ~/mudhut-accc own every process of
+    ~/mudhut-accc2 -- so a full teardown of the first prefix would have killed the second's live
+    session. Measured against a synthetic known-bad in tests/test_identity.py before the fix."""
     out = []
+    want = ("WINEPREFIX=" + prefix.rstrip("/")).encode("utf-8", "replace")
     for p in os.listdir("/proc"):
         if not p.isdigit():
             continue
         try:
             with open(f"/proc/{p}/environ", "rb") as f:
-                env = f.read().decode("utf8", "replace")
-            if ("WINEPREFIX=" + prefix.rstrip("/")) not in env:
+                entries = f.read().split(b"\0")
+            if want not in entries:
                 continue
             comm = open(f"/proc/{p}/comm").read().strip()
             out.append((int(p), comm, comm not in WINE_SYSTEM_PROCS))
@@ -3090,7 +3104,13 @@ def cmd_apply_display_fix(args):
         die({"changed": False, **bad_prefix_reason(getattr(args, "prefix", None) or getattr(args, "path", None))},
             EX_BADPREFIX, args.json)
 
-    if premiere_is_running():
+    # Which of the apps whose prefs this edits are live IN THIS PREFIX. Adobe rewrites its Debug
+    # Database on exit, so a write under a running app is lost at best and races Adobe's own
+    # write at worst. Premiere keeps its historical exit-3 contract (Collider treats it as
+    # best-effort and carries on); After Effects / Media Encoder are skipped per app so a running
+    # AE no longer blocks Premiere's fix, and vice versa. One /proc pass, prefix-scoped.
+    running = set(_running_app_ids(prefix))
+    if "premiere" in running:
         die({"changed": False, "already_applied": False,
              "premiere_running": True,
              "reason": "Premiere is running; cannot edit prefs"},
@@ -3104,6 +3124,11 @@ def cmd_apply_display_fix(args):
                 results.append({"app": label, "state": "not-installed"})
                 continue
             any_target = True
+            if label in running:
+                results.append({"app": label, "state": "running",
+                                "reason": "%s is running in this prefix; its prefs are left "
+                                          "alone until it exits" % label})
+                continue
             if dbg:
                 try:
                     state = _apply_display_fix_to(dbg)
@@ -4712,9 +4737,12 @@ def cmd_launch(args):
     if want_log:
         try:
             os.makedirs(NEUTRON_LOGS_DIR, exist_ok=True)
-            _prune_app_logs(NEUTRON_LOGS_DIR, args.app, keep=20)
+            # Named per app AND prefix (`premiere-premiere2025-…`, `premiere-adobe2026-…`): two
+            # installs of one app are two programs, and their histories are pruned separately.
+            _slug = _prefix_slug(prefix)
+            _prune_app_logs(NEUTRON_LOGS_DIR, args.app, _slug, keep=20)
             log_path = os.path.join(
-                NEUTRON_LOGS_DIR, f"{args.app}-{time.strftime('%Y%m%d-%H%M%S')}.log")
+                NEUTRON_LOGS_DIR, f"{args.app}-{_slug}-{time.strftime('%Y%m%d-%H%M%S')}.log")
             log_fh = open(log_path, "wb")
             # ⭐ MAKE THE LOG SELF-DESCRIBING. The `[neutron] launching: …` line is the PARENT's
             # stderr, so it never appears inside the child's log -- on a menu launch it goes to
@@ -5216,6 +5244,25 @@ def repair_mime_defaults(apps_dir, written):
             continue                # someone real already handles it -- do not steal it
         cp.set(section, mime, entry)
         claimed.append(mime)
+
+    # 🚨 2026-09-18: the dangling case above was only ever repaired for the types WE declare.
+    # Mud Hut's generation claimed types of its own (`application/vnd.adobe.premiere-project`,
+    # `…aftereffects.project`) that no entry of ours declares, so once provision retired
+    # `mudhut-premiere.desktop` those keys pointed at a file that no longer existed -- forever,
+    # because `want` never contained them. Found on the dev box with both lines still dead two
+    # weeks after the retirement. Same app, same user intent: re-point a DEAD `mudhut-<app>`
+    # claim, for any type, at the entry we just wrote for that app. A live one is still never
+    # stolen, and an app we did not write this run is not ours to touch.
+    ours = {w["app"]: (w.get("file") or ("neutron-%s.desktop" % w["app"])) for w in written}
+    for mime, cur in list(cp.items(section)):
+        if mime in want or not cur or live(cur):
+            continue
+        handlers = [h.strip() for h in cur.split(";") if h.strip()]
+        for app_id, entry in ours.items():
+            if ("mudhut-%s.desktop" % app_id) in handlers:
+                cp.set(section, mime, entry)
+                claimed.append(mime)
+                break
     if not claimed:
         return []
     try:
