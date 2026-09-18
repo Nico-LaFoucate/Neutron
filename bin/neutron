@@ -2983,9 +2983,20 @@ def cmd_teardown(args, _emitted=False):
 
     left = _prefix_procs(prefix)
     if not left:
-        for d in glob.glob("/tmp/.wine-%d/server-*" % os.getuid()):
+        # 🚨 2026-09-18: this used to rmtree EVERY /tmp/.wine-<uid>/server-* directory, not just
+        # this prefix's. Tearing down one prefix while another was still running deleted the live
+        # one's socket directory; the next process into that prefix cannot find its wineserver and
+        # starts a SECOND one, so the app loses its own daemons and writes prefs into a registry
+        # that is then discarded. wineserver names the directory server-<dev>-<ino> of the prefix
+        # (server/request.c init_server_dir), so derive it and remove exactly that one.
+        try:
+            st = os.stat(prefix)
+            only = "/tmp/.wine-%d/server-%x-%x" % (os.getuid(), st.st_dev, st.st_ino)
+        except OSError:
+            only = None
+        if only and os.path.isdir(only):
             try:
-                shutil.rmtree(d)
+                shutil.rmtree(only)
             except Exception:
                 pass
     if not _emitted:
@@ -4382,6 +4393,25 @@ def cmd_launch(args):
     dxvk_conf = _resolve_app_dxvk_conf(prefix, profile)
     env = dict(os.environ)
 
+    # ⭐ PER-PREFIX WAYLAND app_id, so two prefixes with the same app are distinguishable.
+    #
+    # Wine's default app_id is the lowercased EXE basename, which is IDENTICAL for the same app in
+    # every prefix. The desktop environment matches a running window back to a .desktop entry by
+    # that id, so with Premiere installed in two prefixes it labelled a window launched from the
+    # .premiere2025 icon "Premiere Pro (Adobe2026)" (operator, 2026-09-18 -- the app was in the
+    # right prefix; only the label and the window grouping were wrong).
+    #
+    # Set it here rather than only in the generated Exec= line, so a launch from Collider or a
+    # terminal gets the same identity as a launch from the menu. An explicit value in the caller's
+    # environment still wins. The id is the .desktop basename for this app+prefix, which is the XDG
+    # convention for binding a window to its entry. Honoured by winewayland.drv
+    # `wayland_init_process_name`; harmless on a runtime that predates it (Wine keeps the EXE name).
+    if not env.get("NEUTRON_WAYLAND_APP_ID"):
+        try:
+            env["NEUTRON_WAYLAND_APP_ID"] = "neutron-%s-%s" % (args.app, _prefix_slug(prefix))
+        except Exception:
+            pass
+
     # ⭐ PER-PREFIX GATE OVERRIDES: <prefix>/neutron-env.conf, `KEY=VALUE` per line.
     #
     # Every behaviour change this project ships is env-gated so it can be A/B'd without a
@@ -5289,10 +5319,27 @@ def register_app_desktop_entries(prefix):
         if not (exe and os.path.isfile(exe)):
             continue
 
-        # The app_id the compositor will see. MUST match Wine exactly or the icon will not bind.
-        wm_class = os.path.basename(exe).lower()
-
         slug = _prefix_slug(prefix)
+        # The app_id the compositor will see. MUST match what Wine advertises or the icon will not
+        # bind -- and it must be UNIQUE PER PREFIX or the desktop environment cannot tell two
+        # installs of the same app apart.
+        #
+        # 🚨 2026-09-18: it used to be `os.path.basename(exe).lower()` -- Wine's own default, the
+        # lowercased EXE basename. That is IDENTICAL for the same app in every prefix, so with
+        # Premiere installed in both ~/.premiere2025 and ~/Neutron-Prefixes/Adobe2026 both entries
+        # carried `StartupWMClass=adobe premiere pro.exe`. The task manager, matching a running
+        # window back to an entry, picked whichever it found first: launching from the pinned
+        # .premiere2025 icon produced a task labelled "Premiere Pro (Adobe2026)" while the window's
+        # own title read "Adobe Premiere Pro 2025". The app WAS in the right prefix -- launcher,
+        # environment and every process had the right WINEPREFIX -- but the label lied, and window
+        # grouping broke with it. It hit every app installed into more than one prefix.
+        #
+        # Now: the entry's own basename, which is already unique per app+prefix. An app_id equal to
+        # a .desktop basename is the XDG convention and is matched to that entry directly. Wine is
+        # told to advertise it via NEUTRON_WAYLAND_APP_ID in Exec= below (honoured by
+        # winewayland.drv `wayland_init_process_name`); with that variable unset Wine keeps its
+        # upstream EXE-name behaviour, so an older runtime still binds by the fallback below.
+        wm_class = "neutron-%s-%s" % (app_id, slug)
         icon_name = "neutron-%s-%s" % (app_id, slug)
         icon_path = os.path.join(icon_dir, icon_name + ".png")
         have_icon = False
@@ -5395,7 +5442,7 @@ def register_app_desktop_entries(prefix):
             # unpinned for a few hours, the user launched from the menu, and the prefix was
             # re-stamped from 11.10-62 back to the CLI default 11.10-59 with dwrite/dcomp/dxcore
             # all reverted to builtins.
-            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin NEUTRON_WINE_VERSION=%s neutron launch %s --prefix %s%s\n"
+            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin NEUTRON_WINE_VERSION=%s NEUTRON_WAYLAND_APP_ID=%s neutron launch %s --prefix %s%s\n"
             "Icon=%s\n"
             "Terminal=false\n"
             # One MAIN category only. `Graphics;AudioVideo;` is two, which makes a menu list the
@@ -5405,7 +5452,7 @@ def register_app_desktop_entries(prefix):
             # ⭐ THE LINE THAT FIXES THE DOCK ICON. Wine's app_id, verbatim.
             "StartupWMClass=%s\n"
             "StartupNotify=false\n"
-            % (disp_name, p["name"], HOME, pinned_version, app_id, prefix, exec_arg,
+            % (disp_name, p["name"], HOME, pinned_version, wm_class, app_id, prefix, exec_arg,
                icon_name if have_icon else "collider",
                APP_CATEGORIES.get(app_id, "Graphics;"),
                ("MimeType=%s\n" % "".join(m + ";" for m in mimes)) if mimes else "",
@@ -5432,8 +5479,22 @@ def register_app_desktop_entries(prefix):
             "rewrote": changed, "caches": caches}
 
 
-def _app_running_pid(exe):
-    """PID of a live process running `exe` in this prefix, or None.
+def _app_running_pid(exe, prefix=None):
+    """PID of a live process running `exe` IN THIS PREFIX, or None.
+
+    🚨 2026-09-18: `prefix` used to not exist and the docstring lied. The scan matched the exe
+    path only, so with the same app installed in two prefixes it returned the OTHER prefix's pid.
+    MEASURED against the live known-bad: with Premiere 2025 running from ~/.premiere2025 (pid
+    15856), `neutron --json apps --prefix ~/Neutron-Prefixes/Adobe2026` reported
+    `premiere 2026 installed=True running=True pid=15856`. Collider adopts that snapshot, so the
+    other prefix's card showed Running, offered no Launch, and its Exit would have acted on the
+    wrong process. Windows does not group two installs by filename either; two exes at two paths
+    are two programs.
+
+    Pass the prefix and a candidate must ALSO carry `WINEPREFIX=<prefix>` in its environ, compared
+    against whole NUL-separated entries -- a substring test makes ~/mudhut-accc match
+    ~/mudhut-accc2. Omitting `prefix` keeps the old, prefix-blind behaviour for any caller that
+    genuinely wants it.
 
     ⛔ Matches on /proc/<pid>/exe and the FULL windows path in the cmdline — never a loose
     substring of the app NAME. A cmdline match on something like "premiere" also matches the
@@ -5444,6 +5505,7 @@ def _app_running_pid(exe):
         return None
     want = os.path.basename(exe).lower()
     me = os.getpid()
+    want_env = ("WINEPREFIX=" + prefix.rstrip("/")) if prefix else None
     try:
         pids = [d for d in os.listdir("/proc") if d.isdigit()]
     except OSError:
@@ -5465,8 +5527,21 @@ def _app_running_pid(exe):
             except Exception:
                 continue
             if t.endswith(want) and ("\\" in t or "/" in t):
+                if want_env is not None and not _proc_has_env(pid, want_env):
+                    break          # right exe, wrong prefix -- not ours
                 return pid
     return None
+
+
+def _proc_has_env(pid, want_env):
+    """True if /proc/<pid>/environ contains exactly `want_env` as one NUL-separated entry."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            entries = f.read().split(b"\0")
+    except OSError:
+        return False
+    w = want_env.encode("utf-8", "replace")
+    return any(e == w for e in entries)
 
 
 def cmd_apps(args):
@@ -5496,8 +5571,8 @@ def cmd_apps(args):
             # Collider adopts these so an app launched from the APPLICATION MENU still shows as
             # Running in the GUI and can be force-quit there. Without it a menu launch is
             # invisible to Collider and clicking Launch would start a SECOND copy.
-            "running": bool(_app_running_pid(exe)) if installed else False,
-            "pid": _app_running_pid(exe) if installed else None,
+            "running": bool(_app_running_pid(exe, prefix)) if installed else False,
+            "pid": _app_running_pid(exe, prefix) if installed else None,
             "icon": _app_icon(exe) if installed else None,   # real logo (lowest-ID group); None -> monogram
         })
     # Installed first, then alphabetical — a stable order for the widget grid.
