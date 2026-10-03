@@ -54,3 +54,12 @@ dist/HANDOFF-*.md
 dist/FIELD-REPORT-*.md
 dist/REPLY-TESTER-*.md
 docs/HANDOFF-*.md
+
+# Internal material: kept locally for development, never published.
+/reference/
+/docs/
+/STATE.md
+/NEUTRON_IOCP_FIX_REFERENCE.md
+/preserved-fixes/
+/patches/diagnostic/
+/dist/
