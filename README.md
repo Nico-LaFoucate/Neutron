@@ -26,11 +26,10 @@ Premiere Pro · After Effects · Photoshop · Lightroom · Illustrator · Animat
 ---
 
 > [!WARNING]
-> **Neutron is in beta, on one machine.** The applications below are used for real work —
-> including paid client work — but everything here is observed on a single development machine:
-> an NVIDIA RTX 5070 (nvidia-open) on CachyOS with KDE Wayland. Nothing is validated across
-> hardware, distributions, or application versions. Things break, and you must bring your own
-> legally licensed Adobe software.
+> **Neutron is in beta.** The applications below are used for real work — including paid client
+> work — and are tested on three machines, all CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs.
+> AMD and Intel GPUs, other distributions and other desktops aren't validated yet. Things break,
+> and you must bring your own legally licensed Adobe software.
 
 ---
 
@@ -153,8 +152,8 @@ focus areas:
   external finalize daemon; it was retired once the underlying fault — Microsoft's UCRT rejecting
   Wine's `\\?\` temp paths, which made the muxer skip interleaving — was fixed properly.)
 
-The shipping fixes live in [`patches/production/`](patches/), the reusable runtime bundle in
-`runtime/`, and the full engineering story in [`docs/`](docs/) and [`STATE.md`](STATE.md).
+The engine's fixes live in [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) (the
+patched Wine runtime) and in [`patches/production/`](patches/) here.
 
 ---
 
@@ -162,17 +161,15 @@ The shipping fixes live in [`patches/production/`](patches/), the reusable runti
 
 > [!IMPORTANT]
 > This is a developer preview, not a one-click installer yet. You will need a patched Neutron
-> Wine build and your own installed, licensed Adobe application. The hardening pass tracked in
-> [`docs/neutron_hardening_brief.md`](docs/neutron_hardening_brief.md) is turning this into a
-> reproducible build.
+> Wine build and your own installed, licensed Adobe application.
 
 **Prerequisites**
 
 - Linux with an **NVIDIA GPU** (dev/test: RTX 5070 / nvidia-open, CachyOS + KDE Wayland). Other
   GPUs are untested.
 - A **patched Neutron stack** — forked Wine (wine-tkg / staging base) plus patched DXVK,
-  vkd3d-proton, and the nvcuda wrapper. See [`STATE.md`](STATE.md) for the component list and
-  per-component build steps.
+  vkd3d-proton, and the nvcuda wrapper. See
+  [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) for the runtime and its build.
 - **Python 3**, plus `inotify-tools` and `ffmpeg` for hardware export.
 - Your own **legally licensed Adobe application**, installed into a Wine prefix.
 
@@ -244,14 +241,10 @@ CLI above — Collider is the convenience layer for people who'd rather click th
 | :--- | :--- |
 | [`bin/neutron`](bin/) | The Neutron CLI — the engine front door. |
 | [`patches/production/`](patches/) | The shipping fixes (anchor-guarded, idempotent). |
-| [`runtime/`](runtime/) | The runtime DLL bundle and override maps. |
 | [`scripts/`](scripts/) | Build, launch, and hardware-export helpers. |
-| [`docs/`](docs/) | Architecture map, investigations, and open issues. |
-| [`STATE.md`](STATE.md) | The known-working configuration and what each patch does. |
 
-**Start here:** [`STATE.md`](STATE.md) for the working configuration, then
-[`docs/display_architecture_map.md`](docs/display_architecture_map.md) for how display works, and
-[`docs/OPEN_ISSUES.md`](docs/OPEN_ISSUES.md) for the current work.
+Documentation, known issues and guides live on the wiki at
+[neutronproject.org/wiki](https://neutronproject.org/wiki/).
 
 ---
 
@@ -271,16 +264,16 @@ ground rules learned the hard way (full version in [`CONTRIBUTING.md`](CONTRIBUT
 
 ## License
 
-Neutron is a derivative work of Wine and is proudly open source, licensed under the
-**GNU Lesser General Public License (LGPL), version 2.1 or later**. See [`LICENSE`](LICENSE) for
-the full text.
+The `neutron` CLI is original code, licensed under the **GNU Lesser General Public License,
+version 2.1 or later** (`LGPL-2.1-or-later`). See [`LICENSE`](LICENSE) for the full text. Patch
+files carry the license of the project they modify: Wine and the NVIDIA wrappers
+(LGPL-2.1-or-later), vkd3d-proton (LGPL-2.1-or-later), DXVK (zlib/libpng).
 
 ---
 
 ## Disclaimer
 
-Neutron is an independent, open-source compatibility tool. It is **not** affiliated with,
-associated with, authorized by, endorsed by, or in any way officially connected to Adobe Inc. or
-any of its subsidiaries. All product names, logos, and brands are property of their respective
-owners. Users must provide their own legally acquired licenses and accounts to download and run
-software within this compatibility layer.
+Neutron is an independent project by Nico LaFoucate and Ficus Media Group. Adobe and its product
+names are trademarks of Adobe Inc. Neutron is not affiliated with or endorsed by Adobe.
+
+Users must provide their own legally acquired Adobe licenses and accounts.

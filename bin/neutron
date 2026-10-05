@@ -1866,13 +1866,15 @@ CEP_MANIFEST_BACKUP_SUFFIX = ".pre-neutron-cepflags"
 
 def _cep_manifests(prefix):
     """Every installed CEP extension manifest, as (extension_id, path)."""
-    user = prefix_user(prefix) or "nuck"
+    user = prefix_user(prefix)
     roots = [
         os.path.join(prefix, "drive_c", "Program Files (x86)", "Common Files",
                      "Adobe", "CEP", "extensions"),
-        os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming",
-                     "Adobe", "CEP", "extensions"),
     ]
+    # Per-user extensions only when the prefix has a real user dir -- never a guessed name.
+    if user:
+        roots.append(os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming",
+                                  "Adobe", "CEP", "extensions"))
     out = []
     for root in roots:
         if not os.path.isdir(root):
@@ -4603,11 +4605,10 @@ def cmd_launch(args):
     #
     # ⛔ Do NOT "fix" this in Wine. Windows' getaddrinfo prefers a global IPv6 address in
     # exactly the same way (RFC 6724); Wine matches Windows here. It only LOOKS
-    # Windows-specific because VPN-on-Windows removes the IPv6 address from the
-    # adapter, while VPN-on-Linux blocks IPv6 and leaves the ISP address in place.
+    # Windows-specific because some VPN clients remove the IPv6 address from the adapter
+    # on Windows, while on Linux they block IPv6 and leave the ISP address in place.
     # Reordering DNS inside Wine would be Wine deviating from Windows for every app.
-    # The real fix is the network: `VPN tunnel set ipv6 on`, or drop IPv6 on the
-    # interface. See docs/wiki/APPS.md "Captioneer licence 101".
+    # The real fix is the network: enable IPv6 in the VPN, or drop IPv6 on the interface.
     _node_opts = env.get("NODE_OPTIONS", "")
     if "--dns-result-order" not in _node_opts:
         env["NODE_OPTIONS"] = (_node_opts + " --dns-result-order=ipv4first").strip()

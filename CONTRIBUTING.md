@@ -14,7 +14,6 @@ are welcome — please open an issue to discuss approach before large PRs.
 - **Never commit a Wine prefix or build artifacts** (see `.gitignore`).
 
 ## Where things are
-- `STATE.md` — the working configuration and what each production patch does.
-- `docs/` — the architecture map and the full investigation.
-- `patches/production/` — shipping fixes. `patches/diagnostic/` — reference probes (don't ship).
+- `bin/neutron` — the CLI.
+- `patches/production/` — shipping fixes.
 - `scripts/` — build, run, export daemon.
