@@ -3403,9 +3403,8 @@ def cmd_prefix_provision(args):
     registry provisioning (Wayland graphics driver, the Segoe UI->Adobe Clean
     font fix, the native DLL overrides); (3) place the Adobe-suite DXVK config.
 
-    NOT yet automated (reported under `deferred`): staging the native DLL *files*
-    (dxcore/dcomp/nvapi64) from the Neutron runtime, licensing/activation, and
-    desktop-entry/MIME creation. Those are the remaining P1 chunks."""
+    Also stages the runtime bundle's native DLL files (`files_staged`) and its overrides.
+    Licensing/activation is never ours (it happens inside the Adobe app)."""
     prefix = resolve_prefix(args.path)
     if not prefix:
         die({"ok": False, **bad_prefix_reason(getattr(args, "prefix", None) or getattr(args, "path", None))},
@@ -4396,18 +4395,14 @@ def cmd_launch(args):
         die({"launched": False,
              "reason": "this runtime would RE-STAMP the prefix and revert its patched natives "
                        "(wine runs `wineboot -u` when the stamps differ)",
-             # ⚠️ Do NOT claim provision re-stages the natives. It does not: its own docstring
-             # says staging the native DLL *files* (dxcore/dcomp/nvapi64) is NOT yet automated
-             # and is reported under `deferred`, and its FIRST action is the `wineboot -u` that
-             # reverts them. A build tester followed this advice on 2026-09-08, backed the
-             # natives up by hand first, and only got away with it because 11.10-77 happened to
-             # ship its own copies of all three. A drop that shipped none would have left a hole
-             # with no automated recovery -- which is exactly what the docstring warns about.
-             "fix": "back up the prefix's patched natives (dcomp/dxcore/nvapi64) FIRST, then run "
-                    "`neutron prefix provision %s` — it re-stamps and bakes the registry, but "
-                    "does NOT restage native DLL files (see `deferred` in its output); restore "
-                    "any the new runtime does not ship. Or pass --allow-restamp to accept the "
-                    "clobber knowingly." % prefix,
+             # Provision re-stamps the prefix for THIS runtime: its `wineboot -u` installs this
+             # runtime's own (patched) builtins, and it then restages the bundle's native DLLs
+             # (`files_staged` in its output; that code dates from 2026-07-17). The 2026-09-08
+             # "back up dcomp/dxcore/nvapi64 by hand first" advice was written from a stale
+             # docstring; under a runtime-only install there is nothing to back up.
+             "fix": "run `neutron prefix provision %s` — it re-stamps the prefix for this runtime "
+                    "and restages Neutron's DLLs. Or pass --allow-restamp to launch anyway."
+                    % prefix,
              "prefix_is_stamped_for": (", ".join(also) if also
                                        else "no installed runtime (stamp %d)"
                                             % mismatch["prefix_stamp"]),
