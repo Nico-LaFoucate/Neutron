@@ -2664,24 +2664,268 @@ def cmd_fonts_repair(args):
     return EX_OK if ok else EX_FAIL
 
 
-def detect_scale():
-    """Best-effort primary-monitor scale (KDE). Returns float or None. Collider
-    normally passes --scale; this is the direct-CLI fallback. (DE-specific: KDE
-    kscreen-doctor; GNOME/wlroots would need their own source.)"""
+# --- display scale --------------------------------------------------------------------------
+# Adobe apps are System-DPI-aware: they read ONE dpi at startup, LogPixels = round(96 * scale).
+# Each desktop reports its scale differently, so detection dispatches by compositor and falls
+# back to a compositor-agnostic Wayland probe. Only Windows scale steps (dpi a multiple of 24:
+# 100/125/150/175/200%...) render exactly: Adobe rounds its UI scale to 2 decimals, and at 170%
+# Premiere's rulers drew 0.47% stretched. Collider passes --scale; this is the CLI's own source.
+
+def _run_json(cmd, env=None):
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+                           env=env)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _scale_kde():
+    """KDE: kscreen-doctor. Primary = the enabled output with priority 1, else the max."""
     if not have("kscreen-doctor"):
         return None
-    try:
-        r = subprocess.run(["kscreen-doctor", "--json"], stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=5)
-        data = json.loads(r.stdout or b"{}")
-        outs = [o for o in data.get("outputs", []) if o.get("enabled")]
-        prim = next((o for o in outs if o.get("priority") == 1), None)
-        if prim and prim.get("scale"):
-            return float(prim["scale"])
-        scales = [float(o["scale"]) for o in outs if o.get("scale")]
-        return max(scales) if scales else None
-    except Exception:
+    data = _run_json(["kscreen-doctor", "--json"]) or {}
+    outs = [o for o in data.get("outputs", []) if o.get("enabled") and o.get("scale")]
+    if not outs:
         return None
+    prim = next((o for o in outs if o.get("priority") == 1), None) or \
+        max(outs, key=lambda o: float(o["scale"]))
+    return {"scale": float(prim["scale"]), "output": prim.get("name"), "source": "kde"}
+
+
+def _scale_gnome():
+    """GNOME/Mutter: org.gnome.Mutter.DisplayConfig.GetCurrentState via busctl's JSON. Each
+    logical monitor is (x, y, scale, transform, primary, monitors, props); use the primary."""
+    if not have("busctl"):
+        return None
+    data = _run_json(["busctl", "--user", "--json=short", "call", "org.gnome.Mutter.DisplayConfig",
+                      "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig",
+                      "GetCurrentState"])
+    try:
+        lms = data["data"][2]
+    except (TypeError, KeyError, IndexError):
+        return None
+    if not lms:
+        return None
+    lm = next((m for m in lms if m[4]), None) or max(lms, key=lambda m: float(m[2]))
+    name = lm[5][0][0] if lm[5] else None
+    return {"scale": float(lm[2]), "output": name, "source": "gnome"}
+
+
+def _v120(scale, w=None, h=None):
+    """Scale as a wp_fractional_scale client receives it: round(scale*120)/120. Hyprland <= 0.56.1
+    prints 2 decimals (5/3 -> 1.67); pick the 1/120 step that divides the mode cleanly."""
+    n = round(scale * 120)
+    if w and h:
+        for k in (n, n - 1, n + 1):
+            if k > 0 and abs(k / 120 - scale) <= 0.0051 and (w * 120) % k == 0 \
+                    and (h * 120) % k == 0:
+                return k / 120
+    return n / 120
+
+
+def _scale_wlroots():
+    """Sway (swaymsg) / Hyprland (hyprctl) / other wlroots (wlr-randr). No 'primary' exists:
+    use the focused output (new windows open there), else the largest scale."""
+    def pick(outs, source):
+        if not outs:
+            return None
+        o = next((o for o in outs if o[2]), None) or max(outs, key=lambda o: o[1])
+        return {"scale": o[1], "output": o[0], "source": source}
+    desk = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or "hyprland" in desk:
+        if have("hyprctl"):
+            env = None
+            if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+                wl = os.environ.get("WAYLAND_DISPLAY")
+                inst = [i for i in _run_json(["hyprctl", "instances", "-j"]) or []
+                        if not wl or i.get("wl_socket") == wl]
+                env = ({**os.environ, "HYPRLAND_INSTANCE_SIGNATURE": inst[0]["instance"]}
+                       if len(inst) == 1 else None)
+            r = pick([(m.get("name"), _v120(float(m["scale"]), m.get("width"), m.get("height")),
+                       bool(m.get("focused")))
+                      for m in _run_json(["hyprctl", "-j", "monitors"], env) or []
+                      if (m.get("scale") or 0) > 0], "hyprland")
+            if r:
+                return r
+    elif have("swaymsg"):
+        cmd = ["swaymsg", "-t", "get_outputs", "--raw"]
+        sock_ok = bool(os.environ.get("SWAYSOCK"))
+        if not sock_ok:   # upstream sway doesn't export SWAYSOCK to .desktop launches
+            rt = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+            live = [sk for sk in glob.glob(f"{rt}/sway-ipc.{os.getuid()}.*.sock")
+                    if os.path.exists("/proc/" + sk.rsplit(".", 2)[-2])]
+            if len(live) == 1:
+                cmd[1:1] = ["-s", live[0]]
+                sock_ok = True
+        if sock_ok:
+            r = pick([(o.get("name"), _v120(float(o["scale"])), bool(o.get("focused")))
+                      for o in _run_json(cmd) or []
+                      if o.get("active") and not o.get("non_desktop")
+                      and (o.get("scale") or 0) > 0], "sway")
+            if r:
+                return r
+    if have("wlr-randr"):
+        return pick([(o.get("name"), _v120(float(o["scale"])), False)
+                     for o in _run_json(["wlr-randr", "--json"]) or []
+                     if o.get("enabled") and (o.get("scale") or 0) > 0], "wlr-randr")
+    return None
+
+
+def _wayland_outputs(timeout=2.0):
+    """Any compositor: per-output scale exactly as winewayland computes it (mode width over
+    xdg-output logical width). A minimal stdlib Wayland client; None if it can't connect."""
+    import socket
+    import struct
+    d = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+    path = d if d.startswith("/") else os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), d)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    ids, buf, outs, xdg = [1], bytearray(), {}, {}
+
+    def new():
+        ids[0] += 1
+        return ids[0]
+
+    def send(obj, op, p=b""):
+        s.sendall(struct.pack("<II", obj, (8 + len(p)) << 16 | op) + p)
+
+    def wstr(t):
+        b = t.encode() + b"\0"
+        return struct.pack("<I", len(b)) + b + bytes(-len(b) % 4)
+
+    def rstr(b, o):
+        n = struct.unpack_from("<I", b, o)[0]
+        return b[o + 4:o + 3 + n].decode("utf-8", "replace"), o + 4 + n + (-n % 4)
+
+    def roundtrip(handle):
+        cb = new()
+        send(1, 0, struct.pack("<I", cb))                       # wl_display.sync
+        while True:
+            while len(buf) >= 8:
+                obj, so = struct.unpack_from("<II", buf)
+                if len(buf) < so >> 16:
+                    break
+                body = bytes(buf[8:so >> 16])
+                del buf[:so >> 16]
+                if obj == cb:
+                    return
+                if obj == 1 and (so & 0xffff) == 0:
+                    raise OSError("wl_display.error")
+                handle(obj, so & 0xffff, body)
+            chunk = s.recv(65536)
+            if not chunk:
+                raise OSError("closed")
+            buf.extend(chunk)
+    try:
+        s.connect(path)
+        reg, globs = new(), []
+        send(1, 1, struct.pack("<I", reg))                     # wl_display.get_registry
+
+        def on_global(obj, op, b):
+            if obj == reg and op == 0:
+                iface, o = rstr(b, 4)
+                globs.append((struct.unpack_from("<I", b)[0], iface,
+                              struct.unpack_from("<I", b, o)[0]))
+        roundtrip(on_global)
+
+        def bind(name, iface, ver):
+            i = new()
+            send(reg, 0, struct.pack("<I", name) + wstr(iface) + struct.pack("<II", ver, i))
+            return i
+        mgr = None
+        for name, iface, ver in globs:
+            if iface == "wl_output":
+                outs[bind(name, iface, min(ver, 4))] = {"transform": 0, "int_scale": 1}
+            elif iface == "zxdg_output_manager_v1":
+                mgr = bind(name, iface, min(ver, 3))
+        for oid in (outs if mgr else ()):
+            x = new()
+            send(mgr, 1, struct.pack("<II", x, oid))           # get_xdg_output
+            xdg[x] = oid
+
+        def on_event(obj, op, b):
+            if obj in outs:
+                o = outs[obj]
+                if op == 0:
+                    o["transform"] = struct.unpack_from("<i", b, len(b) - 4)[0]
+                elif op == 1 and struct.unpack_from("<I", b)[0] & 1:
+                    o["mode"] = struct.unpack_from("<ii", b, 4)
+                elif op == 3:
+                    o["int_scale"] = struct.unpack_from("<i", b)[0]
+                elif op == 4:
+                    o["name"] = rstr(b, 0)[0]
+            elif obj in xdg:
+                o = outs[xdg[obj]]
+                if op == 0:
+                    o["pos"] = struct.unpack_from("<ii", b)
+                elif op == 1:
+                    o["logical"] = struct.unpack_from("<ii", b)
+                elif op == 3:
+                    o.setdefault("name", rstr(b, 0)[0])
+        roundtrip(on_event)
+    except (OSError, struct.error):
+        return None
+    finally:
+        s.close()
+    res = []
+    for o in outs.values():
+        if "mode" not in o:
+            continue
+        mw = o["mode"][1] if o["transform"] & 1 else o["mode"][0]   # logical is rotated, mode not
+        lw = o.get("logical", (mw,))[0] or mw
+        physical = lw == mw and o["int_scale"] > 1                     # Mutter physical layout
+        sc = o["int_scale"] if physical else mw / lw
+        res.append({"output": o.get("name"), "pos": tuple(o.get("pos", (0, 0))),
+                    "scale": round(sc * 120) / 120})
+    return res
+
+
+def _scale_probe():
+    """Generic fallback: Wine's primary rule (the output at 0,0), else the largest scale."""
+    outs = _wayland_outputs()
+    if not outs:
+        return None
+    o = next((o for o in outs if o["pos"] == (0, 0)), None) or max(outs, key=lambda o: o["scale"])
+    return {"scale": o["scale"], "output": o["output"], "source": "wayland"}
+
+
+def detect_scale_info():
+    """{scale, dpi, output, source, windows_step} for the monitor Adobe will start on, or None."""
+    desk = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    if "kde" in desk or "plasma" in desk:
+        order = (_scale_kde, _scale_probe)
+    elif "gnome" in desk:
+        order = (_scale_gnome, _scale_probe)
+    elif (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or os.environ.get("SWAYSOCK")
+          or any(w in desk for w in ("hyprland", "sway", "river", "wayfire", "labwc"))):
+        order = (_scale_wlroots, _scale_probe)
+    else:
+        order = (_scale_kde, _scale_gnome, _scale_wlroots, _scale_probe)
+    for fn in order:
+        try:
+            r = fn()
+        except Exception:
+            r = None
+        if r and r.get("scale", 0) > 0:
+            dpi = round(96 * r["scale"])
+            return {**r, "dpi": dpi, "windows_step": dpi % 24 == 0}
+    return None
+
+
+def detect_scale():
+    """Back-compat: just the scale (float) or None."""
+    info = detect_scale_info()
+    return info["scale"] if info else None
+
+
+def windows_step_warning(dpi):
+    """The warning shown when a scale isn't a Windows step, or None."""
+    if dpi is None or dpi % 24 == 0:
+        return None
+    return ("display scale %d%% isn't a Windows scale step; Adobe apps may draw slightly "
+            "misaligned. Use 100, 125, 150 or 200%% (or 175%% where your desktop offers it)."
+            % round(dpi * 100 / 96))
 
 
 def ensure_dxvk_gpl(conf_path, full_body=None):
@@ -4632,8 +4876,15 @@ def cmd_launch(args):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "wayland")
         # auto-DPI: LogPixels = round(96 * scale) so System-DPI-aware Adobe apps
         # render at device resolution; the wp_fractional_scale patch maps it 1:1.
-        scale = args.scale if getattr(args, "scale", None) else detect_scale()
+        if getattr(args, "scale", None):
+            scale, _scale_src = args.scale, "--scale"
+        else:
+            _si = detect_scale_info()
+            scale, _scale_src = (_si["scale"], _si["source"]) if _si else (None, None)
         logpixels = round(96 * scale) if (scale and scale > 0) else None
+        _warn = windows_step_warning(logpixels)
+        if _warn:
+            log("WARNING: " + _warn)
         if logpixels:
             reg_set(wine, prefix, r"HKCU\Control Panel\Desktop", "LogPixels",
                     "REG_DWORD", str(logpixels))
@@ -4642,7 +4893,7 @@ def cmd_launch(args):
                         PROVISION_DXVK_CONF_BODIES.get(profile.get("dxvk_conf")))
         env.pop("DISPLAY", None)
         env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
-        log(f"display: wayland | scale={scale} LogPixels={logpixels}")
+        log(f"display: wayland | scale={scale} ({_scale_src or 'not detected'}) LogPixels={logpixels}")
     else:
         # ⛔ NO AUTOMATIC X11. EVER.
         #
@@ -5967,6 +6218,30 @@ def _runtime_version_of(wine):
     return root[len("neutron-wine-"):] if root.startswith("neutron-wine-") else None
 
 
+def cmd_display(args):
+    """The display scale Neutron will use for Adobe apps, where it came from, and every output."""
+    info = detect_scale_info()
+    out = {"ok": bool(info), **(info or {}), "outputs": _wayland_outputs() or [],
+           "warning": windows_step_warning(info["dpi"]) if info else None}
+    if not info:
+        out["reason"] = ("could not detect the display scale; pass --scale to `neutron launch` "
+                         "or set it in Collider")
+    if args.json:
+        emit(out, True)
+    else:
+        if info:
+            print("scale %s%%  (%d dpi)  on %s  via %s" % (round(info["scale"] * 100, 2),
+                  info["dpi"], info.get("output") or "?", info["source"]))
+        else:
+            print(out["reason"])
+        for o in out["outputs"]:
+            print("  output %-12s %s%%  at %s" % (o["output"], round(o["scale"] * 100, 2),
+                                                 o["pos"]))
+        if out["warning"]:
+            print("⚠️  " + out["warning"])
+    return EX_OK if info else EX_FAIL
+
+
 def cmd_version(args):
     """Every piece's version in one place, for bug reports."""
     cli = CLI_VERSION
@@ -6026,6 +6301,9 @@ def build_parser():
     p.add_argument("--version", action="store_true",
                    help="print the version of every Neutron piece and exit")
     sub = p.add_subparsers(dest="cmd")
+
+    dp = sub.add_parser("display", help="show the display scale Neutron will use")
+    dp.set_defaults(func=cmd_display)
 
     # prefix
     pp = sub.add_parser("prefix", help="prefix inspection / provisioning")
