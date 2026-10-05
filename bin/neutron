@@ -5982,6 +5982,34 @@ def cmd_theme_apply(args):
     emit({"ok": True, **res}, args.json)
 
 
+def ntsync_status():
+    """'active' (/dev/ntsync usable), 'available' (the kernel ships the module but it isn't loaded
+    -- nothing autoloads it), or 'missing' (kernel older than 6.14 / built without it).
+    Speed only: neutron-wine falls back to wineserver sync without it, much slower for Adobe apps."""
+    if os.path.exists("/dev/ntsync") and os.access("/dev/ntsync", os.R_OK):
+        return "active"
+    rel = os.uname().release
+    if glob.glob(f"/lib/modules/{rel}/kernel/drivers/misc/ntsync.ko*") or \
+            glob.glob(f"/usr/lib/modules/{rel}/kernel/drivers/misc/ntsync.ko*"):
+        return "available"
+    try:
+        with open(f"/lib/modules/{rel}/modules.builtin") as f:
+            if "ntsync" in f.read():
+                return "available"
+    except OSError:
+        pass
+    return "missing"
+
+
+NTSYNC_DETAIL = {
+    "active": "active",
+    "available": "your kernel has ntsync but it isn't turned on — run `neutron setup` to enable "
+                 "it (asks for your password once). Without it Adobe apps run much slower.",
+    "missing": "your kernel has no ntsync (it needs Linux 6.14 or newer). Adobe apps still run, "
+               "but much slower.",
+}
+
+
 def cmd_doctor(args):
     """Health check. Powers Collider's prefix-health status surface.
 
@@ -6023,6 +6051,12 @@ def cmd_doctor(args):
     if _wine and _wine_is_neutron:
         for c in _runtime_integrity_checks(_wine):
             check(c[0], c[1], c[2])
+
+    # ntsync: speed, not correctness -- reported, never a failure.
+    _nts = ntsync_status()
+    check("ntsync", True, NTSYNC_DETAIL[_nts])
+    if _nts != "active":
+        checks[-1]["warning"] = True
 
     if args.prefix:
         prefix = resolve_prefix(args.prefix)
