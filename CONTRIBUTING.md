@@ -15,5 +15,6 @@ are welcome — please open an issue to discuss approach before large PRs.
 
 ## Where things are
 - `bin/neutron` — the CLI.
-- `patches/production/` — shipping fixes.
-- `scripts/` — build, run, export daemon.
+- `scripts/` — the ucrtbase shim the CLI builds, and the support snapshot tool.
+- `tests/` — tests for the CLI.
+- The engine's fixes live in the neutron-wine repository.

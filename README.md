@@ -152,8 +152,8 @@ focus areas:
   external finalize daemon; it was retired once the underlying fault — Microsoft's UCRT rejecting
   Wine's `\\?\` temp paths, which made the muxer skip interleaving — was fixed properly.)
 
-The engine's fixes live in [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) (the
-patched Wine runtime) and in [`patches/production/`](patches/) here.
+The engine's fixes live in [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine), the
+patched Wine runtime.
 
 ---
 
@@ -240,8 +240,8 @@ CLI above — Collider is the convenience layer for people who'd rather click th
 | Path | Contents |
 | :--- | :--- |
 | [`bin/neutron`](bin/) | The Neutron CLI — the engine front door. |
-| [`patches/production/`](patches/) | The shipping fixes (anchor-guarded, idempotent). |
-| [`scripts/`](scripts/) | Build, launch, and hardware-export helpers. |
+| [`scripts/`](scripts/) | The ucrtbase shim the CLI builds, and the support snapshot tool. |
+| [`tests/`](tests/) | Tests for the CLI. |
 
 Documentation, known issues and guides live on the wiki at
 [neutronproject.org/wiki](https://neutronproject.org/wiki/).
