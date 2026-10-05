@@ -132,14 +132,13 @@ NEUTRON_LOGS_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
     "neutron", "logs")
 
+# A dev build is selected with $NEUTRON_WINE; there are no hardcoded home-dir fallbacks.
 NEUTRON_WINE_CANDIDATES = [
     os.environ.get("NEUTRON_WINE"),
     (os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{NEUTRON_WINE_VERSION}",
                   "bin", "wine") if NEUTRON_WINE_VERSION else None),
-    os.path.join(HOME, "neutron", "dist", "wine", "bin", "wine"),
-    os.path.join(HOME, "wine-tkg-git", "wine-tkg-git", "src",
-                 "wine-tkg-staging-ntsync-git-64-build", "wine"),
 ]
+NO_RUNTIME_MSG = "neutron-wine isn't installed. Run `neutron setup` first."
 
 # GPU-vendor ICD selection (NVIDIA default; TODO: generalize per detected GPU).
 NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
@@ -1108,13 +1107,16 @@ def have(cmd):
 
 
 def resolve_wine():
-    """The Neutron-owned wine binary (Phase 1). Returns (path, is_neutron).
-    Falls back to system wine (is_neutron=False) only if no Neutron wine exists."""
+    """The Neutron-owned wine binary. Returns (path, is_neutron).
+
+    ⛔ Never falls back to the system's wine. A distro wine boots a prefix with a different
+    stamp and `wineboot -u` reverts every patched native; Mud Hut asks `runtime which` and would
+    build a brand-new prefix on it. No Neutron runtime => (None, False), and callers refuse with
+    NO_RUNTIME_MSG."""
     for c in NEUTRON_WINE_CANDIDATES:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c, True
-    sysw = shutil.which("wine")
-    return sysw, False
+    return None, False
 
 
 def _prefix_stamp(prefix):
@@ -2612,7 +2614,7 @@ def cmd_fonts_repair(args):
             EX_BADPREFIX, args.json)
     wine, is_neutron = resolve_wine()
     if not wine:
-        die({"ok": False, "reason": "no wine resolved"}, EX_DEP, args.json)
+        die({"ok": False, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
     if not is_neutron:
         die({"ok": False, "reason": "resolved wine is not a Neutron runtime; refusing to touch the "
                                     "prefix (distro wine would wineboot-clobber it)"},
@@ -3412,7 +3414,7 @@ def cmd_prefix_provision(args):
 
     wine, is_neutron = resolve_wine()
     if not wine:
-        die({"ok": False, "reason": "no wine runtime found"}, EX_FAIL, args.json)
+        die({"ok": False, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
 
     steps = []
 
@@ -3986,7 +3988,7 @@ def cmd_runtime_which(args):
             if mm:
                 out["prefix_is_stamped_for"] = mm["prefix_runtimes"]
     if not wine:
-        die({**out, "reason": "no wine found — install the Neutron runtime"}, EX_DEP, args.json)
+        die({**out, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
     emit(out, args.json)
     return EX_OK
 
@@ -4374,7 +4376,7 @@ def cmd_launch(args):
 
     wine, is_neutron = resolve_wine()
     if not wine:
-        die({"launched": False, "reason": "no Neutron wine and no system wine found"},
+        die({"launched": False, "reason": NO_RUNTIME_MSG},
             EX_DEP, args.json)
     if not is_neutron:
         log("WARNING: using system wine - Neutron patches (frame pacer / winewayland "
@@ -5693,7 +5695,7 @@ def cmd_theme_apply(args):
             die({"ok": False, "reason": "bad --colors: %s" % e}, EX_FAIL, args.json)
     wine, is_neutron = resolve_wine()
     if not wine:
-        die({"ok": False, "reason": "no wine resolved"}, EX_DEP, args.json)
+        die({"ok": False, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
     if not is_neutron:
         # ⛔ Never import through distro wine: a different-stamp wine fires wineboot -u and reverts
         # the prefix's patched natives. Refusing is the same rule the launch path follows.
@@ -5747,7 +5749,7 @@ def cmd_doctor(args):
     _wine, _wine_is_neutron = resolve_wine()
     check("wine", bool(_wine),
           (_wine + ("  (Neutron runtime)" if _wine_is_neutron else "  (system wine)")) if _wine
-          else "no wine found — install the Neutron runtime")
+          else NO_RUNTIME_MSG)
 
     # 🚨 IS THE RUNTIME ITSELF INTACT? Reported from the build tester 2026-08-25: doctor returned
     # {"ok": true, "healthy": true} against 11.10-61, a build we KNOW is defective. Resolving a
