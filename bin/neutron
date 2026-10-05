@@ -49,7 +49,16 @@ HOME = os.path.expanduser("~")
 
 # This repo's root (bin/neutron -> ..) — used to find checked-in reproducible sources
 # like scripts/ucrtshim/ that capture builds into the runtime bundle.
-NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
+# Collider); `neutron --version` prints all of them for bug reports.
+CLI_VERSION = "1.0.0-beta.1"
+NEUTRON_DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
+    "neutron")
+# What `neutron setup` installed (component -> version); read by --version.
+NEUTRON_INSTALLED_JSON = os.path.join(NEUTRON_DATA_DIR, "installed.json")
 
 # The proven launcher env (from ~/.local/bin/premiere). Single source of truth.
 PREMIERE_SUBPATH = os.path.join(
@@ -5950,6 +5959,55 @@ def cmd_doctor(args):
     return EX_OK if healthy else EX_FAIL
 
 
+def _runtime_version_of(wine):
+    """`11.10-97` for a runtime's bin/wine, else None."""
+    if not wine:
+        return None
+    root = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(wine))))
+    return root[len("neutron-wine-"):] if root.startswith("neutron-wine-") else None
+
+
+def cmd_version(args):
+    """Every piece's version in one place, for bug reports."""
+    cli = CLI_VERSION
+    try:
+        sha = subprocess.run(["git", "-C", NEUTRON_REPO, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if sha:
+            cli += " (" + sha + ")"
+    except Exception:
+        pass
+    wine, _ = resolve_wine()
+    installed = {}
+    try:
+        with open(NEUTRON_INSTALLED_JSON) as f:
+            installed = json.load(f)
+    except (OSError, ValueError):
+        pass
+    mudhut = None
+    if shutil.which("mudhut"):
+        try:
+            mudhut = subprocess.run(["mudhut", "--version"], capture_output=True, text=True,
+                                    timeout=5).stdout.strip().removeprefix("mudhut ") or None
+        except Exception:
+            mudhut = None
+    out = {"ok": True, "cli": cli,
+           "neutron_wine": _runtime_version_of(wine),
+           "neutron_wine_installed": _installed_runtime_versions(),
+           "mudhut": mudhut or installed.get("mudhut"),
+           "collider": installed.get("collider")}
+    if args.json:
+        emit(out, True)
+    else:
+        print("neutron CLI    " + out["cli"])
+        print("neutron-wine   " + (out["neutron_wine"] or "not installed")
+              + ("   (%d versions installed)" % len(out["neutron_wine_installed"])
+                 if len(out["neutron_wine_installed"]) > 1 else ""))
+        print("Mud Hut        " + (out["mudhut"] or "not installed"))
+        print("Collider       " + (out["collider"] or "unknown"))
+    return EX_OK
+
+
 # --- argument plumbing -----------------------------------------------------
 
 def build_parser():
@@ -5965,7 +6023,9 @@ def build_parser():
                         "OPT-IN on purpose: Mud Hut runs `neutron prefix provision` with INHERITED "
                         "stdout, so streaming by default would inject these lines into Mud Hut's own "
                         "event stream and Collider would read our result as Mud Hut's.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("--version", action="store_true",
+                   help="print the version of every Neutron piece and exit")
+    sub = p.add_subparsers(dest="cmd")
 
     # prefix
     pp = sub.add_parser("prefix", help="prefix inspection / provisioning")
@@ -6122,6 +6182,10 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.version:
+        return cmd_version(args)
+    if not args.cmd:
+        parser.error("a command is required (or --version)")
     try:
         return args.func(args)
     except BrokenPipeError:
