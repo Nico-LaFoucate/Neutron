@@ -239,9 +239,8 @@ PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides: Wine bui
 # ⛔ dxcore and dcomp were REMOVED here 2026-08-07. They used to be staged as `native` because the
 # patched versions had to be supplied as files; that is obsolete — a wineboot on 11.10-22+ is a
 # SELF-HEAL that installs the runtime's own PATCHED dcomp/dxcore/dwrite builtins (verified by
-# marker, not size: wiki APPS.md prefix registry). Re-adding them is not merely redundant:
-# wiki APPS.md records "do NOT re-add dcomp/dxcore/nvapi64 — they black-box PS 2026" (that note is
-# about the photoshop app profile, but the prefix-wide case points the same way). The live
+# marker, not size). Re-adding them is not merely redundant: on the Photoshop profile,
+# dcomp/dxcore/nvapi64 overrides black-box PS 2026, and the prefix-wide case points the same way. The live
 # ~/.premiere2025, which runs all seven apps, has NEITHER override.
 #
 # HKCU\Software\Wine\Fonts\Replacements — map the fonts Adobe requests but that
@@ -385,8 +384,7 @@ def _common_adobe(*parts):
 
 # Adobe background services Photoshop's NGL/RPC needs at launch (else it fatals with
 # "can't communicate with CC desktop"). Started detached before the app; torn down
-# with the prefix. Full stop-on-app-exit lifecycle is a TODO
-# (see memory neutron-ipcbroker-lifecycle-collider).
+# with the prefix. Full stop-on-app-exit lifecycle is a TODO.
 ADOBE_DAEMONS = [
     _common_adobe("Adobe Desktop Common", "ADS", "Adobe Desktop Service.exe"),
     _common_adobe("Adobe Desktop Common", "IPCBox", "AdobeIPCBroker.exe"),
@@ -506,7 +504,7 @@ APP_PROFILES = {
         #   NEUTRON_HEAP_LARGE_CACHE-- large-block heap cache.
         # ⚠️ Keep this list and premiere-soak.sh's env block in sync; if they diverge again the
         # CLI and the validated path stop testing the same thing. (3rd occurrence of "check how
-        # the app was previously validated" -- see INCIDENTS.md.)
+        # the app was previously validated".)
         "nvapi": False,
         # ⭐ 2026-08-19 — NEUTRON_WHEEL_NOTCH: snap a high-resolution mouse wheel to whole
         # notches. A hi-res wheel (HID++ multiplier 8) delivers one physical detent as an
@@ -553,7 +551,6 @@ APP_PROFILES = {
         "env": {"NEUTRON_DISABLE_BTW": "1"},
         "accent": "#31a8ff", "export": False,
         "daemons": ADOBE_DAEMONS,                # ADS + IPCBroker (PS NGL/RPC deps)
-        "post_launch": None,                     # psdock DEPRECATED: PS2025-era app-side dock hack, superseded by the win32u Wine-level dock fix (OPEN_ISSUES P3). Its ~50-nudges/10s doc-create jitter hammer = the "shake on new doc" regression (OPEN_ISSUES PS2026 line 66). win32u docks the canvas natively without it.
     },
     "lightroom": {
         "name": "Lightroom Classic",
@@ -664,7 +661,7 @@ APP_PROFILES = {
         # DXVK to make interop-shaped textures exportable. Narrowly scoped inside DXVK
         # (2D, >=512x512, BIND_UNORDERED_ACCESS, GPU-only) because a shared allocation is
         # dedicated and bypasses the suballocator. ⚠️ Needs the staged nvcuda.dll +
-        # d3d11.dll -- see preserved-fixes/patches/README-cuda-d3d11-interop.md.
+        # d3d11.dll (neutron-wine external/patches).
         # ⭐ 2026-08-03 — THE D2D/PRESENT SET. These four had lived only in ~/ae-best.sh, so a
         # plain `neutron launch aftereffects` produced a BLACK, UNRENDERED UI. I had looked at
         # them, called them unjustified carry-over from the Premiere harnesses because ae-best.sh
@@ -690,7 +687,7 @@ APP_PROFILES = {
         # profile without launching that app and checking for a ghost window behind its splash.
         # NEUTRON_D2D_CLIPCHILDREN=1 was the ONE variable `~/ae-best.sh` set that this
         # profile did not, so a menu/Collider launch never matched the config the
-        # composition was proven to render under, and APPS.md had to carry "a plain
+        # composition was proven to render under, and the app notes had to carry "a plain
         # `neutron launch aftereffects` is BLACK". Folded in so the default launch IS
         # the known-good one.
         "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_DXVK_EXPORT_TEXTURES": "1",
@@ -1124,8 +1121,7 @@ def _prefix_stamp(prefix):
     what reverts our patched natives (dwrite/dcomp/dxcore) and reads as a mass regression with no
     code change behind it.
 
-    ⚠️ The stamp file is CRLF. A naive read keeps the \\r and never matches -- the trap that cost
-    `preserved-fixes/harnesses/runtime_for_prefix.sh` its comment block.
+    ⚠️ The stamp file is CRLF. A naive read keeps the \\r and never matches.
     """
     try:
         with open(os.path.join(prefix, ".update-timestamp")) as f:
@@ -1279,7 +1275,7 @@ def session_is_wayland():
     same machine could run Wayland from Collider and X11 from the application menu, flip-flopping
     the prefix's graphics driver on every launch.
 
-    ⛔ X11 is a HARD NEVER on this project (HOME.md). A missing variable must not be able to
+    ⛔ X11 is a HARD NEVER on this project. A missing variable must not be able to
     select it. `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` existing is direct evidence a compositor is
     there; `XDG_SESSION_TYPE` is corroboration, never a veto.
     """
@@ -2270,7 +2266,7 @@ def _repair_roman_defaults(wine, prefix):
 
 # --- fonts: re-verify + repair (`neutron fonts check|repair`) ------------------------------------
 # Fonts are the highest-value check in the stack because the failures are severe and the symptom
-# never mentions fonts (wiki ROADMAP item 2, built 2026-09-13):
+# never mentions fonts (built 2026-09-13):
 #   * After Effects dies at startup ("EGG Constructor IEggApp failed") when CoolType cannot
 #     resolve its default Roman face -- _roman_default_status() / _stale_roman_cache_records().
 #   * Premiere / Media Encoder / AE do not start without the real Microsoft core fonts. Wine's
@@ -2291,7 +2287,7 @@ def _ms_core_fonts_status(prefix):
     A presence test BY DESIGN: it answers "did the real core fonts ever land here", which a
     check of times/arial/cour cannot (Wine's substitutes carry those exact filenames). It is
     blind to a faked times/arial/cour -- that is _roman_default_status()'s job. The two are
-    complementary, never interchangeable (INCIDENTS.md 2026-08-11)."""
+    complementary, never interchangeable (2026-08-11)."""
     fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
     try:
         have_files = {f.lower() for f in os.listdir(fd)}
@@ -2609,7 +2605,7 @@ def repair_prefix_fonts(wine, prefix):
     The cache is invalidated UNCONDITIONALLY, even when nothing else changed: CoolType's cache is
     keyed on filename, so any font overwritten in place (ours, or one the user copied in by hand)
     leaves a record pointing at what used to be there. Repairing the files and
-    leaving the cache is how a build tester lost three days (INCIDENTS.md 2026-08-12)."""
+    leaving the cache is how a build tester lost three days (2026-08-12)."""
     before = fonts_verdict(prefix)
     steps = []
 
@@ -4230,7 +4226,7 @@ def cmd_prefix_provision(args):
     event(args, event="progress", stage="lrc", pct=70, msg="registering the Lightroom → Photoshop detector key")
     # 2c. Lightroom Classic's "Edit in Photoshop" detector: register the dot-free
     # PHSP<major> Uninstall key so LrC's whole-string regex_match finds PS (see
-    # provision_photoshop_detection + memory neutron-lrc-editin-photoshop). No-op
+    # provision_photoshop_detection). No-op
     # when no Photoshop is installed in this prefix.
     ps_detect = provision_photoshop_detection(wine, prefix)
     if ps_detect is not None:
@@ -4559,8 +4555,7 @@ def cmd_prefix_provision(args):
 #      These are the ONLY ones a tester ever needs, and until 2026-08-27 they had no interface at
 #      all: the name lived in a handoff document, had to be typed exactly, could not be set on a
 #      menu or dock launch, and a typo silently did nothing while looking like a clean negative
-#      result. That is the same shape as every "harness was broken, not the code" incident in
-#      INCIDENTS.md.
+#      result. That is the same shape as every "harness was broken, not the code" incident.
 #
 # So the env var stays as the TRANSPORT to the C code -- that is just how a DLL reads a setting --
 # and stops being the INTERFACE. `neutron gates` lists them; `launch --without <name>` sets one,
@@ -4887,61 +4882,6 @@ def cmd_runtime_install(args):
     return EX_OK
 
 
-def _stage_and_inject_psdock(prefix, wine, env):
-    """Photoshop dock helper: stage neutron_psdock.dll + the injector into the
-    prefix, then arm the SAME detached inject-waiter scripts/launch-photoshop.sh
-    uses — a backgrounded bash loop that injects once PS is ready (>=150 threads)
-    so File>New docks. Spawned DEVNULL'd + start_new_session so it never holds this
-    CLI's stdout pipe (Collider's run_json reads to EOF) and outlives the CLI.
-    Best-effort; never affects the launch. Set NEUTRON_PSDOCK_DEBUG=1 to log to
-    <prefix>/drive_c/neutron_psdock_inject.log."""
-    import shutil
-    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # neutron repo root (realpath: neutron is invoked via a ~/.local/bin symlink)
-    dll_src = os.path.join(root, "src", "neutron_psdock.dll")
-    inj_src = os.path.join(root, "src", "neutron_psinject.exe")
-    if not (os.path.isfile(dll_src) and os.path.isfile(inj_src)):
-        log("psdock: helper files missing (src/neutron_psdock.*) - File>New docking inactive")
-        return
-    dll_dst = os.path.join(prefix, "drive_c", "windows", "system32", "neutron_psdock.dll")
-    inj_dst = os.path.join(prefix, "drive_c", "neutron_psinject.exe")
-    try:
-        os.makedirs(os.path.dirname(dll_dst), exist_ok=True)
-        shutil.copyfile(dll_src, dll_dst); os.chmod(dll_dst, 0o755)
-        shutil.copyfile(inj_src, inj_dst); os.chmod(inj_dst, 0o755)
-    except OSError as e:
-        log(f"psdock: staging failed: {e}")
-        return
-
-    # The exact inject-waiter from launch-photoshop.sh, run detached + DEVNULL'd.
-    waiter = (
-        'exec >>"$DBG" 2>&1\n'
-        'echo "[psdock] armed $(date)"\n'
-        'for i in $(seq 1 120); do\n'
-        '  for d in /proc/[0-9]*; do\n'
-        '    cl=$(tr "\\0" " " < "$d/cmdline" 2>/dev/null)\n'
-        '    case "$cl" in *Photoshop.exe*)\n'
-        '      t=$(ls "$d/task" 2>/dev/null | wc -l)\n'
-        '      if [ "$t" -ge 150 ]; then echo "[psdock] PS ready t=$t; injecting"; sleep 3; "$WINE_BIN" "$INJ"; echo "[psdock] injected rc=$?"; exit 0; fi;;\n'
-        '    esac\n'
-        '  done\n'
-        '  sleep 1\n'
-        'done\n'
-        'echo "[psdock] PS never reached ready state"\n'
-    )
-    wenv = dict(env)
-    wenv["WINE_BIN"] = wine
-    wenv["INJ"] = inj_dst
-    wenv["DBG"] = (os.path.join(prefix, "drive_c", "neutron_psdock_inject.log")
-                   if os.environ.get("NEUTRON_PSDOCK_DEBUG") else os.devnull)
-    try:
-        subprocess.Popen(["bash", "-c", waiter], env=wenv,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-        log("psdock: dock-inject waiter armed")
-    except Exception as e:
-        log(f"psdock: could not arm waiter: {e}")
-
-
 def cmd_launch(args):
     """Launch an app through the Neutron stack. Returns the spawned PID.
     Profile-driven: the per-app exe/env/overrides come from APP_PROFILES so the
@@ -5251,7 +5191,7 @@ def cmd_launch(args):
         # so the same machine could run Wayland from Collider and X11 from the application menu,
         # rewriting the prefix's graphics driver on every launch.
         #
-        # X11 is a HARD NEVER on this project (HOME.md): the winewayland work -- fractional
+        # X11 is a HARD NEVER on this project: the winewayland work -- fractional
         # scale, the present path, decorations, drag-and-drop, the owned-window coordinate
         # fixes -- is where every fix of the last two months lives. Silently degrading into the
         # one configuration we have ruled out, and persisting it into the user's installation,
@@ -5413,10 +5353,6 @@ def cmd_launch(args):
         die({"launched": False, "pid": proc.pid,
              "reason": f"process exited immediately (code {proc.returncode})"},
             EX_FAIL, args.json)
-
-    # Post-launch hook: Photoshop's dock-helper inject (File>New docks the workspace).
-    if profile.get("post_launch") == "psdock":
-        _stage_and_inject_psdock(prefix, wine, env)
 
     # `log` is returned so Collider can surface "open log" in the UI and so a bug
     # report can name the exact file without the user hunting for it.
@@ -6150,8 +6086,8 @@ def _app_running_pid(exe, prefix=None):
 
     ⛔ Matches on /proc/<pid>/exe and the FULL windows path in the cmdline — never a loose
     substring of the app NAME. A cmdline match on something like "premiere" also matches the
-    grep, the launcher, and this very process; that trap has cost real time before
-    (preserved-fixes/harnesses/premiere_live.py exists because of it). Skips our own pid.
+    grep, the launcher, and this very process; that trap has cost real time before. Skips our
+    own pid.
     """
     if not exe:
         return None
