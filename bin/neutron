@@ -4849,7 +4849,7 @@ def cmd_runtime_install(args):
                 + (f" ({size/(1<<20):.1f} MiB)" if isinstance(size, int) else ""))
         tarball = os.path.join(tmp, artifact)
         try:
-            _download(art_url, tarball, args.json)
+            _download(art_url, tarball, args.json and not getattr(args, "show_progress", False))
         except (urllib.error.URLError, OSError) as e:
             die({"ok": False, "reason": f"download failed: {e}", "url": art_url},
                 EX_FAIL, args.json)
@@ -4998,13 +4998,13 @@ def cmd_launch(args):
              "reason": "this runtime would RE-STAMP the prefix and revert its patched natives "
                        "(wine runs `wineboot -u` when the stamps differ)",
              # Provision re-stamps the prefix for THIS runtime: its `wineboot -u` installs this
-             # runtime's own (patched) builtins, and it then restages the bundle's native DLLs
-             # (`files_staged` in its output; that code dates from 2026-07-17). The 2026-09-08
-             # "back up dcomp/dxcore/nvapi64 by hand first" advice was written from a stale
-             # docstring; under a runtime-only install there is nothing to back up.
-             "fix": "run `neutron prefix provision %s` — it re-stamps the prefix for this runtime "
-                    "and restages Neutron's DLLs. Or pass --allow-restamp to launch anyway."
-                    % prefix,
+             # runtime's own (patched) builtins, and stage_natives then restages the runtime's
+             # DXVK / vkd3d-proton / NVIDIA DLLs. The usual cause is `neutron update` installing a
+             # newer runtime: prefixes stay on theirs until moved, by design.
+             "fix": "this prefix was set up with another neutron-wine version (after `neutron "
+                    "update`, prefixes stay on their version until you move them). Run `neutron "
+                    "prefix provision %s` to move it to this one: it re-stamps the prefix and "
+                    "restages Neutron's DLLs. Or pass --allow-restamp to launch anyway." % prefix,
              "prefix_is_stamped_for": (", ".join(also) if also
                                        else "no installed runtime (stamp %d)"
                                             % mismatch["prefix_stamp"]),
@@ -6683,6 +6683,464 @@ def cmd_version(args):
     return EX_OK
 
 
+# --- setup / update / uninstall ------------------------------------------------------------------
+# One command installs everything (DECISIONS G1): our builds come from our GitHub releases,
+# Microsoft's files from Microsoft, Adobe's ACCCx from Adobe (through Mud Hut). Every download is
+# checked: the runtime against its manifest's sha256, the others against their release's
+# SHA256SUMS, Microsoft's files against MS_FILES. Collider's "Set up" button runs `neutron setup`.
+GITHUB_OWNER = os.environ.get("NEUTRON_GITHUB_OWNER", "Nico-LaFoucate")
+NEUTRON_BIN_DIR = os.path.join(NEUTRON_DATA_DIR, "bin")          # the installed CLI + mudhut
+NEUTRON_COLLIDER_DIR = os.path.join(NEUTRON_DATA_DIR, "collider")
+LOCAL_BIN = os.path.join(HOME, ".local", "bin")
+APPS_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
+                        "applications")
+# piece -> (GitHub repo, how to recognize its release asset)
+RELEASE_PIECES = {
+    "cli": ("neutron", lambda n: n == "neutron"),
+    "mudhut": ("Mud-Hut", lambda n: n == "mudhut"),
+    "collider": ("Collider", lambda n: n.endswith(".AppImage")),
+}
+
+
+def _installed():
+    try:
+        with open(NEUTRON_INSTALLED_JSON) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_installed(data):
+    os.makedirs(NEUTRON_DATA_DIR, exist_ok=True)
+    tmp = NEUTRON_INSTALLED_JSON + ".part"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, NEUTRON_INSTALLED_JSON)
+
+
+def _gh_latest(repo):
+    """The release GitHub marks Latest for <owner>/<repo> (pre-releases never are):
+    {"version", "assets": {name: url}}. Raises RuntimeError with a readable reason."""
+    import urllib.error, urllib.request
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": "neutron-cli",
+                                               "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rel = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError(f"{GITHUB_OWNER}/{repo} has no published release yet")
+        raise RuntimeError(f"GitHub answered {e.code} for {GITHUB_OWNER}/{repo}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise RuntimeError(f"could not reach GitHub ({e})")
+    return {"version": rel.get("tag_name", "").lstrip("v"),
+            "assets": {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}}
+
+
+def _local_release(src_dir, match):
+    """--from DIR: the same shape as _gh_latest, from files in a directory."""
+    names = sorted(os.listdir(src_dir))
+    assets = {n: "file://" + os.path.abspath(os.path.join(src_dir, n)) for n in names}
+    hit = next((n for n in names if match(n)), None)
+    return {"version": None, "assets": assets, "hit": hit}
+
+
+def _sha256sums(assets):
+    """{name: sha256} from a release's SHA256SUMS asset, or {} when it has none."""
+    import tempfile
+    url = assets.get("SHA256SUMS")
+    if not url:
+        return {}
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "SHA256SUMS")
+        _download(url, p, as_json=True)
+        out = {}
+        with open(p) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2:
+                    out[parts[1].lstrip("*")] = parts[0].lower()
+        return out
+
+
+def _fetch_piece(piece, dest, as_json, src_dir=None):
+    """Download one piece's release asset to `dest`, verified. Returns its version (None when it
+    came from --from without one)."""
+    repo, match = RELEASE_PIECES[piece]
+    rel = _local_release(src_dir, match) if src_dir else _gh_latest(repo)
+    name = rel.get("hit") or next((n for n in rel["assets"] if match(n)), None)
+    if not name:
+        raise RuntimeError(f"the {repo} release has no {piece} file")
+    sums = _sha256sums(rel["assets"])
+    if not sums.get(name) and not src_dir:
+        raise RuntimeError(f"the {repo} release lists no checksum for {name}")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    if not as_json:
+        log(f"downloading {name}" + (f" {rel['version']}" if rel["version"] else ""))
+    _download(rel["assets"][name], part, as_json)
+    if sums.get(name) and _sha256_file(part) != sums[name]:
+        os.remove(part)
+        raise RuntimeError(f"{name}: checksum mismatch (corrupt or tampered download)")
+    os.chmod(part, 0o755)
+    os.replace(part, dest)
+    return rel["version"]
+
+
+def _link_on_path(name, target):
+    """~/.local/bin/<name> -> target. Never replaces a file that is not a symlink (someone's own
+    wrapper); says so instead. Returns a short status string."""
+    os.makedirs(LOCAL_BIN, exist_ok=True)
+    link = os.path.join(LOCAL_BIN, name)
+    if os.path.lexists(link) and not os.path.islink(link):
+        return f"kept your own {link} (not a link); it is used instead of Neutron's"
+    if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(target):
+        return f"{link} ok"
+    tmp = link + ".neutron-tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, link)
+    return f"{link} -> {target}"
+
+
+def _install_cli(as_json):
+    """Put this CLI where setup keeps it. A git checkout (development) is linked, not copied, so
+    `git pull` keeps updating it; anything else is copied into NEUTRON_BIN_DIR."""
+    this = os.path.realpath(__file__)
+    if os.path.isdir(os.path.join(NEUTRON_REPO, ".git")):
+        return this, "git checkout (update it with git pull)"
+    dest = os.path.join(NEUTRON_BIN_DIR, "neutron")
+    if os.path.realpath(dest) != this:
+        os.makedirs(NEUTRON_BIN_DIR, exist_ok=True)
+        shutil.copyfile(this, dest + ".part")
+        os.chmod(dest + ".part", 0o755)
+        os.replace(dest + ".part", dest)
+    return dest, CLI_VERSION
+
+
+def _install_runtime(args, src_dir=None, version=None):
+    """Install a neutron-wine runtime through cmd_runtime_install: the release GitHub marks Latest,
+    a named version (testers: pre-releases), or the newest manifest in --from DIR."""
+    import tempfile, types
+    ns = types.SimpleNamespace(version=version, repo=None, manifest=None, force=False,
+                               json=True, show_progress=not args.json)
+    if src_dir:
+        mans = sorted((n for n in os.listdir(src_dir) if n.endswith(".manifest.json")),
+                      key=lambda n: [int(x) if x.isdigit() else x
+                                     for x in re.split(r"[.-]", n)])
+        if not mans:
+            raise RuntimeError(f"no neutron-wine-*.manifest.json in {src_dir}")
+        with open(os.path.join(src_dir, mans[-1])) as f:
+            man = json.load(f)
+        man["url"] = "file://" + os.path.abspath(os.path.join(src_dir, man["artifact"]))
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(man, tmp)
+        tmp.close()
+        ns.manifest, ns.version = tmp.name, str(man["version"])
+    elif not version:
+        rel = _gh_latest(NEUTRON_WINE_REPO.split("/", 1)[1])
+        man = next((n for n in rel["assets"] if n.endswith(".manifest.json")), None)
+        if not man:
+            raise RuntimeError("the latest neutron-wine release has no manifest")
+        ns.manifest, ns.version = rel["assets"][man], rel["version"]
+    import io, contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cmd_runtime_install(ns)
+    except SystemExit:
+        pass
+    finally:
+        if src_dir:
+            os.remove(ns.manifest)
+    try:
+        res = json.loads(buf.getvalue().strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise RuntimeError("runtime install produced no result")
+    if not res.get("ok"):
+        raise RuntimeError(res.get("reason", "runtime install failed"))
+    return res["version"], res["status"]
+
+
+def _collider_desktop_entry(appimage):
+    """Neutron Collider in the application menu. PATH is spelled out because a menu launch may
+    not include ~/.local/bin, and Collider runs `neutron` and `mudhut` from PATH."""
+    import tempfile
+    if os.path.exists(os.path.join(APPS_DIR, "collider.desktop")):
+        return "kept the existing collider.desktop"
+    icon = "neutron-collider"
+    icon_dir = os.path.join(os.path.dirname(APPS_DIR), "icons", "hicolor", "256x256", "apps")
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            subprocess.run([appimage, "--appimage-extract", "*.png"], cwd=d, timeout=60,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            pngs = sorted((p for p in glob.glob(os.path.join(d, "squashfs-root", "*.png"))
+                           if os.path.isfile(p)), key=os.path.getsize)   # skips dangling links
+            if pngs:
+                os.makedirs(icon_dir, exist_ok=True)
+                shutil.copyfile(pngs[-1], os.path.join(icon_dir, icon + ".png"))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    path = ":".join([LOCAL_BIN, "/usr/local/bin", "/usr/bin", "/bin"])
+    os.makedirs(APPS_DIR, exist_ok=True)
+    with open(os.path.join(APPS_DIR, "neutron-collider.desktop"), "w") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Neutron Collider\n"
+                "GenericName=Adobe Creative Cloud\n"
+                "Comment=Install and run Adobe Creative Cloud apps on Linux\n"
+                f"Exec=env PATH={path} {appimage}\nIcon={icon}\nTerminal=false\n"
+                "Categories=Graphics;Photography;AudioVideo;\n")
+    refresh_desktop_caches(APPS_DIR)
+    return "menu entry added"
+
+
+def _enable_ntsync(as_json, assume_yes):
+    """Turn on ntsync permanently if the kernel has it (DECISIONS G9). Neutron works without it,
+    just much slower. One root step: Fedora's ntsync-autoload package, else a modules-load.d entry
+    plus modprobe. Asks for the password through sudo in a terminal, pkexec otherwise."""
+    st = ntsync_status()
+    if st != "available":
+        return st
+    distro = ""
+    try:
+        with open("/etc/os-release") as f:
+            distro = dict(l.rstrip("\n").split("=", 1) for l in f if "=" in l).get("ID", "").strip('"')
+    except OSError:
+        pass
+    if distro == "fedora" and have("dnf"):
+        cmd = "dnf install -y ntsync-autoload && modprobe ntsync"
+    else:
+        cmd = "echo ntsync > /etc/modules-load.d/ntsync.conf && modprobe ntsync"
+    tty = sys.stdin.isatty() and not as_json
+    if tty and not assume_yes:
+        print("[neutron] Your kernel has ntsync, which makes the Adobe apps much faster, but it is "
+              "off.\n[neutron] Turning it on permanently needs your password once:\n"
+              f"[neutron]     {cmd}", file=sys.stderr)
+    runner = ["sudo", "sh", "-c", cmd] if tty else (["pkexec", "sh", "-c", cmd] if have("pkexec") else None)
+    if not runner:
+        return "available"
+    try:
+        subprocess.run(runner, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not enable ntsync: {e}")
+    return ntsync_status()
+
+
+def _setup_checks():
+    """Problems that stop setup, and warnings that don't."""
+    problems, warnings = [], []
+    if os.uname().machine != "x86_64":
+        problems.append(f"Neutron needs an x86_64 PC (this is {os.uname().machine})")
+    try:
+        libc = os.confstr("CS_GNU_LIBC_VERSION").split()[-1]
+        if tuple(int(x) for x in libc.split(".")[:2]) < (2, 39):
+            problems.append(f"glibc {libc} is too old; Neutron needs 2.39 or newer "
+                            "(Ubuntu 24.04, Fedora 40, current Arch, or newer)")
+    except (ValueError, OSError, IndexError):
+        pass
+    if not have("cabextract"):
+        problems.append("cabextract is missing (it unpacks Microsoft's installers). Install it: "
+                        "`sudo pacman -S cabextract`, `sudo apt install cabextract`, "
+                        "`sudo dnf install cabextract` or `sudo zypper install cabextract`")
+    if not session_is_wayland():
+        warnings.append("this is not a Wayland session. Neutron supports Wayland only; on X11 you "
+                        "are on your own")
+    if LOCAL_BIN not in os.environ.get("PATH", "").split(":"):
+        warnings.append(f"{LOCAL_BIN} is not on your PATH; add it so `neutron` and `mudhut` work "
+                        "in a terminal")
+    return problems, warnings
+
+
+def cmd_setup(args, updating=False):
+    """Install or update everything: the CLI, neutron-wine, Microsoft's components, Mud Hut (and
+    Adobe's ACCCx through it), Collider, menu entries, ntsync."""
+    what = "update" if updating else "setup"
+    problems, warnings = _setup_checks()
+    if problems:
+        die({"ok": False, "reason": "; ".join(problems), "warnings": warnings}, EX_DEP, args.json)
+    for w in warnings:
+        log("⚠️  " + w)
+    src = os.path.abspath(args.from_dir) if getattr(args, "from_dir", None) else None
+    inst = _installed()
+    steps = []
+
+    def step(name, fn):
+        event(args, event="progress", stage=name, msg=f"{what}: {name}")
+        try:
+            res = fn()
+            steps.append({"step": name, "ok": True, **(res or {})})
+        except Exception as e:                        # report every piece, never stop half-way
+            steps.append({"step": name, "ok": False, "detail": str(e)})
+            log(f"{name}: {e}")
+
+    def do_cli():
+        if updating and not src and not os.path.isdir(os.path.join(NEUTRON_REPO, ".git")):
+            latest = _gh_latest("neutron")["version"]
+            if latest and latest != CLI_VERSION:
+                dest = os.path.join(NEUTRON_BIN_DIR, "neutron")
+                _fetch_piece("cli", dest, args.json)
+                inst["cli"] = latest
+                return {"version": latest, "path": dest, "link": _link_on_path("neutron", dest),
+                        "note": "updated; this run finishes with the old version"}
+        if src and os.path.isfile(os.path.join(src, "neutron")):
+            dest = os.path.join(NEUTRON_BIN_DIR, "neutron")
+            _fetch_piece("cli", dest, args.json, src)
+            path, ver = dest, CLI_VERSION
+        else:
+            path, ver = _install_cli(args.json)
+        inst["cli"] = CLI_VERSION
+        return {"version": ver, "path": path, "link": _link_on_path("neutron", path)}
+
+    def do_runtime():
+        ver, status = _install_runtime(args, src, getattr(args, "runtime_version", None))
+        inst["neutron_wine"] = ver
+        return {"version": ver, "status": status}
+
+    def do_microsoft():
+        r = ms_fetch(args.json)
+        if not r["ok"]:
+            raise RuntimeError("; ".join(f"{k}: {v}" for k, v in r["failed"].items()))
+        return {"downloaded": len(r["fetched"]), "already": len(r["present"])}
+
+    def do_mudhut():
+        dest = os.path.join(NEUTRON_BIN_DIR, "mudhut")
+        latest = None if src else _gh_latest("Mud-Hut")["version"]
+        if not (updating and latest and inst.get("mudhut") == latest and os.path.isfile(dest)):
+            ver = _fetch_piece("mudhut", dest, args.json, src)
+            inst["mudhut"] = ver or "local"
+        link = _link_on_path("mudhut", dest)
+        r = subprocess.run([dest, "accc"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           text=True, timeout=900)
+        if r.returncode != 0:
+            raise RuntimeError("Adobe's Creative Cloud package could not be downloaded: "
+                               + (r.stderr.strip().splitlines() or ["unknown error"])[-1])
+        return {"version": inst["mudhut"], "path": dest, "link": link, "accc": "ready"}
+
+    def do_collider():
+        dest = os.path.join(NEUTRON_COLLIDER_DIR, "Collider.AppImage")
+        latest = None if src else _gh_latest("Collider")["version"]
+        if not (updating and latest and inst.get("collider") == latest and os.path.isfile(dest)):
+            ver = _fetch_piece("collider", dest, args.json, src)
+            inst["collider"] = ver or "local"
+        return {"version": inst["collider"], "path": dest, "menu": _collider_desktop_entry(dest)}
+
+    step("cli", do_cli)
+    step("neutron-wine", do_runtime)
+    step("microsoft", do_microsoft)
+    if not getattr(args, "no_mudhut", False):
+        step("mudhut", do_mudhut)
+    if not getattr(args, "no_collider", False):
+        step("collider", do_collider)
+    if not getattr(args, "no_ntsync", False):
+        st = _enable_ntsync(args.json, getattr(args, "yes", False))
+        steps.append({"step": "ntsync", "ok": True, "status": st, "detail": NTSYNC_DETAIL.get(st)})
+    inst["updated_at" if updating else "installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    _save_installed(inst)
+
+    out = {"ok": all(s["ok"] for s in steps), "steps": steps, "warnings": warnings}
+    if updating:
+        out["prefixes_on_older_runtimes"] = _prefixes_behind()
+    if args.json:
+        emit(out, True, streaming=getattr(args, "progress", False))
+    else:
+        for s in steps:
+            mark = "✓" if s["ok"] else "✗"
+            info = s.get("version") or s.get("status") or ""
+            print(f"[neutron] {mark} {s['step']:<13} {info}  {s.get('detail') or s.get('note') or ''}".rstrip())
+        for p in out.get("prefixes_on_older_runtimes", []):
+            print(f"[neutron]   {p['prefix']} still runs neutron-wine {p['runtime']}; move it to "
+                  f"{p['latest']} with: neutron prefix provision {p['prefix']}")
+        if out["ok"] and not updating:
+            print("[neutron] Done. Open Neutron Collider from your application menu to install "
+                  "the Adobe apps.")
+    return EX_OK if out["ok"] else EX_FAIL
+
+
+def _prefixes_behind():
+    """Discovered prefixes whose stamp belongs to an older runtime than the newest installed."""
+    latest = _default_wine_version()
+    if not latest:
+        return []
+    newest = os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{latest}", "bin", "wine")
+    out = []
+    for p in discover_prefixes():
+        mm = stamp_mismatch(p, newest)
+        if mm:
+            out.append({"prefix": p, "runtime": ", ".join(mm["prefix_runtimes"]) or "older",
+                        "latest": latest})
+    return out
+
+
+def cmd_update(args):
+    """Update every installed piece to its latest release; prefixes keep their runtime until
+    you move them (`neutron prefix provision <prefix>`)."""
+    return cmd_setup(args, updating=True)
+
+
+def cmd_uninstall(args):
+    """Remove what `neutron setup` installed. Prefixes -- your Adobe apps and their settings --
+    are never touched; they are listed so you can delete them yourself."""
+    owned = [os.path.join(NEUTRON_DATA_DIR, d) for d in
+             ("runtimes", "microsoft", "bin", "collider", "accc", "logs", "icon-stamps",
+              "prefs-check", "superseded-desktop-entries")]
+    owned.append(NEUTRON_INSTALLED_JSON)
+    owned.append(os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")),
+                              "neutron"))
+    prefixes = discover_prefixes()
+    # Never delete a directory that holds a prefix, whatever it is called.
+    keep = [d for d in owned if any(os.path.realpath(p).startswith(os.path.realpath(d) + os.sep)
+                                    for p in prefixes)]
+    remove = [d for d in owned if d not in keep and os.path.lexists(d)]
+    links = [os.path.join(LOCAL_BIN, n) for n in ("neutron", "mudhut")
+             if os.path.islink(os.path.join(LOCAL_BIN, n))
+             and os.path.realpath(os.path.join(LOCAL_BIN, n)).startswith(
+                 os.path.realpath(NEUTRON_DATA_DIR) + os.sep)]
+    entries = sorted(glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop")))
+    icons = sorted(glob.glob(os.path.join(HOME, ".local", "share", "icons", "hicolor", "*", "apps",
+                                          "neutron-*.png")))
+    mime = os.path.join(HOME, ".local", "share", "mime", "packages", "neutron-adobe.xml")
+    plan = {"remove": remove + links + entries + icons + ([mime] if os.path.exists(mime) else []),
+            "kept_because_a_prefix_is_inside": keep, "prefixes_not_removed": prefixes}
+    if not getattr(args, "yes", False):
+        if args.json or not sys.stdin.isatty():
+            die({"ok": False, "reason": "pass --yes to uninstall", **plan}, EX_FAIL, args.json)
+        print("[neutron] This removes:")
+        for p in plan["remove"]:
+            print("    " + p)
+        if prefixes:
+            print("[neutron] Your prefixes (Adobe apps and settings) are NOT removed:")
+            for p in prefixes:
+                print("    " + p)
+        if input("[neutron] Uninstall Neutron? [y/N] ").strip().lower() not in ("y", "yes"):
+            return EX_FAIL
+    failed = []
+    for p in plan["remove"]:
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+        except OSError as e:
+            failed.append(f"{p}: {e}")
+    if os.path.isdir(APPS_DIR):
+        refresh_desktop_caches(APPS_DIR)
+    if have("update-mime-database"):
+        subprocess.run(["update-mime-database", os.path.join(HOME, ".local", "share", "mime")],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    out = {"ok": not failed, "removed": len(plan["remove"]) - len(failed), "failed": failed,
+           "prefixes_not_removed": prefixes,
+           "note": "ntsync stays enabled (it is a system setting other Wine programs use too)"}
+    if args.json:
+        emit(out, True)
+    else:
+        print(f"[neutron] Removed {out['removed']} items." + (f" Failed: {failed}" if failed else ""))
+        for p in prefixes:
+            print(f"[neutron] Kept prefix {p}; delete it yourself if you no longer need it.")
+    return EX_OK if out["ok"] else EX_FAIL
+
+
 # --- argument plumbing -----------------------------------------------------
 
 def build_parser():
@@ -6828,6 +7286,25 @@ def build_parser():
     pd = sub.add_parser("doctor", help="health check")
     pd.add_argument("--prefix", default=None)
     pd.set_defaults(func=cmd_doctor)
+
+    # setup / update / uninstall
+    for name, fn, hlp in (("setup", cmd_setup, "install everything Neutron needs: neutron-wine, "
+                           "Microsoft's components, Mud Hut, Collider, menu entries"),
+                          ("update", cmd_update, "update every installed piece to its latest release")):
+        su = sub.add_parser(name, help=hlp)
+        su.add_argument("--from", dest="from_dir", default=None,
+                        help="use release files from this directory instead of GitHub")
+        su.add_argument("--runtime-version", default=None,
+                        help="install this neutron-wine version (e.g. a pre-release) instead of "
+                             "the latest")
+        su.add_argument("--no-collider", action="store_true", help="skip Collider")
+        su.add_argument("--no-mudhut", action="store_true", help="skip Mud Hut")
+        su.add_argument("--no-ntsync", action="store_true", help="do not offer to turn on ntsync")
+        su.add_argument("--yes", action="store_true", help="do not ask before enabling ntsync")
+        su.set_defaults(func=fn)
+    un = sub.add_parser("uninstall", help="remove what `neutron setup` installed (never prefixes)")
+    un.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    un.set_defaults(func=cmd_uninstall)
 
     # runtime: the neutron-wine runtimes
     prt = sub.add_parser("runtime", help="neutron-wine runtimes")
