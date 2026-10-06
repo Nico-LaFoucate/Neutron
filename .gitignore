@@ -71,3 +71,6 @@ docs/HANDOFF-*.md
 /scripts/neutron_build.fish
 /scripts/neutron_run.fish
 /scripts/build-stack-bundle.sh
+
+# CLI release output (scripts/release.sh)
+/release/
