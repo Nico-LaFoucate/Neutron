@@ -160,41 +160,32 @@ patched Wine runtime.
 ## Getting Started
 
 > [!IMPORTANT]
-> This is a developer preview, not a one-click installer yet. You will need a patched Neutron
-> Wine build and your own installed, licensed Adobe application.
+> Neutron is in beta. You need your own licensed Adobe apps; you sign in inside each app, the
+> same as on Windows.
 
-**Prerequisites**
+**Requirements**
 
-- Linux with an **NVIDIA GPU** (dev/test: RTX 5070 / nvidia-open, CachyOS + KDE Wayland). Other
-  GPUs are untested.
-- A **patched Neutron stack** — forked Wine (wine-tkg / staging base) plus patched DXVK,
-  vkd3d-proton, and the nvcuda wrapper. See
-  [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) for the runtime and its build.
-- **Python 3**, plus `inotify-tools` and `ffmpeg` for hardware export.
-- Your own **legally licensed Adobe application**, installed into a Wine prefix.
+- 64-bit Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, current Arch / CachyOS /
+  Manjaro, openSUSE Tumbleweed) and a **Wayland** session.
+- An **NVIDIA GPU**. AMD and Intel GPUs are not validated yet.
+- **Python 3** and **cabextract**.
 
-**Run it**
+**Install**
 
 ```bash
-git clone https://github.com/Nico-LaFoucate/Neutron.git
-cd Neutron
-
-# Point at your Wine prefix — use any path you like, then reuse it below.
-# (prefix provision takes the path as a positional argument.)
-./bin/neutron prefix provision ~/neutronprefix
-
-# Sanity-check the stack
-./bin/neutron doctor --prefix ~/neutronprefix
-
-# See which apps are installed in the prefix
-./bin/neutron apps --prefix ~/neutronprefix
-
-# Launch through the Neutron stack
-./bin/neutron launch premiere --prefix ~/neutronprefix
+curl -LO https://github.com/Nico-LaFoucate/neutron/releases/latest/download/neutron
+python3 neutron setup
 ```
 
-Add `bin/` to your `PATH` (or symlink `bin/neutron` into `~/.local/bin`) to call `neutron`
-from anywhere.
+`neutron setup` downloads [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) and the
+[Mud Hut](https://github.com/Nico-LaFoucate/Mud-Hut) installer from GitHub, Microsoft's Visual C++
+runtimes, GDI+ and core fonts from Microsoft, and Adobe's Creative Cloud package from Adobe, and
+installs [Collider](https://github.com/Nico-LaFoucate/Collider) with a menu entry. It may ask for
+your password once, to turn on ntsync, which makes the apps much faster. Then open **Neutron
+Collider** and install your apps from its Mud Hut tab.
+
+`neutron update` updates everything and moves your prefixes to the new runtime.
+`neutron uninstall` removes Neutron; it asks before deleting any prefix.
 
 ### The `neutron` CLI
 
@@ -203,14 +194,15 @@ command for structured output.
 
 | Command | What it does |
 | :--- | :--- |
-| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`. Supports `--prefix`, `--gpu`, `--scale`, and opening a project file. |
-| `neutron prefix provision <path>` | Make a staged Wine prefix Neutron-ready (fonts, overrides, display fixes). |
+| `neutron setup` / `update` / `uninstall` | Install, update or remove everything (see above). |
+| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, and `lightroomcc` (Lightroom, experimental). Supports `--prefix`, `--scale`, and opening a project file. |
+| `neutron prefix provision <path>` | Make a Wine prefix Neutron-ready: Microsoft's components, the runtime's DXVK / vkd3d-proton / NVIDIA DLLs, fonts, display fixes. |
 | `neutron prefix info <path>` | Report the paths and state Collider needs. |
 | `neutron apps --prefix <path>` | List apps and install status in a prefix. |
 | `neutron doctor --prefix <path>` | Health-check the prefix and stack. |
 | `neutron teardown [--app <id>]` | Close one app, or the whole prefix, cleanly — apps save their preferences, and Adobe's orphaned daemons are swept so they can't wedge the next launch. |
-| `neutron runtime install` | Download, verify (sha256), and unpack the pinned [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) runtime — the patched Wine the engine runs. |
-| `neutron runtime capture` | Build the runtime DLL bundle from a proven prefix. |
+| `neutron display` | Show the display scale Neutron will use, and whether it is one Adobe's UI lays out cleanly. |
+| `neutron runtime install --version <v>` | Install a specific [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) version (e.g. a pre-release), verified against its sha256. |
 
 ---
 
