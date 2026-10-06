@@ -3976,13 +3976,20 @@ def ms_status():
 
 
 def reg_import(wine, prefix, sections, tag="neutron"):
-    """Write {key: {name: value}} (REG_SZ values) to the prefix in ONE `reg import`."""
+    """Write {key: {name: value}} to the prefix in ONE `reg import`: str = REG_SZ, int = DWORD,
+    None = delete the value."""
     def esc(s):
         return s.replace("\\", "\\\\").replace('"', '\\"')
+    def val(v):
+        if v is None:
+            return "-"
+        if isinstance(v, bool) or isinstance(v, int):
+            return "dword:%08x" % int(v)
+        return f'"{esc(v)}"'
     lines = ["REGEDIT4", ""]
     for key, values in sections.items():
         lines.append(f"[{key}]")
-        lines += [f'"{esc(n)}"="{esc(v)}"' for n, v in values.items()]
+        lines += [f'"{esc(n)}"={val(v)}' for n, v in values.items()]
         lines.append("")
     tmp_dir = os.path.join(prefix, "drive_c", "windows", "temp")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -4939,12 +4946,10 @@ def cmd_launch(args):
                        "(wine runs `wineboot -u` when the stamps differ)",
              # Provision re-stamps the prefix for THIS runtime: its `wineboot -u` installs this
              # runtime's own (patched) builtins, and stage_natives then restages the runtime's
-             # DXVK / vkd3d-proton / NVIDIA DLLs. The usual cause is `neutron update` installing a
-             # newer runtime: prefixes stay on theirs until moved, by design.
-             "fix": "this prefix was set up with another neutron-wine version (after `neutron "
-                    "update`, prefixes stay on their version until you move them). Run `neutron "
-                    "prefix provision %s` to move it to this one: it re-stamps the prefix and "
-                    "restages Neutron's DLLs. Or pass --allow-restamp to launch anyway." % prefix,
+             # DXVK / vkd3d-proton / NVIDIA DLLs. `neutron update` does this for every prefix.
+             "fix": "Run `neutron update` (or `neutron prefix provision %s`): it moves the "
+                    "prefix to this runtime and restages Neutron's DLLs. Or pass --allow-restamp "
+                    "to launch anyway." % prefix,
              "prefix_is_stamped_for": (", ".join(also) if also
                                        else "no installed runtime (stamp %d)"
                                             % mismatch["prefix_stamp"]),
@@ -6236,26 +6241,12 @@ def cmd_theme_apply(args):
                 raise ValueError("non-string values for: %s" % ", ".join(sorted(bad)[:5]))
         except Exception as e:
             die({"ok": False, "reason": "bad --colors: %s" % e}, EX_FAIL, args.json)
-    wine, is_neutron = resolve_wine()
+    # ⛔ Never through distro wine, never through a runtime that would re-stamp the prefix (a
+    # FIRST wine process into a COLD prefix whose stamp differs runs `wineboot -u` and reverts the
+    # patched natives). wine_for_prefix picks a runtime that shares the prefix's stamp.
+    wine, why = wine_for_prefix(prefix)
     if not wine:
-        die({"ok": False, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
-    if not is_neutron:
-        # ⛔ Never import through distro wine: a different-stamp wine fires wineboot -u and reverts
-        # the prefix's patched natives. Refusing is the same rule the launch path follows.
-        die({"ok": False, "reason": "resolved wine is not a Neutron runtime; refusing to touch the "
-                                    "prefix (distro wine would wineboot-clobber it)"},
-            EX_DEP, args.json)
-    # ⛔ THE SAME GUARD `launch` USES. Importing a .reg means starting wine against the prefix, and
-    # a FIRST wine process into a COLD prefix whose stamp differs runs `wineboot -u` and reverts the
-    # patched natives. A cosmetic theme write must never be able to do that.
-    mismatch = stamp_mismatch(prefix, wine)
-    if mismatch and not getattr(args, "allow_restamp", False):
-        die({"ok": False,
-             "reason": "this runtime would RE-STAMP the prefix and revert its patched natives; "
-                       "refusing to write a theme through it",
-             "hint": "run it with the runtime this prefix is stamped for: "
-                     "NEUTRON_WINE_VERSION=<ver> neutron theme apply --prefix %s" % prefix,
-             **mismatch}, EX_FAIL, args.json)
+        die({"ok": False, **why}, EX_DEP, args.json)
 
     res = apply_theme(wine, prefix, colors)
     res["prefix"] = prefix
@@ -6263,6 +6254,142 @@ def cmd_theme_apply(args):
     if not res.get("ok"):
         die({"ok": False, **res}, EX_FAIL, args.json)
     emit({"ok": True, **res}, args.json)
+
+
+def wine_for_prefix(prefix):
+    """A Neutron wine that can start in `prefix` WITHOUT re-stamping it, for registry writes: the
+    resolved runtime when its stamp matches, else the newest installed runtime that shares the
+    prefix's stamp. Which of those runs a `reg import` does not matter, and none of them can
+    re-stamp the prefix. (Launch is different: it must use the resolved runtime and refuses.)
+    Returns (wine, None) or (None, why)."""
+    wine, is_neutron = resolve_wine()
+    if not wine or not is_neutron:
+        return None, {"reason": NO_RUNTIME_MSG}
+    mm = stamp_mismatch(prefix, wine)
+    if not mm:
+        return wine, None
+    for ver in reversed(mm["prefix_runtimes"]):
+        cand = os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{ver}", "bin", "wine")
+        if os.access(cand, os.X_OK):
+            return cand, None
+    return None, {"reason": "no installed runtime matches this prefix's stamp, and the resolved "
+                            "one would re-stamp it; run `neutron prefix provision` first",
+                  **mm}
+
+
+CAPTION_BUTTONS = ("close", "min", "max", "restore")
+
+
+def cmd_theme_icons(args):
+    """Window-button (caption) icons: the neutron-wine frame draws close/min/max/restore .ico files
+    from a folder when HKCU\\Software\\Neutron\\Caption has Enabled=1 and IconDir. Copies the set
+    from --from into the prefix and points the registry at it; --off goes back to Wine's glyphs.
+    Collider ships the sets and passes a folder; the prefix side is the engine's."""
+    prefix = resolve_prefix(args.path)
+    if not prefix:
+        die({"ok": False, **bad_prefix_reason(getattr(args, "path", None))}, EX_BADPREFIX, args.json)
+    wine, why = wine_for_prefix(prefix)
+    if not wine:
+        die({"ok": False, **why}, EX_DEP, args.json)
+    key = r"HKEY_CURRENT_USER\Software\Neutron\Caption"
+    if args.off:
+        ok = reg_import(wine, prefix, {key: {"Enabled": 0}}, tag="neutron-caption")
+        emit({"ok": ok, "prefix": prefix, "enabled": False}, args.json)
+        return EX_OK if ok else EX_FAIL
+    if not args.from_dir or not os.path.isdir(args.from_dir):
+        die({"ok": False, "reason": "--from must name a folder with close/min/max/restore .ico files"},
+            EX_FAIL, args.json)
+    name = re.sub(r"[^A-Za-z0-9_-]", "", args.name or "custom") or "custom"
+    dst = os.path.join(prefix, "drive_c", "windows", "neutron", "caption", name)
+    os.makedirs(dst, exist_ok=True)
+    copied = []
+    for b in CAPTION_BUTTONS:
+        src = os.path.join(args.from_dir, b + ".ico")
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(dst, b + ".ico"))
+            copied.append(b)
+    if not copied:
+        die({"ok": False, "reason": f"no close/min/max/restore .ico files in {args.from_dir}"},
+            EX_FAIL, args.json)
+    ok = reg_import(wine, prefix, {key: {"Enabled": 1, "IconDir": "C:\\windows\\neutron\\caption\\" + name}},
+                    tag="neutron-caption")
+    emit({"ok": ok, "prefix": prefix, "enabled": True, "set": name, "buttons": copied,
+          "note": "restart the app to see the change"}, args.json)
+    return EX_OK if ok else EX_FAIL
+
+
+# --- KWin rule: Premiere's home screen position (KDE Plasma, Wayland) ------------------------
+# Wayland does not let a client position its own toplevel, so Premiere's home/Welcome overlay
+# lands at the top of the screen over the menu bar. KWin can place it: an optional rule matching
+# the overlay (app_id contains `neutron-premiere-`, the per-prefix id our .desktop entries and
+# `launch` give Wine; the overlay has an EMPTY title) and forcing its position. Off by default;
+# Collider exposes it in Preferences. Merges into kwinrulesrc, never clobbering other rules.
+KWIN_RULE_ID = "neutron-premiere-home"
+KWIN_RULE_KEYS = ("Description", "wmclass", "wmclasscomplete", "wmclassmatch",
+                  "title", "titlematch", "position", "positionrule")
+# The kwin script Collider installs for the same overlay (removed by `uninstall`).
+KWIN_SCRIPT_ID = "neutron-home-overlay"
+
+
+def _is_kde():
+    de = (os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("XDG_SESSION_DESKTOP") or "").lower()
+    return "kde" in de or "plasma" in de
+
+
+def _kconfig(tool):
+    return tool + "6" if have(tool + "6") else tool
+
+
+def _kwin_reconfigure():
+    subprocess.run(["gdbus", "call", "--session", "--dest", "org.kde.KWin", "--object-path",
+                    "/KWin", "--method", "org.kde.KWin.reconfigure"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+
+
+def _kwin_rule_list():
+    r = subprocess.run([_kconfig("kreadconfig"), "--file", "kwinrulesrc", "--group", "General",
+                        "--key", "rules"], capture_output=True, text=True, timeout=15)
+    return [x for x in r.stdout.strip().split(",") if x] if r.returncode == 0 else []
+
+
+def kwin_home_rule(enable, y=82):
+    """Write (enable=True) or remove the rule. Returns {"supported", "enabled"}."""
+    if not (session_is_wayland() and _is_kde()):
+        return {"supported": False, "enabled": False}
+    kw = _kconfig("kwriteconfig")
+    def write(group, k, v):
+        subprocess.run([kw, "--file", "kwinrulesrc", "--group", group, "--key", k, v],
+                       check=True, timeout=15)
+    ids = [x for x in _kwin_rule_list() if x != KWIN_RULE_ID]
+    if enable:
+        for k, v in (("Description", "Neutron: Premiere home screen position"),
+                     ("wmclass", "neutron-premiere-"), ("wmclasscomplete", "false"),
+                     ("wmclassmatch", "2"),             # 2 = substring
+                     ("title", ""), ("titlematch", "1"),  # 1 = exact: empty title = the overlay
+                     ("position", f"0,{int(y)}"), ("positionrule", "2")):  # 2 = Force
+            write(KWIN_RULE_ID, k, v)
+        ids.append(KWIN_RULE_ID)
+    else:
+        # Delete the stanza's keys too: dropping the id alone leaves positionrule=2 on disk,
+        # one `rules=` edit away from live again.
+        for k in KWIN_RULE_KEYS:
+            subprocess.run([kw, "--file", "kwinrulesrc", "--group", KWIN_RULE_ID, "--key", k,
+                            "--delete"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15)
+    write("General", "rules", ",".join(ids))
+    write("General", "count", str(len(ids)))
+    _kwin_reconfigure()
+    return {"supported": True, "enabled": bool(enable)}
+
+
+def cmd_window_rule(args):
+    """`neutron window-rule premiere-home (--y N | --off)`: Premiere's home screen position."""
+    try:
+        res = kwin_home_rule(not args.off, args.y)
+    except (OSError, subprocess.SubprocessError) as e:
+        die({"ok": False, "reason": f"could not write the KWin rule: {e}"}, EX_FAIL, args.json)
+    emit({"ok": True, **res}, args.json)
+    return EX_OK
 
 
 def ntsync_status():
@@ -6972,6 +7099,9 @@ def cmd_setup(args, updating=False):
     if not getattr(args, "no_ntsync", False):
         st = _enable_ntsync(args.json, getattr(args, "yes", False))
         steps.append({"step": "ntsync", "ok": True, "status": st, "detail": NTSYNC_DETAIL.get(st)})
+    if updating and inst.get("neutron_wine"):
+        event(args, event="progress", stage="prefixes", msg="update: moving prefixes to the new runtime")
+        steps.append(_reprovision_prefixes(inst["neutron_wine"], args.json))
     inst["updated_at" if updating else "installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     _save_installed(inst)
 
@@ -6994,6 +7124,35 @@ def cmd_setup(args, updating=False):
     return EX_OK if out["ok"] else EX_FAIL
 
 
+def _reprovision_prefixes(version, as_json):
+    """`neutron update` moves every Neutron prefix onto the new runtime (DECISIONS C16): a
+    provision under that version re-stamps the prefix, restages the runtime's DLLs and re-pins its
+    menu entries. A prefix with an Adobe app running is skipped (provisioning boots wine in it)
+    and named, so the user can close the app and update again."""
+    moved, skipped, failed = [], [], []
+    newest = os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{version}", "bin", "wine")
+    for p in discover_prefixes():
+        if not stamp_mismatch(p, newest):
+            continue
+        running = _running_app_ids(p)
+        if running:
+            skipped.append({"prefix": p, "running": running})
+            continue
+        if not as_json:
+            log(f"moving {p} to neutron-wine {version}")
+        r = subprocess.run([sys.executable, os.path.realpath(__file__), "--json", "prefix",
+                            "provision", p], env={**os.environ, "NEUTRON_WINE_VERSION": version},
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+        (moved if r.returncode == 0 else failed).append(p)
+    step = {"step": "prefixes", "ok": not failed, "moved": moved, "skipped": skipped,
+            "failed": failed}
+    if skipped:
+        step["detail"] = ("not moved while an app runs in them: "
+                          + "; ".join(f'{x["prefix"]} ({", ".join(x["running"])})' for x in skipped)
+                          + ". Close the apps and run `neutron update` again.")
+    return step
+
+
 def _prefixes_behind():
     """Discovered prefixes whose stamp belongs to an older runtime than the newest installed."""
     latest = _default_wine_version()
@@ -7010,20 +7169,25 @@ def _prefixes_behind():
 
 
 def cmd_update(args):
-    """Update every installed piece to its latest release; prefixes keep their runtime until
-    you move them (`neutron prefix provision <prefix>`)."""
+    """Update every installed piece to its latest release, then move every prefix onto the new
+    runtime (DECISIONS C16)."""
     return cmd_setup(args, updating=True)
 
 
 def cmd_uninstall(args):
-    """Remove what `neutron setup` installed. Prefixes -- your Adobe apps and their settings --
-    are never touched; they are listed so you can delete them yourself."""
+    """Remove what `neutron setup` installed (DECISIONS C17): runtimes, downloads and caches,
+    logs, menu entries and icons, file associations, Collider's settings, the KWin script and rule,
+    the `neutron`/`mudhut` commands. Prefixes -- the Adobe apps and their settings -- only when
+    asked (a separate question; default keep). ntsync stays enabled."""
     owned = [os.path.join(NEUTRON_DATA_DIR, d) for d in
              ("runtimes", "microsoft", "bin", "collider", "accc", "logs", "icon-stamps",
               "prefs-check", "superseded-desktop-entries")]
     owned.append(NEUTRON_INSTALLED_JSON)
     owned.append(os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")),
                               "neutron"))
+    owned.append(os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+                              "collider"))                                   # Collider's settings
+    owned.append(os.path.join(os.path.dirname(APPS_DIR), "kwin", "scripts", KWIN_SCRIPT_ID))
     prefixes = discover_prefixes()
     # Never delete a directory that holds a prefix, whatever it is called.
     keep = [d for d in owned if any(os.path.realpath(p).startswith(os.path.realpath(d) + os.sep)
@@ -7038,19 +7202,37 @@ def cmd_uninstall(args):
                                           "neutron-*.png")))
     mime = os.path.join(HOME, ".local", "share", "mime", "packages", "neutron-adobe.xml")
     plan = {"remove": remove + links + entries + icons + ([mime] if os.path.exists(mime) else []),
-            "kept_because_a_prefix_is_inside": keep, "prefixes_not_removed": prefixes}
+            "kept_because_a_prefix_is_inside": keep}
+    del_prefixes = bool(getattr(args, "delete_prefixes", False))
     if not getattr(args, "yes", False):
         if args.json or not sys.stdin.isatty():
-            die({"ok": False, "reason": "pass --yes to uninstall", **plan}, EX_FAIL, args.json)
+            die({"ok": False, "reason": "pass --yes to uninstall", **plan,
+                 "prefixes": prefixes}, EX_FAIL, args.json)
         print("[neutron] This removes:")
         for p in plan["remove"]:
             print("    " + p)
-        if prefixes:
-            print("[neutron] Your prefixes (Adobe apps and settings) are NOT removed:")
-            for p in prefixes:
-                print("    " + p)
         if input("[neutron] Uninstall Neutron? [y/N] ").strip().lower() not in ("y", "yes"):
             return EX_FAIL
+        if prefixes and not del_prefixes:
+            print("[neutron] Your prefixes hold the Adobe apps and their settings:")
+            for p in prefixes:
+                print("    " + p)
+            del_prefixes = input("[neutron] Delete them too? [y/N] ").strip().lower() in ("y", "yes")
+    if del_prefixes:
+        busy = [p for p in prefixes if _running_app_ids(p)]
+        if busy:
+            die({"ok": False, "reason": "close the Adobe apps first; they are running in "
+                 + ", ".join(busy)}, EX_RUNNING, args.json)
+        plan["remove"] += prefixes
+    # The KWin rule lives in kwinrulesrc next to the user's own rules: removed key by key.
+    try:
+        kwin_home_rule(False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if _is_kde() and have(_kconfig("kwriteconfig")):
+        subprocess.run([_kconfig("kwriteconfig"), "--file", "kwinrc", "--group", "Plugins", "--key",
+                        KWIN_SCRIPT_ID + "Enabled", "--delete"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
     failed = []
     for p in plan["remove"]:
         try:
@@ -7065,15 +7247,17 @@ def cmd_uninstall(args):
     if have("update-mime-database"):
         subprocess.run(["update-mime-database", os.path.join(HOME, ".local", "share", "mime")],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kept = [] if del_prefixes else prefixes
     out = {"ok": not failed, "removed": len(plan["remove"]) - len(failed), "failed": failed,
-           "prefixes_not_removed": prefixes,
+           "prefixes_not_removed": kept,
            "note": "ntsync stays enabled (it is a system setting other Wine programs use too)"}
     if args.json:
         emit(out, True)
     else:
         print(f"[neutron] Removed {out['removed']} items." + (f" Failed: {failed}" if failed else ""))
-        for p in prefixes:
-            print(f"[neutron] Kept prefix {p}; delete it yourself if you no longer need it.")
+        for p in kept:
+            print(f"[neutron] Kept prefix {p}.")
+        print("[neutron] " + out["note"] + ".")
     return EX_OK if out["ok"] else EX_FAIL
 
 
@@ -7202,6 +7386,19 @@ def build_parser():
     ta.set_defaults(func=cmd_theme_apply)
     ts = tsub.add_parser("show", help="print the default theme")
     ts.set_defaults(func=cmd_theme_show)
+    ti = tsub.add_parser("icons", help="window-button icons: install a set into a prefix, or --off")
+    ti.add_argument("--prefix", dest="path", default=None)
+    ti.add_argument("--from", dest="from_dir", default=None,
+                    help="folder with close.ico, min.ico, max.ico, restore.ico")
+    ti.add_argument("--name", default=None, help="the set's name (folder name inside the prefix)")
+    ti.add_argument("--off", action="store_true", help="back to Wine's own button glyphs")
+    ti.set_defaults(func=cmd_theme_icons)
+
+    pw = sub.add_parser("window-rule", help="KDE: keep Premiere's home screen below the menu bar")
+    pw.add_argument("rule", choices=["premiere-home"])
+    pw.add_argument("--y", type=int, default=82, help="logical-pixel Y position (default 82)")
+    pw.add_argument("--off", action="store_true", help="remove the rule")
+    pw.set_defaults(func=cmd_window_rule)
 
     # fonts: re-verify + repair. The engine half predates this command (it ran inside doctor
     # and provision); this is the first-class surface Collider's Fonts row drives.
@@ -7238,8 +7435,11 @@ def build_parser():
         su.add_argument("--no-ntsync", action="store_true", help="do not offer to turn on ntsync")
         su.add_argument("--yes", action="store_true", help="do not ask before enabling ntsync")
         su.set_defaults(func=fn)
-    un = sub.add_parser("uninstall", help="remove what `neutron setup` installed (never prefixes)")
+    un = sub.add_parser("uninstall", help="remove what `neutron setup` installed; prefixes only "
+                                          "if you say so")
     un.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    un.add_argument("--delete-prefixes", action="store_true",
+                    help="also delete every Neutron prefix (the Adobe apps and their settings)")
     un.set_defaults(func=cmd_uninstall)
 
     # runtime: the neutron-wine runtimes
