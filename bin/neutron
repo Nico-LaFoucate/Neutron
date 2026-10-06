@@ -565,6 +565,18 @@ APP_PROFILES = {
         "env": {"NEUTRON_DISABLE_BTW": "1"},
         "accent": "#4d9fff", "export": False,
     },
+    # EXPERIMENTAL: Lightroom (the cloud app) is "Planned", not supported. This profile exists so
+    # people can try it before official support; it borrows Lightroom Classic's settings (same
+    # photo-editing engine and GPU path) and has not been validated.
+    "lightroomcc": {
+        "name": "Lightroom (experimental)",
+        "exe": _adobe("Adobe Lightroom CC", "lightroom.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b;dxcore=n;nvapi64=n;dcomp=n,b",
+        "nvapi": True,
+        "env": {"NEUTRON_DISABLE_BTW": "1"},
+        "accent": "#31a8ff", "export": False,
+    },
     "animate": {
         "name": "Animate",
         "exe": _adobe("Adobe Animate 2024", "Animate.exe"),
@@ -5570,6 +5582,7 @@ APP_CATEGORIES = {
     "photoshop":    "Graphics;2DGraphics;RasterGraphics;Photography;",
     "illustrator":  "Graphics;2DGraphics;VectorGraphics;",
     "lightroom":    "Graphics;Photography;",
+    "lightroomcc":  "Graphics;Photography;",
     "animate":      "Graphics;2DGraphics;",
 }
 
