@@ -47,8 +47,7 @@ HOME = os.path.expanduser("~")
 # -> unambiguous discovery. A hardcoded name is one machine's layout and has repeatedly broken the
 # build tester; see default_prefix() for the history.
 
-# This repo's root (bin/neutron -> ..) — used to find checked-in reproducible sources
-# like scripts/ucrtshim/ that capture builds into the runtime bundle.
+# This repo's root (bin/neutron -> ..), wherever it was unpacked.
 NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 # The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
@@ -152,18 +151,15 @@ NO_RUNTIME_MSG = "neutron-wine isn't installed. Run `neutron setup` first."
 # GPU-vendor ICD selection (NVIDIA default; TODO: generalize per detected GPU).
 NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
 
-# --- Neutron runtime DLL bundle (Proton-style; provision stages it) -------------
-# The native translation/redistributable DLLs (DXVK + vkd3d-proton + dxvk-nvapi +
-# vcrun + gdiplus/d3dcompiler) and their DllOverrides that make an Adobe prefix
-# work, captured once from a proven prefix (`neutron runtime capture`) into a
-# versioned bundle: <runtime>/dlls/{system32,syswow64}/*.dll + <runtime>/overrides.json.
-# Resolution mirrors the wine runtime (env -> dist -> repo-local). Binaries are
-# NOT committed to git; they're a build/runtime artifact.
-NEUTRON_RUNTIME_CANDIDATES = [
-    os.environ.get("NEUTRON_RUNTIME"),
-    os.path.join(HOME, "neutron", "dist", "runtime"),
-    os.path.join(HOME, "neutron", "runtime"),
-]
+# --- DLLs staged into every prefix ---------------------------------------------------------
+# Two sources, nothing else:
+#   * our open-source builds (DXVK, vkd3d-proton, dxvk-nvapi, the NVIDIA wrappers, the ucrtbase
+#     shim) ship INSIDE the neutron-wine runtime: <runtime>/lib/wine/<project>/, listed with their
+#     DLL overrides in <runtime>/share/neutron/natives.json (neutron-wine external/);
+#   * Microsoft's files are downloaded from Microsoft by `neutron setup` (MS_DOWNLOADS below).
+# NEUTRON_RUNTIME may point at an old-style captured bundle (<dir>/dlls/{system32,syswow64} +
+# <dir>/overrides.json) for development; nothing else reads one.
+NEUTRON_RUNTIME_BUNDLE = os.environ.get("NEUTRON_RUNTIME")
 
 # --- WebView2 runtime (Adobe in-app sign-in / IMS is a Microsoft Edge WebView2
 # web UI). The Adobe installer drops WebView2 files under Common Files\Adobe but
@@ -171,14 +167,19 @@ NEUTRON_RUNTIME_CANDIDATES = [
 # sign-in window renders BLANK (a big time-sink to diagnose — bank it). provision
 # stages a complete *registered* runtime to the standard path AND writes the
 # EdgeUpdate\Clients\{GUID} "pv" the loader reads (both the 64-bit view and
-# Wow6432Node — the Adobe licensing helper is 32-bit). Binary is a runtime
-# artifact (like the DLL bundle), NOT committed to git.
+# Wow6432Node — the Adobe licensing helper is 32-bit). Sources, in order: a copy already
+# registered in the prefix; Adobe's own copy in the prefix; $NEUTRON_WEBVIEW2; and last,
+# Microsoft's WebView2 Fixed Version runtime, downloaded once into MICROSOFT_DIR.
 WEBVIEW2_CLIENT_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
-WEBVIEW2_CANDIDATES = [
-    os.environ.get("NEUTRON_WEBVIEW2"),
-    os.path.join(HOME, "neutron", "dist", "webview2"),
-    os.path.join(HOME, "neutron", "webview2"),
-]
+WEBVIEW2_DEV_SOURCE = os.environ.get("NEUTRON_WEBVIEW2")
+# Only the latest two majors are downloadable, and only 133 and 140 (Adobe's copies) have run
+# under neutron-wine; anything newer is flagged as untested. The pin is refreshed at release time;
+# if it has gone, the current list is read from Microsoft's download page.
+WEBVIEW2_TESTED_MAJORS = (133, 140)
+WEBVIEW2_FIXED_PIN = ("154.0.4258.62", "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/"
+                      "files/b92cd7d9-6976-4f34-9708-47e80937c287/"
+                      "Microsoft.WebView2.FixedVersionRuntime.154.0.4258.62.x64.cab")
+WEBVIEW2_PAGE = "https://developer.microsoft.com/en-us/microsoft-edge/webview2/"
 
 # --- Wine Mono + Gecko (Adobe prefixes need them INSTALLED, never suppressed) ----
 # The Wine Mono/Gecko installer popup must never reach the end user, but the WRONG
@@ -187,27 +188,16 @@ WEBVIEW2_CANDIDATES = [
 # The RIGHT way (a complete Adobe prefix, e.g. the proven mudhut-accc2, has both Mono
 # and Gecko installed): actually INSTALL the matching versions during provision so
 # wineboot never prompts at launch and nothing is disabled. The versions MUST match
-# what the packaged neutron-wine runtime expects (baked at build time: appwiz.cpl
-# MONO_VERSION / mshtml GECKO_VERSION) — a version skew is exactly what makes wineboot
-# re-prompt on a prefix-update. Keep these in lockstep with build/WINE_BASE.
+# what the runtime expects (baked at build time into appwiz.cpl / mshtml) -- a skew is
+# exactly what makes wineboot re-prompt. The runtime ships the matching trees in
+# <runtime>/share/wine/{mono,gecko} (neutron-wine package.sh), and the versions are read from
+# there; these two are only the fallback for a runtime that predates that.
 MONO_VERSION = "11.1.0"
 GECKO_VERSION = "2.47.4"
-# Source trees (extracted wine-mono/wine-gecko), resolved in priority order. Like the
-# WebView2 runtime these are a runtime artifact, NOT committed to git; stage them under
-# ~/neutron/{mono,gecko} (or point NEUTRON_MONO/NEUTRON_GECKO at them), or fall back to
-# the host's /usr/share/wine trees IF they still carry the matching version.
-MONO_CANDIDATES = [
-    os.environ.get("NEUTRON_MONO"),
-    os.path.join(HOME, "neutron", "dist", "mono"),
-    os.path.join(HOME, "neutron", "mono"),
-    "/usr/share/wine/mono",
-]
-GECKO_CANDIDATES = [
-    os.environ.get("NEUTRON_GECKO"),
-    os.path.join(HOME, "neutron", "dist", "gecko"),
-    os.path.join(HOME, "neutron", "gecko"),
-    "/usr/share/wine/gecko",
-]
+# Extra source trees, after the runtime's own: $NEUTRON_MONO / $NEUTRON_GECKO, then the host's
+# /usr/share/wine trees IF they carry the matching version.
+MONO_CANDIDATES = [os.environ.get("NEUTRON_MONO"), "/usr/share/wine/mono"]
+GECKO_CANDIDATES = [os.environ.get("NEUTRON_GECKO"), "/usr/share/wine/gecko"]
 
 # DXVK workaround: winevulkan can't marshal VK_EXT_graphics_pipeline_library
 # create-infos under winewayland.drv -> disable that DXVK feature.
@@ -240,11 +230,12 @@ DISPLAY_FIX_APPS = (
 # apply BEFORE first launch (the DS.DisableDirectXDisplay pref lives in Premiere's
 # Debug Database and is written post-first-launch by apply-display-fix, so it's
 # not part of provision). Values are the proven ones from the live suite.
-PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides
-    "nvapi64": "native",             # real-NVIDIA reporting (dxvk-nvapi)
-    "ucrtbase": "native,builtin",    # the muxing shim (forwards to ucrtbase_orig.dll)
-    "dwrite": "builtin",
+PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides: Wine builtin pins
+    "d2d1": "builtin",               # our patched d2d1, never a native copy
+    "dwrite": "builtin",             # our patched dwrite; a stray Microsoft DWrite.dll must not win
 }
+# The overrides for our own DLLs come from the runtime's natives.json, and Microsoft's from
+# MS_OVERRIDES; provision writes all three.
 # ⛔ dxcore and dcomp were REMOVED here 2026-08-07. They used to be staged as `native` because the
 # patched versions had to be supplied as files; that is obsolete — a wineboot on 11.10-22+ is a
 # SELF-HEAL that installs the runtime's own PATCHED dcomp/dxcore/dwrite builtins (verified by
@@ -253,9 +244,6 @@ PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides
 # about the photoshop app profile, but the prefix-wide case points the same way). The live
 # ~/.premiere2025, which runs all seven apps, has NEITHER override.
 #
-# This mattered because these only fire on the `builtin-minimal` path — when no runtime bundle is
-# present — which is exactly a fresh tester's first provision. The bundle-derived path never had
-# them, so the defect was invisible on any machine that had already captured a bundle.
 # HKCU\Software\Wine\Fonts\Replacements — map the fonts Adobe requests but that
 # can't ship (MS Segoe/Calibri, CJK Noto/MS) onto Adobe Clean (installed with the
 # apps). Missing these -> dwrite FindFamilyName NULL -> AdobeOwl AV -> leaked
@@ -1231,11 +1219,17 @@ def stamp_mismatch(prefix, wine_path):
 
 
 def resolve_runtime():
-    """The Neutron runtime DLL bundle dir (has overrides.json + dlls/), or None."""
-    for c in NEUTRON_RUNTIME_CANDIDATES:
-        if c and os.path.isdir(c) and os.path.isfile(os.path.join(c, "overrides.json")):
-            return c
+    """A development DLL bundle named by $NEUTRON_RUNTIME (has overrides.json + dlls/), or None.
+    Releases never use one: see NEUTRON_RUNTIME_BUNDLE."""
+    c = NEUTRON_RUNTIME_BUNDLE
+    if c and os.path.isdir(c) and os.path.isfile(os.path.join(c, "overrides.json")):
+        return c
     return None
+
+
+def runtime_root(wine):
+    """<runtime> for <runtime>/bin/wine."""
+    return os.path.dirname(os.path.dirname(os.path.realpath(wine)))
 
 
 def _sha256_file(path):
@@ -1340,16 +1334,11 @@ def wineserver_wait(wine, prefix, timeout=240):
 
 
 def resolve_webview2():
-    """The staged Microsoft Edge WebView2 registered-runtime source dir (has an
-    Application/<version>/msedgewebview2.exe), or None. This tree is copied into
-    the prefix's 'Program Files (x86)\\Microsoft\\EdgeWebView'. Resolution order:
-    $NEUTRON_WEBVIEW2 -> the runtime DLL bundle's webview2/ (so it ships with
-    `neutron runtime capture`) -> dist/ -> repo-local artifact."""
+    """A development WebView2 tree named by $NEUTRON_WEBVIEW2 (has an
+    Application/<version>/msedgewebview2.exe), copied into the prefix's
+    'Program Files (x86)\\Microsoft\\EdgeWebView'; or one in a $NEUTRON_RUNTIME bundle. Else None."""
     rt = resolve_runtime()
-    cands = list(WEBVIEW2_CANDIDATES)
-    if rt:
-        cands.insert(1, os.path.join(rt, "webview2"))
-    for c in cands:
+    for c in (WEBVIEW2_DEV_SOURCE, rt and os.path.join(rt, "webview2")):
         if c and os.path.isdir(os.path.join(c, "Application")):
             return c
     return None
@@ -1416,10 +1405,68 @@ def _adopt_adobe_webview2(prefix, app_dir):
     return version
 
 
-def register_webview2(wine, prefix):
+def _webview2_fixed(as_json=True):
+    """Microsoft's WebView2 Fixed Version runtime (x64), downloaded once into MICROSOFT_DIR and
+    shared by every prefix. The fallback for a prefix whose Adobe install did not bring its own
+    copy. Returns (version, dir), or (None, reason)."""
+    import re, tempfile, urllib.error, urllib.request
+    base = os.path.join(MICROSOFT_DIR, "webview2")
+    vkey = lambda v: tuple(int(x) for x in v.split("."))
+    have_v = []
+    if os.path.isdir(base):
+        have_v = [v for v in os.listdir(base) if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", v)
+                  and os.path.isfile(os.path.join(base, v, "msedgewebview2.exe"))]
+    if have_v:
+        v = max(have_v, key=vkey)
+        return v, os.path.join(base, v)
+    if not have("cabextract"):
+        return None, "cabextract is not installed"
+    cands = [WEBVIEW2_FIXED_PIN]
+    try:   # the pin can age off Microsoft's servers; the download page lists what is current
+        req = urllib.request.Request(WEBVIEW2_PAGE, headers={"User-Agent": "neutron-cli"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            page = r.read().decode("utf-8", "replace")
+        # The list lives in the page's embedded Nuxt payload, a JSON array of strings.
+        m = re.search(r'<script[^>]*id="__NUXT_DATA__"[^>]*>(.*?)</script>', page, re.S)
+        found = {}
+        for item in (json.loads(m.group(1)) if m else []):
+            hit = isinstance(item, str) and re.fullmatch(
+                r"https://msedge\.sf\.dl\.delivery\.mp\.microsoft\.com/\S+/"
+                r"Microsoft\.WebView2\.FixedVersionRuntime\.(\d+\.\d+\.\d+\.\d+)\.x64\.cab", item)
+            if hit:
+                found[hit.group(1)] = item
+        cands += sorted(found.items(), key=lambda kv: vkey(kv[0]), reverse=True)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log(f"webview2: could not read Microsoft's download page ({e}); trying the pinned version")
+    os.makedirs(base, exist_ok=True)
+    last = "no download available"
+    for v, url in cands:
+        tmp = tempfile.mkdtemp(prefix=".wv2-", dir=base)
+        try:
+            cab = os.path.join(tmp, os.path.basename(url))
+            if not as_json:
+                log(f"downloading Microsoft WebView2 {v} (about 300 MiB)")
+            _download(url, cab, as_json)
+            subprocess.run(["cabextract", "-q", "-d", tmp, cab], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.remove(cab)
+            tree = os.path.join(tmp, f"Microsoft.WebView2.FixedVersionRuntime.{v}.x64")
+            if not os.path.isfile(os.path.join(tree, "msedgewebview2.exe")):
+                raise RuntimeError("the download did not contain msedgewebview2.exe")
+            os.replace(tree, os.path.join(base, v))
+            return v, os.path.join(base, v)
+        except (urllib.error.URLError, OSError, subprocess.CalledProcessError, RuntimeError) as e:
+            last = f"{v}: {e}"
+            log(f"webview2: {last}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return None, last
+
+
+def register_webview2(wine, prefix, as_json=True):
     """Stage + register the WebView2 runtime so Adobe's in-app web sign-in (IMS)
-    renders instead of a blank window. Idempotent. Returns the registered version
-    string, or None if no runtime is present and no source was available.
+    renders instead of a blank window. Idempotent. Returns (version, source), with
+    version None if nothing could be staged (source then says why).
 
     The loader finds the runtime via HKLM ...\\EdgeUpdate\\Clients\\{GUID} "pv"
     + the standard path %ProgramFiles(x86)%\\Microsoft\\EdgeWebView\\Application\\
@@ -1428,70 +1475,106 @@ def register_webview2(wine, prefix):
     The Adobe installer's Common Files copy is NOT registered, hence blank sign-in."""
     ew = os.path.join(prefix, "drive_c", "Program Files (x86)", "Microsoft", "EdgeWebView")
     app = os.path.join(ew, "Application")
+    source = "prefix"
     version = _webview2_version(app)                 # already staged?
     if not version:
+        source = "adobe"
         version = _adopt_adobe_webview2(prefix, app)  # offline installs: use Adobe's own copy
-    if not version:
+    if not version and resolve_webview2():
+        source = "dev"
         src = resolve_webview2()
-        if not src:
-            return None
         version = _webview2_version(os.path.join(src, "Application"))
+        if version:
+            try:
+                os.makedirs(os.path.dirname(ew), exist_ok=True)
+                shutil.copytree(src, ew, dirs_exist_ok=True)
+            except OSError as e:
+                log(f"webview2 stage failed: {e}")
+                version = None
+    if not version:
+        source = "microsoft"
+        version, where = _webview2_fixed(as_json)
         if not version:
-            return None
+            return None, where
         try:
-            os.makedirs(os.path.dirname(ew), exist_ok=True)
-            shutil.copytree(src, ew, dirs_exist_ok=True)
+            os.makedirs(app, exist_ok=True)
+            link = os.path.join(app, version)
+            if not os.path.lexists(link):
+                os.symlink(where, link)
         except OSError as e:
-            log(f"webview2 stage failed: {e}")
-            return None
+            return None, f"could not link WebView2 into the prefix: {e}"
+        if int(version.split(".")[0]) not in WEBVIEW2_TESTED_MAJORS:
+            log(f"⚠️  WebView2 {version} is untested under neutron-wine (tested: "
+                + ", ".join(map(str, WEBVIEW2_TESTED_MAJORS)) + "). If Adobe's sign-in window stays "
+                "blank, please report it.")
     # Register in both registry views so the 32-bit + 64-bit loaders find it.
-    for clients in (r"HKLM\Software\Microsoft\EdgeUpdate\Clients",
-                    r"HKLM\Software\Wow6432Node\Microsoft\EdgeUpdate\Clients"):
-        key = clients + "\\" + WEBVIEW2_CLIENT_GUID
-        reg_set(wine, prefix, key, "name", "REG_SZ", "Microsoft Edge WebView2 Runtime")
-        reg_set(wine, prefix, key, "pv", "REG_SZ", version)
-    return version
+    reg_import(wine, prefix, {
+        rf"HKEY_LOCAL_MACHINE\{clients}\{WEBVIEW2_CLIENT_GUID}":
+            {"name": "Microsoft Edge WebView2 Runtime", "pv": version}
+        for clients in (r"Software\Microsoft\EdgeUpdate\Clients",
+                        r"Software\Wow6432Node\Microsoft\EdgeUpdate\Clients")},
+        tag="neutron-webview2")
+    return version, source
 
 
-def _mono_bases():
-    """MONO source bases, with the runtime DLL bundle's mono/ inserted so a
-    captured/shipped bundle carries wine-mono (like the WebView2 runtime)."""
-    rt = resolve_runtime()
-    bases = list(MONO_CANDIDATES)
+def webview2_untested(version):
+    return bool(version) and int(version.split(".")[0]) not in WEBVIEW2_TESTED_MAJORS
+
+
+def _mono_gecko_versions(wine):
+    """(mono, gecko) versions this runtime expects, read from the trees it ships in
+    <runtime>/share/wine/{mono,gecko}; the constants only cover a runtime without them."""
+    import re
+    rt = runtime_root(wine) if wine else None
+    mono, gecko = MONO_VERSION, GECKO_VERSION
     if rt:
-        bases.insert(1, os.path.join(rt, "mono"))
-    return bases
+        for sub, pat in (("mono", r"wine-mono-([\d.]+)$"), ("gecko", r"wine-gecko-([\d.]+)-x86$")):
+            try:
+                hits = [m.group(1) for m in (re.match(pat, n) for n in
+                        os.listdir(os.path.join(rt, "share", "wine", sub))) if m]
+            except OSError:
+                hits = []
+            if len(hits) == 1:
+                mono, gecko = (hits[0], gecko) if sub == "mono" else (mono, hits[0])
+    return mono, gecko
 
 
-def _gecko_bases():
-    """GECKO source bases, with the runtime DLL bundle's gecko/ inserted."""
-    rt = resolve_runtime()
-    bases = list(GECKO_CANDIDATES)
-    if rt:
-        bases.insert(1, os.path.join(rt, "gecko"))
-    return bases
+def _mono_bases(wine=None):
+    """Where to look for the wine-mono tree: $NEUTRON_MONO, the runtime's own share/wine/mono,
+    a $NEUTRON_RUNTIME bundle, then the host's /usr/share/wine/mono."""
+    rt, bundle = (runtime_root(wine) if wine else None), resolve_runtime()
+    return [MONO_CANDIDATES[0], rt and os.path.join(rt, "share", "wine", "mono"),
+            bundle and os.path.join(bundle, "mono"), *MONO_CANDIDATES[1:]]
 
 
-def _resolve_mono_support_msi():
+def _gecko_bases(wine=None):
+    """Same order as _mono_bases, for wine-gecko."""
+    rt, bundle = (runtime_root(wine) if wine else None), resolve_runtime()
+    return [GECKO_CANDIDATES[0], rt and os.path.join(rt, "share", "wine", "gecko"),
+            bundle and os.path.join(bundle, "gecko"), *GECKO_CANDIDATES[1:]]
+
+
+def _resolve_mono_support_msi(wine=None):
     """Absolute path to the version-matched wine-mono support MSI
-    (<tree>/wine-mono-<MONO_VERSION>/support/winemono-support.msi), or None."""
-    for base in _mono_bases():
+    (<tree>/wine-mono-<version>/support/winemono-support.msi), or None."""
+    ver = _mono_gecko_versions(wine)[0]
+    for base in _mono_bases(wine):
         if not base:
             continue
-        msi = os.path.join(base, f"wine-mono-{MONO_VERSION}",
-                           "support", "winemono-support.msi")
+        msi = os.path.join(base, f"wine-mono-{ver}", "support", "winemono-support.msi")
         if os.path.isfile(msi):
             return msi
     return None
 
 
-def _resolve_gecko_tree(arch):
+def _resolve_gecko_tree(arch, wine=None):
     """Absolute path to the version-matched extracted wine-gecko tree for an arch
-    ('x86' or 'x86_64'): <tree>/wine-gecko-<GECKO_VERSION>-<arch>, or None."""
-    for base in _gecko_bases():
+    ('x86' or 'x86_64'): <tree>/wine-gecko-<version>-<arch>, or None."""
+    ver = _mono_gecko_versions(wine)[1]
+    for base in _gecko_bases(wine):
         if not base:
             continue
-        d = os.path.join(base, f"wine-gecko-{GECKO_VERSION}-{arch}")
+        d = os.path.join(base, f"wine-gecko-{ver}-{arch}")
         if os.path.isdir(d):
             return d
     return None
@@ -1512,15 +1595,16 @@ def install_mono_gecko(wine, prefix):
       own installer runs; it creates the c:\\windows\\mono links + registry)."""
     res = {"mono": None, "gecko": None}
     win = os.path.join(prefix, "drive_c", "windows")
+    mono_ver, gecko_ver = _mono_gecko_versions(wine)
 
     # --- Gecko: place both arch trees where mshtml looks (idempotent). ----------
     gecko_done = []
     for arch, scope in (("x86", "system32"), ("x86_64", "syswow64")):
-        dst = os.path.join(win, scope, "gecko", GECKO_VERSION, "wine_gecko")
+        dst = os.path.join(win, scope, "gecko", gecko_ver, "wine_gecko")
         if os.path.isdir(dst) and os.listdir(dst):
             gecko_done.append(f"{scope}:present")
             continue
-        src = _resolve_gecko_tree(arch)
+        src = _resolve_gecko_tree(arch, wine)
         if not src:
             gecko_done.append(f"{scope}:no-source")
             continue
@@ -1531,7 +1615,7 @@ def install_mono_gecko(wine, prefix):
         except OSError as e:
             log(f"gecko {scope} install failed: {e}")
             gecko_done.append(f"{scope}:error")
-    res["gecko"] = {"version": GECKO_VERSION, "arches": gecko_done}
+    res["gecko"] = {"version": gecko_ver, "arches": gecko_done}
 
     # --- Mono: install via the support MSI unless already installed. ------------
     # Modern wine-mono's support MSI references the extracted tree in place (no
@@ -1539,11 +1623,11 @@ def install_mono_gecko(wine, prefix):
     # "Wine Mono Windows Support" uninstall record (matches the proven accc2 prefix).
     mono_marker = os.path.join(win, "syswow64", "monodebg.vxd")
     if os.path.isfile(mono_marker):
-        res["mono"] = {"version": MONO_VERSION, "status": "present"}
+        res["mono"] = {"version": mono_ver, "status": "present"}
     else:
-        msi = _resolve_mono_support_msi()
+        msi = _resolve_mono_support_msi(wine)
         if not msi:
-            res["mono"] = {"version": MONO_VERSION, "status": "no-source"}
+            res["mono"] = {"version": mono_ver, "status": "no-source"}
         else:
             try:
                 env = dict(os.environ)
@@ -1557,12 +1641,12 @@ def install_mono_gecko(wine, prefix):
                                env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=240)
                 wineserver_wait(wine, prefix)
-                res["mono"] = {"version": MONO_VERSION,
+                res["mono"] = {"version": mono_ver,
                                "status": "installed" if os.path.isfile(mono_marker)
                                else "ran"}
             except Exception as e:
                 log(f"mono install failed (non-fatal): {e}")
-                res["mono"] = {"version": MONO_VERSION, "status": "error"}
+                res["mono"] = {"version": mono_ver, "status": "error"}
     return res
 
 
@@ -2111,27 +2195,30 @@ def register_prefix_fonts(wine, prefix):
 
 
 
-def _winetricks_corefonts(wine, prefix):
-    """Run `winetricks corefonts` against the prefix with THIS runtime's wine. Returns True when
-    winetricks ran (not whether it succeeded -- callers re-read the files and judge from those).
-    `-f` forces a reinstall even when winetricks.log already says corefonts: the state we repair
-    is one where the log says done and the files say otherwise."""
-    if not shutil.which("winetricks"):
+def install_corefonts(wine, prefix, as_json=True):
+    """Put Microsoft's core fonts (Arial, Times New Roman, Courier New, Georgia, Verdana, Impact,
+    Trebuchet MS, Comic Sans MS, Andale Mono, Webdings) into the prefix's windows/Fonts, from the
+    Microsoft cache; the first use downloads Microsoft's original font installers (~4 MB). Returns
+    True when it ran to completion -- callers re-read the files and judge from those."""
+    keys = [k for k in MS_FILES if k.startswith("corefonts/")]
+    r = ms_fetch(as_json, only=keys)
+    if not r["ok"]:
+        log("could not download the Microsoft core fonts: "
+            + "; ".join(f"{k}: {v}" for k, v in r["failed"].items()))
         return False
-    try:
-        subprocess.run(["winetricks", "-q", "-f", "corefonts"],
-                       env={**os.environ, "WINE": wine, "WINEPREFIX": prefix,
-                            "WINEDEBUG": "-all", "W_OPT_UNATTENDED": "1"},
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=600, check=False)
-    except Exception as e:                        # never fail the caller on this
-        log(f"winetricks corefonts failed: {e}")
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    os.makedirs(fd, exist_ok=True)
+    for k in keys:
+        sha, name = MS_FILES[k][2], MS_FILES[k][4]
+        dst = os.path.join(fd, name)
+        if _sha256_file(dst) != sha:
+            shutil.copyfile(_ms_cached(sha), dst)
     return True
 
 
 def _repair_roman_defaults(wine, prefix):
     """Make at least one of times/arial/cour a genuine Microsoft face. Returns
-    (repaired, unrepaired, ran_winetricks).
+    (repaired, unrepaired, fetched_corefonts).
 
     Extracted verbatim from `prefix provision` on 2026-09-13 so that `neutron fonts repair` and
     provision share ONE implementation. Behaviour unchanged: copy a genuine face from the host or
@@ -2140,7 +2227,7 @@ def _repair_roman_defaults(wine, prefix):
     CoolType wants, so this cannot make a prefix worse."""
     roman = _roman_default_status(prefix)
     fake = [fn for fn, state, _ in roman if state != "real"]
-    repaired, unrepaired, ran_winetricks = [], [], False
+    repaired, unrepaired, fetched = [], [], False
     if fake:
         fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
         for fn in fake:
@@ -2158,7 +2245,7 @@ def _repair_roman_defaults(wine, prefix):
             unrepaired.append(fn)
         # 🚨 If NOTHING on this host could supply a genuine face, copying cannot
         # help and the prefix stays fatally broken -- we would only print
-        # "run `winetricks corefonts`" and call it a day, which is how a build
+        # "install the core fonts" and call it a day, which is how a build
         # tester ends up with an install that reported success and cannot launch
         # Premiere, AE or Media Encoder.
         #
@@ -2166,10 +2253,9 @@ def _repair_roman_defaults(wine, prefix):
         # prefix pays nothing, and corefonts brings georgia/verdana/impact/trebuc
         # too -- which the video trio needs and _ROMAN_DEFAULTS (times/arial/cour)
         # never covered.
-        if unrepaired and shutil.which("winetricks"):
-            log("no genuine Roman face on this host — fetching the real Microsoft "
-                "core fonts (`winetricks corefonts`); this downloads ~10 MB")
-            ran_winetricks = _winetricks_corefonts(wine, prefix)
+        if unrepaired:
+            log("no genuine Roman face on this host — installing the Microsoft core fonts")
+            fetched = install_corefonts(wine, prefix)
             # Re-evaluate: whatever landed changes the verdict below, and the
             # CoolType cache invalidation after this block must see the NEW files.
             roman = _roman_default_status(prefix)
@@ -2178,7 +2264,7 @@ def _repair_roman_defaults(wine, prefix):
             unrepaired = [fn for fn in unrepaired if fn not in newly]
         if repaired:
             register_prefix_fonts(wine, prefix)   # re-register the replaced files
-    return repaired, unrepaired, ran_winetricks
+    return repaired, unrepaired, fetched
 
 
 
@@ -2377,9 +2463,9 @@ def fonts_verdict(prefix):
         add("ms-core-fonts", "bad",
             "%d of the 6 Microsoft core fonts are missing (%s). Premiere, After Effects and Media "
             "Encoder are known to fail at startup without the real set, and Wine's own substitutes "
-            "do not count. Repair installs them (`winetricks corefonts`, ~10 MB on first use)."
+            "do not count. Repair installs them (Microsoft's font installers, ~4 MB on first use)."
             % (len(missing), ", ".join(missing)), present=present, missing=missing)
-        repair.append("install the Microsoft core fonts (winetricks corefonts)")
+        repair.append("install the Microsoft core fonts")
     else:
         add("ms-core-fonts", "good", "all 6 Microsoft core fonts present (" +
             ", ".join(_MS_CORE_FONTS) + ")", present=present, missing=[])
@@ -2521,8 +2607,8 @@ def repair_prefix_fonts(wine, prefix):
     step, never from intent -- a step that reports what it meant to do is a guess.
 
     The cache is invalidated UNCONDITIONALLY, even when nothing else changed: CoolType's cache is
-    keyed on filename, so any font overwritten in place (ours, or a `winetricks corefonts` the
-    user ran by hand) leaves a record pointing at what used to be there. Repairing the files and
+    keyed on filename, so any font overwritten in place (ours, or one the user copied in by hand)
+    leaves a record pointing at what used to be there. Repairing the files and
     leaving the cache is how a build tester lost three days (INCIDENTS.md 2026-08-12)."""
     before = fonts_verdict(prefix)
     steps = []
@@ -2530,20 +2616,18 @@ def repair_prefix_fonts(wine, prefix):
     repaired, unrepaired, ran = _repair_roman_defaults(wine, prefix)
     roman = _roman_default_status(prefix)
     steps.append({"step": "roman_default", "ok": any(st == "real" for _f, st, _d in roman),
-                  "repaired": repaired, "unrepaired": unrepaired, "winetricks": ran,
+                  "repaired": repaired, "unrepaired": unrepaired, "fetched": ran,
                   "detail": ", ".join(f"{fn}={st}" for fn, st, _ in roman)})
 
     present, missing = _ms_core_fonts_status(prefix)
     if missing:
-        ran2 = ran or _winetricks_corefonts(wine, prefix)   # the same fetch covers both
+        ran2 = ran or install_corefonts(wine, prefix)   # the same fetch covers both
         present, missing = _ms_core_fonts_status(prefix)
-        step = {"step": "ms_core_fonts", "ok": not missing, "winetricks": ran2,
+        step = {"step": "ms_core_fonts", "ok": not missing, "fetched": ran2,
                 "present": present, "missing": missing}
         if not ran2:
-            step["needs"] = "winetricks"
-            step["detail"] = ("winetricks is not installed, so the Microsoft core fonts could not "
-                              "be fetched. Install winetricks (or run `WINE=%s WINEPREFIX=%s "
-                              "winetricks corefonts`) and repair again." % (wine, prefix))
+            step["detail"] = ("the Microsoft core fonts could not be downloaded; check the "
+                              "connection and repair again")
         steps.append(step)
     else:
         steps.append({"step": "ms_core_fonts", "ok": True, "present": present, "missing": []})
@@ -3649,17 +3733,427 @@ def apply_theme(wine, prefix, colors=None):
         except OSError: pass
 
 
+# --- Microsoft components (VC++ runtimes, UCRT, d3dcompiler_47, GDI+, core fonts) ----------------
+# Neutron never redistributes Microsoft files. `neutron setup` downloads them on the user's machine
+# from the original publishers -- Microsoft's own servers; for d3dcompiler_47, Mozilla's copy of
+# the Microsoft-signed file; for the core fonts, Microsoft's original font installers -- checks
+# every byte against the sha256 pinned below, and keeps them in MICROSOFT_DIR. Provisioning copies
+# them into each prefix. Nothing here goes through winetricks: its downloads follow moving links,
+# accept a checksum mismatch in unattended mode, and the distro package pulls in the distro's wine.
+#
+# Each file is the exact build the validated prefixes run (same sha256), not "the latest".
+MICROSOFT_DIR = os.path.join(NEUTRON_DATA_DIR, "microsoft")
+_VCDL = "https://download.visualstudio.microsoft.com/download/pr/"
+_COREFONTS = "https://github.com/pushcx/corefonts/raw/8f8627b0004b5f1b952c09cf6390e4ae46475e59/"
+MS_DOWNLOADS = {   # id -> where it comes from. "ranges": byte spans that hold every file we take.
+    "vc2022-x64": {"url": _VCDL + "bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe",
+                   "sha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b", "size": 25635768},
+    "vc2022-x86": {"url": _VCDL + "bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/0C09F2611660441084CE0DF425C51C11E147E6447963C3690F97E0B25C55ED64/VC_redist.x86.exe",
+                   "sha256": "0c09f2611660441084ce0df425c51c11e147e6447963c3690f97e0b25c55ed64", "size": 13953392},
+    "vc2013-x64": {"url": "https://download.microsoft.com/download/0/5/6/056dcda9-d667-4e27-8001-8a0c6971d6b1/vcredist_x64.exe",
+                   "sha256": "20e2645b7cd5873b1fa3462b99a665ac8d6e14aae83ded9d875fea35ffdd7d7e", "size": 7201032},
+    "vc2013-x86": {"url": "https://download.microsoft.com/download/0/5/6/056dcda9-d667-4e27-8001-8a0c6971d6b1/vcredist_x86.exe",
+                   "sha256": "89f4e593ea5541d1c53f983923124f9fd061a1c0c967339109e375c661573c17", "size": 6510544},
+    "ucrt-x64":   {"url": _VCDL + "85d47aa9-69ae-4162-8300-e6b7e4bf3cf3/52B196BBE9016488C735E7B41805B651261FFA5D7AA86EB6A1D0095BE83687B2/VC_redist.x64.exe",
+                   "sha256": "52b196bbe9016488c735e7b41805b651261ffa5d7aa86eb6a1d0095be83687b2", "size": 14882064},
+    "ucrt-x86":   {"url": _VCDL + "85d47aa9-69ae-4162-8300-e6b7e4bf3cf3/14563755AC24A874241935EF2C22C5FCE973ACB001F99E524145113B2DC638C1/VC_redist.x86.exe",
+                   "sha256": "14563755ac24a874241935ef2c22c5fce973acb001f99e524145113b2dc638c1", "size": 14327344},
+    "d3dcompiler-x64": {"url": "https://raw.githubusercontent.com/mozilla/fxc2/9aba9b11079303d5577e0e3eb455f4d00f3b5946/dll/d3dcompiler_47.dll",
+                        "sha256": "4432bbd1a390874f3f0a503d45cc48d346abc3a8c0213c289f4b615bf0ee84f3", "size": 4346120},
+    "d3dcompiler-x86": {"url": "https://raw.githubusercontent.com/mozilla/fxc2/9aba9b11079303d5577e0e3eb455f4d00f3b5946/dll/d3dcompiler_47_32.dll",
+                        "sha256": "2ad0d4987fc4624566b190e747c9d95038443956ed816abfd1e2d389b5ec0851", "size": 3657992},
+    # GDI+ 6.1.7601.17514 exists only inside Windows 7 SP1 (947 MB). Both architectures are in the
+    # x64 package, and the cabinet's header plus the two LZX folders up to the gdiplus entries are
+    # ~107 MB, so fetch just those spans into a sparse file; the full download is the fallback.
+    "win7sp1-x64": {"url": "https://catalog.s.download.windowsupdate.com/msdownload/update/software/svpk/2011/02/windows6.1-kb976932-x64_74865ef2562006e51d7f9333b4a8d45b7a749dab.exe",
+                    "sha256": "f4d1d418d91b1619688a482680ee032ffd2b65e420c6d2eaecf8aa3762aa64c8", "size": 947070088,
+                    "ranges": [(14634291, 15811226), (126375580, 181334962), (225348572, 276409816)]},
+    **{f"corefonts-{n}": {"url": _COREFONTS + n + ".exe", "sha256": s, "size": z} for n, s, z in (
+        ("andale32", "0524fe42951adc3a7eb870e32f0920313c71f170c859b5f770d82b4ee111e970", 198384),
+        ("arial32",  "85297a4d146e9c87ac6f74822734bdee5f4b2a722d7eaa584b7f2cbf76f478f6", 554208),
+        ("arialb32", "a425f0ffb6a1a5ede5b979ed6177f4f4f4fdef6ae7c302a7b7720ef332fec0a8", 168176),
+        ("comic32",  "9c6df3feefde26d4e41d4a4fe5db2a89f9123a772594d7f59afd062625cd204e", 246008),
+        ("courie32", "bb511d861655dde879ae552eb86b134d6fae67cb58502e6ff73ec5d9151f3384", 646368),
+        ("georgi32", "2c2c7dcda6606ea5cf08918fb7cd3f3359e9e84338dc690013f20cd42e930301", 392440),
+        ("impact32", "6061ef3b7401d9642f5dfdb5f2b376aa14663f6275e60a51207ad4facf2fccfb", 173288),
+        ("times32",  "db56595ec6ef5d3de5c24994f001f03b2a13e37cee27bc25c58f6f43e8f807ab", 661728),
+        ("trebuc32", "5a690d9bb8510be1b8b4fe49f1f2319651fe51bbe54775ddddd8ef0bd07fdac9", 357200),
+        ("verdan32", "c1cb61255e363166794e47664e2f21af8e3a26cb6346eb8d2ae2fa85dd5aad96", 351992),
+        ("webdin32", "64595b5abc1080fba8610c5c34fab5863408e806aafe84653ca8575bed17d75a", 185072))},
+}
+_GDIPLUS = "microsoft.windows.gdiplus_6595b64144ccf1df_1.1.7601.17514_none_"
+_VC2022 = (("concrt140", "2405355f0a58067b258f8df33c327e3a3d716eaac5a3a5aebb757842d85bd376", "a2b04c69868b08a600518ebbad1661d38de4dd0e0a8e638c22d4641d410e50b1"),
+           ("msvcp140", "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9", "97e71a3c697fb1ab3af777db39009e4602525e8c3aff0837ecc7031cba188165"),
+           ("msvcp140_1", "bfad5aef4c63a669e3c140655cdfdf395b6c979b400a447bd5dcb65ed8826c3d", "01a58552686d0c6b9fd67a7ac81169fc0013aedf59a8efdc611f94907489a31c"),
+           ("msvcp140_atomic_wait", "640b2aefced484d0368eea5bdd06addd0658a3a70a49256e560d6923b404a479", "c4a2bae74e008a5bb2445f9078c14df9dcb03267248dfa64e7d04cdc8af5208e"),
+           ("msvcp140_codecvt_ids", "f2069a52880ec885ee7f0511186100eb7fada0411a2b4948fafea7735b878a18", "a5cbecfd9b8892ec9a60e30fef7ef2158032c6d91efdfbaca87c082bcd48bfa9"),
+           ("vcamp140", "52af68f35476bd03d7b97752b01bef358ffdda568d150057d6ce809f77c4f704", "3df343f3951c63caffa1bd04e93728483efdfc67220d2c03a81ff36563dfbdf2"),
+           ("vccorlib140", "19839407c3fdbc824e5bce189bf68ddf8097f12ec28b757797ffa0415c144ddd", "89ed5a6877a87ec3ec9fe4a0fb14dc950599f0b67318e746084a0c333a6c865f"),
+           ("vcomp140", "55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164", "91cbb2dbb3c4f279e5b660049b0c86ba85de845931a182ad86c45121bb013d6d"),
+           ("vcruntime140", "d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066", "a9d7732a3c3de09f0601a7fa2555093dcb49f08e2fc62a86091461f0f38393ed"))
+# File -> (download, cabinet path outer->inner ([] = the download itself), sha256, prefix dir, name).
+# A prefix dir of None means the file is only used from the cache (the installers run from there).
+MS_FILES = {
+    "vc2013-x64.exe": ("vc2013-x64", [], MS_DOWNLOADS["vc2013-x64"]["sha256"], None, None),
+    "vc2013-x86.exe": ("vc2013-x86", [], MS_DOWNLOADS["vc2013-x86"]["sha256"], None, None),
+    "vc2022-x64.exe": ("vc2022-x64", [], MS_DOWNLOADS["vc2022-x64"]["sha256"], None, None),
+    "vc2022-x86.exe": ("vc2022-x86", [], MS_DOWNLOADS["vc2022-x86"]["sha256"], None, None),
+    **{f"vc2022/x64/{n}.dll": ("vc2022-x64", ["a12", f"{n}.dll_amd64"], s64, "system32", f"{n}.dll") for n, s64, _ in _VC2022},
+    **{f"vc2022/x86/{n}.dll": ("vc2022-x86", ["a10", f"{n}.dll_x86"], s86, "syswow64", f"{n}.dll") for n, _, s86 in _VC2022},
+    # The x64 UCRT becomes ucrtbase_orig.dll: our shim (from the runtime) is system32\ucrtbase.dll and
+    # forwards to it. Exactly this build -- the shim's forward table is generated from its exports.
+    "ucrt/x64/ucrtbase.dll": ("ucrt-x64", ["a10", "ucrtbase.dll"], "51cbbde17a768930300236facd9738f54b7801e6715771ff8af90bfbe3fad44f", "system32", "ucrtbase_orig.dll"),
+    "ucrt/x86/ucrtbase.dll": ("ucrt-x86", ["a10", "ucrtbase.dll"], "66a93e40dd6721ded8a32d407d2c5fc291edaf74485ccbc848b6804efebd6dba", "syswow64", "ucrtbase.dll"),
+    "d3dcompiler/x64/d3dcompiler_47.dll": ("d3dcompiler-x64", [], MS_DOWNLOADS["d3dcompiler-x64"]["sha256"], "system32", "d3dcompiler_47.dll"),
+    "d3dcompiler/x86/d3dcompiler_47.dll": ("d3dcompiler-x86", [], MS_DOWNLOADS["d3dcompiler-x86"]["sha256"], "syswow64", "d3dcompiler_47.dll"),
+    "gdiplus/x64/gdiplus.dll": ("win7sp1-x64", ["amd64_" + _GDIPLUS + "2b24536c71ed437a/gdiplus.dll"], "980ea189929d95eb36e35980fff0c81f7b78de9422771fde8f4ac7a779f5bd89", "system32", "gdiplus.dll"),
+    "gdiplus/x86/gdiplus.dll": ("win7sp1-x64", ["x86_" + _GDIPLUS + "72d18a4386696c80/gdiplus.dll"], "c07a936009fb275d56dc451c7d05b5f5a3f4dcd985c7f02dee57d674034c602b", "syswow64", "gdiplus.dll"),
+    **{f"corefonts/{m.lower()}": (f"corefonts-{d}", [m], s, "Fonts", m.lower()) for d, m, s in (
+        ("andale32", "AndaleMo.TTF", "48d9bc613917709d3b0e0f4a6d4fe33a5c544c5035dffe9e90bc11e50e822071"),
+        ("arial32", "Arial.TTF", "35c0f3559d8db569e36c31095b8a60d441643d95f59139de40e23fada819b833"),
+        ("arial32", "Arialbd.TTF", "4044aa6b5bebbc36980206b45b0aaaaa5681552a48bcadb41746d5d1d71fd7b4"),
+        ("arial32", "Arialbi.TTF", "2f371cd9d96b3ac544519d85c16dc43ceacdfcea35090ee8ddf3ec5857c50328"),
+        ("arial32", "Ariali.TTF", "70ade233175a6a6675e4501461af9326e6f78b1ffdf787ca0da5ab0fc8c9cfd6"),
+        ("arialb32", "AriBlk.TTF", "dad7c04acb26e23dfe4780e79375ca193ddaf68409317e81577a30674668830e"),
+        ("comic32", "Comic.TTF", "b82c53776058f291382ff7e008d4675839d2dc21eb295c66391f6fb0655d8fc0"),
+        ("comic32", "Comicbd.TTF", "873361465d994994762d0b9845c99fc7baa2a600442ea8db713a7dd19f8b0172"),
+        ("courie32", "cour.ttf", "6715838c52f813f3821549d3f645db9a768bd6f3a43d8f85a89cb6875a546c61"),
+        ("courie32", "courbd.ttf", "edf8a7c5bfcac2e1fe507faab417137cbddc9071637ef4648238d0768c921e02"),
+        ("courie32", "courbi.ttf", "66dbfa20b534fba0e203da140fec7276a45a1069e424b1b9c35547538128bbe8"),
+        ("courie32", "couri.ttf", "f3f6b09855b6700977e214aab5eb9e5be6813976a24f894bd7766e92c732fbe1"),
+        ("georgi32", "Georgia.TTF", "7d0bb20c632bb59e81a0885f573bd2173f71f73204de9058feb68ce032227072"),
+        ("georgi32", "Georgiab.TTF", "82d2fbadb88a8632d7f2e8ad50420c9fd2e7d3cbc0e90b04890213a711b34b93"),
+        ("georgi32", "Georgiai.TTF", "1523f19bda6acca42c47c50da719a12dd34f85cc2606e6a5af15a7728b377b60"),
+        ("georgi32", "Georgiaz.TTF", "c983e037d8e4e694dd0fb0ba2e625bca317d67a41da2dc81e46a374e53d0ec8a"),
+        ("impact32", "Impact.TTF", "00f1fc230ac99f9b97ba1a7c214eb5b909a78660cb3826fca7d64c3af5a14848"),
+        ("times32", "Times.TTF", "4e98adeff8ccc8ef4e3ece8d4547e288ff85fdc9c7ca711a4599c234874bbe86"),
+        ("times32", "Timesbd.TTF", "4357b63cef20c01661a53c5dae70ffd20cb4765503aaed6d38b17a57c5a90bff"),
+        ("times32", "Timesbi.TTF", "192e1b0d18e90334e999a99f8c32808d6a2e74b3698b8cd90c943c2249a46549"),
+        ("times32", "Timesi.TTF", "c25ae529b4cecdbca148b6ccb862ee0abad770af8b1fd29c8dba619d1b8da78a"),
+        ("trebuc32", "trebuc.ttf", "ec3ffb302488251e1b67fb09dd578b364c5339e27c1cfb26eb627666236453d0"),
+        ("trebuc32", "Trebucbd.ttf", "f65941f9487c0a0a3b7445996ecbbd24466d7ae76ea2a597ced55f438fa63838"),
+        ("trebuc32", "trebucbi.ttf", "c0a6bdf31f9f2953b2f08a0c1734c892bc825f0fb17c604d420f7acf203a213b"),
+        ("trebuc32", "trebucit.ttf", "db56fdac7d3ba20b7aededcb6ee86c46687489d17b759e1708ea4e2d21e38410"),
+        ("verdan32", "Verdana.TTF", "96ed14949ca4b7392cff235b9c41d55c125382abbe0c0d3c2b9dd66897cae0cb"),
+        ("verdan32", "Verdanab.TTF", "c8f5065ba91680f596af3b0378e2c3e713b95a523be3d56ae185ca2b8f5f0b23"),
+        ("verdan32", "Verdanai.TTF", "91b59186656f52972531a11433c866fd56e62ec4e61e2621a2dba70c8f19a828"),
+        ("verdan32", "Verdanaz.TTF", "698e220f48f4a40e77af7eb34958c8fd02f1e18c3ba3f365d93bfa2ed4474c80"),
+        ("webdin32", "Webdings.TTF", "10d099c88521b1b9e380b7690cbe47b54bb19396ca515358cfdc15ac249e2f5d"))},
+}
+# DLL overrides for the Microsoft files (HKCU\Software\Wine\DllOverrides). msvcp140_2 and
+# vcruntime140_1 are deliberately absent: the validated prefixes run Wine's own builds of those two,
+# and the ucrtbase shim forwards __CxxFrameHandler4 to Wine's vcruntime140_1.
+MS_OVERRIDES = {
+    **{"*" + n: "native,builtin" for n, _, _ in _VC2022},
+    **{"*" + n: "native,builtin" for n in ("atl120", "msvcp120", "msvcr120", "vcomp120")},
+    "*ucrtbase": "native,builtin",
+    "*d3dcompiler_47": "native,builtin",   # a missing file falls back to Wine's builtin
+    "gdiplus": "native,builtin",           # Animate exits on Wine's builtin GDI+
+}
+
+
+def _ms_cached(sha):
+    return os.path.join(MICROSOFT_DIR, "files", sha)
+
+
+def _ms_have(sha):
+    p = _ms_cached(sha)
+    return os.path.isfile(p) and _sha256_file(p) == sha
+
+
+def _http_get(url, dest, as_json=True, ranges=None, size=None):
+    """Download `url` to `dest`. With `ranges`, fetch only those byte spans into a sparse file of
+    `size` bytes and return False (without raising) if the server ignores Range requests."""
+    import urllib.request
+    if not ranges:
+        _download(url, dest, as_json)
+        return True
+    with open(dest, "wb") as out:
+        for start, end in ranges:
+            req = urllib.request.Request(url, headers={"User-Agent": "neutron-cli",
+                                                       "Range": f"bytes={start}-{end - 1}"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if r.status != 206:
+                    return False
+                out.seek(start)
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    out.write(chunk)
+        out.truncate(size or out.tell())
+    return True
+
+
+def _cab_extract(container, members, workdir):
+    """Pull members[-1] out of `container`, descending through nested cabinets. Returns its path."""
+    src = container
+    for i, member in enumerate(members):
+        out = os.path.join(workdir, f"x{i}")
+        os.makedirs(out, exist_ok=True)
+        r = subprocess.run(["cabextract", "-q", "-d", out, "-F", member, src],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        hit = None
+        want = member.replace("\\", "/").lower()
+        for root, _dirs, files in os.walk(out):
+            for fn in files:
+                rel = os.path.relpath(os.path.join(root, fn), out).replace(os.sep, "/")
+                if rel.lower() == want:
+                    hit = os.path.join(root, fn)
+        if not hit:
+            raise RuntimeError(f"{member} not found in {os.path.basename(src)}"
+                               + (f" ({r.stderr.strip()[:200]})" if r.stderr.strip() else ""))
+        src = hit
+    return src
+
+
+def ms_fetch(as_json=True, only=None):
+    """Make sure every pinned Microsoft file (or those in `only`) is in MICROSOFT_DIR, verified.
+    Returns {"ok", "fetched", "present", "failed": {download: reason}}."""
+    import tempfile
+    os.makedirs(os.path.join(MICROSOFT_DIR, "files"), exist_ok=True)
+    want = {k: v for k, v in MS_FILES.items() if only is None or k in only}
+    missing = {k: v for k, v in want.items() if not _ms_have(v[2])}
+    res = {"ok": True, "fetched": [], "present": sorted(set(want) - set(missing)), "failed": {}}
+    if missing and not have("cabextract"):
+        res.update(ok=False, failed={"*": "cabextract is not installed"})
+        return res
+    by_dl = {}
+    for k, v in missing.items():
+        by_dl.setdefault(v[0], []).append(k)
+    for dl_id, keys in sorted(by_dl.items()):
+        dl = MS_DOWNLOADS[dl_id]
+        tmp = tempfile.mkdtemp(prefix=".ms-", dir=MICROSOFT_DIR)
+        try:
+            container = os.path.join(tmp, os.path.basename(dl["url"]))
+            whole = True
+            if dl.get("ranges"):
+                if not as_json:
+                    log(f"downloading part of {os.path.basename(dl['url'])} "
+                        f"(~{sum(b - a for a, b in dl['ranges']) / (1 << 20):.0f} MiB of "
+                        f"{dl['size'] / (1 << 20):.0f} MiB)")
+                try:
+                    whole = not _http_get(dl["url"], container, ranges=dl["ranges"], size=dl["size"])
+                    if not whole:
+                        for k in keys:
+                            _ms_take(container, MS_FILES[k], tmp)
+                except Exception as e:
+                    log(f"{dl_id}: partial download did not work ({e}); downloading the whole file")
+                    whole = True
+            if whole:
+                if not as_json:
+                    log(f"downloading {os.path.basename(dl['url'])} ({dl['size'] / (1 << 20):.1f} MiB)")
+                _http_get(dl["url"], container, as_json)
+                got = _sha256_file(container)
+                if got != dl["sha256"]:
+                    raise RuntimeError(f"checksum mismatch (expected {dl['sha256'][:16]}…, got {(got or '')[:16]}…)")
+            for k in keys:
+                if not _ms_have(MS_FILES[k][2]):
+                    _ms_take(container, MS_FILES[k], tmp)
+                res["fetched"].append(k)
+        except Exception as e:
+            res["ok"] = False
+            res["failed"][dl_id] = str(e)
+            log(f"{dl_id}: {e}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return res
+
+
+def _ms_take(container, spec, tmp):
+    """Extract one MS_FILES entry from its downloaded container into the cache, verified."""
+    _dl, members, sha, _dir, _name = spec
+    path = _cab_extract(container, members, tmp) if members else container
+    got = _sha256_file(path)
+    if got != sha:
+        raise RuntimeError(f"{members[-1] if members else os.path.basename(container)}: checksum "
+                           f"mismatch (expected {sha[:16]}…, got {(got or '')[:16]}…)")
+    dst = _ms_cached(sha)
+    shutil.copyfile(path, dst + ".part")
+    os.replace(dst + ".part", dst)
+
+
+def ms_status():
+    """{file key: True/False} for the cache, without hashing every file (size check only)."""
+    out = {}
+    for k, (_dl, _m, sha, _d, _n) in MS_FILES.items():
+        out[k] = os.path.isfile(_ms_cached(sha))
+    return out
+
+
+def reg_import(wine, prefix, sections, tag="neutron"):
+    """Write {key: {name: value}} (REG_SZ values) to the prefix in ONE `reg import`."""
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+    lines = ["REGEDIT4", ""]
+    for key, values in sections.items():
+        lines.append(f"[{key}]")
+        lines += [f'"{esc(n)}"="{esc(v)}"' for n, v in values.items()]
+        lines.append("")
+    tmp_dir = os.path.join(prefix, "drive_c", "windows", "temp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, f"{tag}.reg"), "w", newline="") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    env = {**os.environ, "WINEPREFIX": prefix}
+    env.setdefault("DISPLAY", ":0")
+    r = subprocess.run([wine, "reg", "import", rf"C:\windows\temp\{tag}.reg"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    return r.returncode == 0
+
+
+def _ms_installed(prefix, display_name):
+    """True if Programs and Features (system.reg) lists `display_name`. Checked by the installer's
+    own entry, not the VC\\Runtimes key: Wine's wine.inf writes that key itself (claiming 14.42)."""
+    want = f'"DisplayName"="{display_name}"'
+    try:
+        with open(os.path.join(prefix, "system.reg"), encoding="utf-8", errors="replace") as f:
+            return any(line.startswith(want) for line in f)
+    except OSError:
+        return False
+
+
+def _run_ms_installer(wine, prefix, key, args=("/q",)):
+    """Run a cached Microsoft installer (MS_FILES key) in the prefix. The cache names files by
+    sha256, so it runs from a copy with its real .exe name in the prefix's temp dir."""
+    tmp = os.path.join(prefix, "drive_c", "windows", "temp")
+    os.makedirs(tmp, exist_ok=True)
+    exe = os.path.join(tmp, "neutron-" + key)
+    shutil.copyfile(_ms_cached(MS_FILES[key][2]), exe)
+    env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "-all"}
+    env.setdefault("DISPLAY", ":0")
+    env.pop("WINEDLLOVERRIDES", None)
+    try:
+        r = subprocess.run([wine, exe, *args], env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=600)
+        wineserver_wait(wine, prefix)
+    finally:
+        try:
+            os.remove(exe)
+        except OSError:
+            pass
+    return r.returncode
+
+
+def install_microsoft(wine, prefix, as_json=True):
+    """Install the Microsoft components into a prefix. Idempotent; downloads anything not yet
+    cached. VC++ 2013 and 2015-2022 run through Microsoft's own installers (Adobe's installers
+    look for the registration they write), then the 2015-2022 DLLs are pinned to the validated
+    build. Returns a step dict for provision's report."""
+    fetched = ms_fetch(as_json)
+    if not fetched["ok"]:
+        return {"step": "microsoft", "ok": False, "failed": fetched["failed"],
+                "detail": "could not download the Microsoft components; run `neutron setup` "
+                          "again when online"}
+    win = os.path.join(prefix, "drive_c", "windows")
+    rt_root = os.path.dirname(os.path.dirname(os.path.realpath(wine)))
+    done = {"installers": {}, "copied": 0, "restored_wine_builtins": []}   # installer -> exit code
+
+    # 1. VC++ 2013 (12.0.40660). Like winetricks: Wine's own msvcp120/msvcr120/vcomp120 builtins
+    #    are removed first so Microsoft's installer can put its files in place.
+    if not _ms_installed(prefix, "Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40660"):
+        for scope in ("syswow64", "system32"):
+            for n in ("msvcp120", "msvcr120", "vcomp120"):
+                p = os.path.join(win, scope, n + ".dll")
+                if _is_wine_builtin(p):
+                    os.remove(p)
+        for k in ("vc2013-x86.exe", "vc2013-x64.exe"):
+            done["installers"][k] = _run_ms_installer(wine, prefix, k)
+
+    # 2. VC++ 2015-2022 (14.44.35211): the installer registers it, then the nine DLLs are copied
+    #    from the cache, because Wine's builtins carry a HIGHER version and the installer will not
+    #    replace them.
+    if not _ms_installed(prefix, "Microsoft Visual C++ 2015-2022 Redistributable (x64) - 14.44.35211"):
+        for k in ("vc2022-x86.exe", "vc2022-x64.exe"):
+            done["installers"][k] = _run_ms_installer(wine, prefix, k)
+
+    # 3. Every file with a prefix destination: copy when missing or different.
+    fonts_copied = False
+    for k, (_dl, _m, sha, pdir, name) in MS_FILES.items():
+        if not pdir:
+            continue
+        dst = os.path.join(win, pdir, name)
+        if _sha256_file(dst) == sha:
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(_ms_cached(sha), dst)
+        done["copied"] += 1
+        fonts_copied = fonts_copied or pdir == "Fonts"
+    if fonts_copied:
+        register_prefix_fonts(wine, prefix)   # Wine only offers apps the fonts in the HKLM key
+
+    # 4. msvcp140_2 + vcruntime140_1 stay Wine's builds (see MS_OVERRIDES). If an installer
+    #    replaced them, put the runtime's copies back.
+    for scope, pedir in (("system32", "x86_64-windows"), ("syswow64", "i386-windows")):
+        for n in ("msvcp140_2.dll", "vcruntime140_1.dll"):
+            p = os.path.join(win, scope, n)
+            src = os.path.join(rt_root, "lib", "wine", pedir, n)
+            if os.path.isfile(p) and not _is_wine_builtin(p) and os.path.isfile(src):
+                shutil.copyfile(src, p)
+                done["restored_wine_builtins"].append(f"{scope}/{n}")
+
+    reg_import(wine, prefix, {r"HKEY_CURRENT_USER\Software\Wine\DllOverrides": MS_OVERRIDES},
+               tag="neutron-microsoft")
+    return {"step": "microsoft", "ok": True, "overrides": len(MS_OVERRIDES), **done,
+            "downloaded": fetched["fetched"]}
+
+
+def stage_natives(wine, prefix):
+    """Copy the runtime's own DLLs (DXVK, vkd3d-proton, dxvk-nvapi, the NVIDIA wrappers, the
+    ucrtbase shim) into the prefix and write their overrides, from
+    <runtime>/share/neutron/natives.json. Copies only files whose sha256 differs, so it is cheap
+    to run on every provision and heals a prefix whose DLLs were replaced."""
+    rt = runtime_root(wine)
+    try:
+        with open(os.path.join(rt, "share", "neutron", "natives.json")) as f:
+            natives = json.load(f)
+    except (OSError, ValueError):
+        return {"step": "natives", "ok": False,
+                "detail": f"{os.path.basename(rt)} predates the runtime-bundled DLLs (no "
+                          "share/neutron/natives.json), so the prefix keeps the DLLs it has; "
+                          "`neutron update` installs a current runtime"}
+    win = os.path.join(prefix, "drive_c", "windows")
+    staged, unchanged, waiting, broken = [], 0, [], []
+    overrides = dict(PROVISION_DLL_OVERRIDES)
+    for row in natives.get("files", []):
+        name = f'{row["prefix_dir"]}/{row["dll"]}.dll'
+        req = row.get("requires")
+        if req and _sha256_file(os.path.join(win, row["prefix_dir"], req["file"])) != req["sha256"]:
+            # The shim without its exact Microsoft UCRT would break everything that links the CRT.
+            waiting.append(f'{name} (needs Microsoft\'s {req["file"]})')
+            continue
+        dst = os.path.join(win, row["prefix_dir"], row["dll"] + ".dll")
+        if _sha256_file(dst) == row["sha256"]:
+            unchanged += 1
+        elif _sha256_file(os.path.join(rt, row["file"])) != row["sha256"]:
+            broken.append(name)
+            continue
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(os.path.join(rt, row["file"]), dst)
+            staged.append(name)
+        overrides.update(row["override"])
+    reg_import(wine, prefix, {r"HKEY_CURRENT_USER\Software\Wine\DllOverrides": overrides},
+               tag="neutron-natives")
+    step = {"step": "natives", "ok": not waiting and not broken, "staged": staged,
+            "unchanged": unchanged, "overrides": len(overrides)}
+    if waiting:
+        step["detail"] = "not staged: " + ", ".join(waiting)
+    if broken:
+        step["detail"] = (f"{os.path.basename(rt)} is damaged ({', '.join(broken)} does not match "
+                          "its checksum); reinstall it with `neutron update`")
+    return step
+
+
 def cmd_prefix_provision(args):
     """Make a (possibly freshly-staged) prefix Neutron-ready. Idempotent. This is
     the single source of truth for the provisioning recipe — Mud Hut calls it
     after copying the Adobe binaries in.
 
-    Steps: (1) initialize the Wine prefix if needed (wineboot); (2) bake the
-    registry provisioning (Wayland graphics driver, the Segoe UI->Adobe Clean
-    font fix, the native DLL overrides); (3) place the Adobe-suite DXVK config.
+    Steps: (1) initialize the Wine prefix if needed (wineboot); (2) install Microsoft's
+    components (VC++ runtimes, UCRT, d3dcompiler_47, GDI+, core fonts; downloaded once by
+    `neutron setup`); (3) stage the runtime's own DLLs (DXVK, vkd3d-proton, NVIDIA wrappers, the
+    ucrtbase shim) with their overrides; (4) registry provisioning (Wayland graphics driver, fonts,
+    theme); (5) WebView2 + Mono/Gecko; (6) the Adobe-suite DXVK configs.
 
-    Also stages the runtime bundle's native DLL files (`files_staged`) and its overrides.
-    Licensing/activation is never ours (it happens inside the Adobe app)."""
+    --microsoft-only stops after (2): Mud Hut runs that before Adobe's installer, which looks for
+    the VC++ runtimes. Licensing/activation is never ours (it happens inside the Adobe app)."""
     prefix = resolve_prefix(args.path)
     if not prefix:
         die({"ok": False, **bad_prefix_reason(getattr(args, "prefix", None) or getattr(args, "path", None))},
@@ -3695,6 +4189,17 @@ def cmd_prefix_provision(args):
     steps.append({"step": "init", "skipped": False, "fresh": fresh,
                   "ok": os.path.isfile(sysreg)})
 
+    # Microsoft's components BEFORE our DLLs: the ucrtbase shim forwards to ucrtbase_orig.dll.
+    event(args, event="progress", stage="microsoft", pct=40,
+          msg="installing Microsoft's VC++ runtimes, UCRT, d3dcompiler, GDI+ and core fonts")
+    steps.append(install_microsoft(wine, prefix, args.json))
+    if getattr(args, "microsoft_only", False):
+        wineserver_wait(wine, prefix)
+        ok = all(st.get("ok", True) for st in steps)
+        emit({"ok": ok, "prefix": prefix, "steps": steps}, args.json,
+             streaming=getattr(args, "progress", False))
+        return EX_OK if ok else EX_FAIL
+
     event(args, event="progress", stage="registry", pct=62, msg="writing registry provisioning (graphics driver, app compat)")
     # 2. Registry provisioning (only affects newly-started processes; shared-safe).
     reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ",
@@ -3722,7 +4227,9 @@ def cmd_prefix_provision(args):
     if ps_detect is not None:
         steps.append({"step": "lrc_ps_detection", **ps_detect})
 
-    runtime = resolve_runtime()
+    runtime = resolve_runtime()        # a development bundle ($NEUTRON_RUNTIME), never in releases
+    event(args, event="progress", stage="dlls", pct=75, msg="staging the runtime's DXVK, vkd3d-proton and NVIDIA DLLs")
+    steps.append(stage_natives(wine, prefix))
     if runtime:
         # Stage the full proven DLL set + write every override from the bundle.
         try:
@@ -3740,7 +4247,7 @@ def cmd_prefix_provision(args):
         # is NOT ours (DXVK, vkd3d-proton, nvidia, Microsoft's VC++ redist); for the handful
         # that IS ours, the PINNED RUNTIME is the authority and the bundle is merely stale.
         # Prefer the runtime's copy per file, so this self-heals on every provision instead of
-        # waiting for someone to re-run `neutron runtime capture`.
+        # waiting for someone to rebuild the bundle.
         rt_root = os.path.dirname(os.path.dirname(os.path.realpath(wine)))   # <rt>/bin/wine -> <rt>
         refreshed, unrefreshable = [], []
         for scope, pedir in (("system32", "x86_64-windows"), ("syswow64", "i386-windows")):
@@ -3779,23 +4286,13 @@ def cmd_prefix_provision(args):
         if unrefreshable:
             log("⚠️  bundle-only wine builtins (no counterpart in the pinned runtime, "
                 "so they cannot be refreshed here): " + ", ".join(sorted(unrefreshable))
-                + " — re-run `neutron runtime capture` if one of these is suspect")
+               )
         for name, val in overrides.items():
             reg_set(wine, prefix, r"HKCU\Software\Wine\DllOverrides", name, "REG_SZ", val)
-        event(args, event="progress", stage="dlls", pct=75, msg="staged native DLL overrides from the runtime bundle")
-        steps.append({"step": "dll_overrides", "source": "runtime-bundle",
+        steps.append({"step": "dev_bundle", "source": runtime,
                       "overrides": len(overrides), "files_staged": files_staged, "ok": True,
                       "builtins_refreshed": sorted(refreshed),
                       "builtins_bundle_only": sorted(unrefreshable)})
-    else:
-        # No bundle yet: write the minimal override set, but the native DLL FILES
-        # aren't staged (apps won't launch until `neutron runtime capture` is run).
-        for dll, val in PROVISION_DLL_OVERRIDES.items():
-            reg_set(wine, prefix, r"HKCU\Software\Wine\DllOverrides", dll, "REG_SZ", val)
-        steps.append({"step": "dll_overrides", "source": "builtin-minimal",
-                      "count": len(PROVISION_DLL_OVERRIDES), "ok": True,
-                      "note": "no runtime bundle; native DLL files NOT staged"})
-
     fonts = expected_font_replacements(runtime)
     for name, repl in fonts.items():
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
@@ -3817,30 +4314,27 @@ def cmd_prefix_provision(args):
     # Repro'd and reversed in the clean room 2026-08-11; see
     # _roman_default_status(). We only ever copy a font whose PostScript name is
     # genuinely the one CoolType wants, so this cannot make a prefix worse.
-    repaired, unrepaired, _ran_winetricks = _repair_roman_defaults(wine, prefix)
+    repaired, unrepaired, _fetched = _repair_roman_defaults(wine, prefix)
     # ⭐ 2026-09-13 (operator's decision): ALSO fetch when ANY of the six Microsoft core fonts is
-    # missing, not only when the Roman defaults could not be repaired locally. Before this, a
-    # host with a genuine Times but no msttcorefonts produced a freshly provisioned prefix that
-    # `fonts check` reads RED until someone presses Repair. The gate's spirit is kept: a prefix
-    # that already has the six pays nothing, and a winetricks failure never fails provisioning.
+    # missing, not only when the Roman defaults could not be repaired locally. install_microsoft
+    # above already put them in place; this catches a prefix whose Fonts dir was changed since.
     _present, _missing = _ms_core_fonts_status(prefix)
     _core_fetched = False
-    if _missing and not _ran_winetricks and shutil.which("winetricks"):
-        log("Microsoft core fonts incomplete (missing %s) -- fetching the real set "
-            "(`winetricks corefonts`); this downloads ~10 MB on first use" % ", ".join(_missing))
-        _core_fetched = _winetricks_corefonts(wine, prefix)
+    if _missing and not _fetched:
+        log("Microsoft core fonts incomplete (missing %s) -- installing them" % ", ".join(_missing))
+        _core_fetched = install_corefonts(wine, prefix, args.json)
         _present, _missing = _ms_core_fonts_status(prefix)
         if _core_fetched:
             register_prefix_fonts(wine, prefix)   # the new files must be registered too
     steps.append({"step": "ms_core_fonts", "ok": not _missing, "present": _present,
-                  "missing": _missing, "fetched": _core_fetched or _ran_winetricks,
+                  "missing": _missing, "fetched": _core_fetched or _fetched,
                   "detail": ("%d/6 present" % len(_present)) if not _missing else
                             ("%d/6 present, missing %s -- Premiere, After Effects and Media Encoder "
-                             "will not start; run `neutron fonts repair <prefix>` once winetricks "
-                             "is installed" % (len(_present), ", ".join(_missing)))})
+                             "will not start; run `neutron fonts repair <prefix>` when online"
+                             % (len(_present), ", ".join(_missing)))})
     # 🚨 UNCONDITIONALLY, even when nothing was repaired. CoolType's cache is
     # keyed on FILENAME, so any font work that overwrites a file in place --
-    # ours above, or the `winetricks corefonts` we tell people to run -- leaves
+    # ours above, or a font the user copied in -- leaves
     # the cached record pointing at whatever used to be there. Repairing the
     # files and leaving the cache yields a prefix that passes every check and
     # still fails, which is exactly how the build tester lost three days after
@@ -3863,11 +4357,11 @@ def cmd_prefix_provision(args):
                   "detail": ", ".join(f"{fn}={state}" for fn, state, _ in roman) +
                             ("" if genuine else
                              "  — NO genuine Roman face; After Effects WILL fail at startup. "
-                             "Install the real Microsoft core fonts (`winetricks corefonts`).")})
+                             "Run `neutron fonts repair` to install the Microsoft core fonts.")})
     if not genuine:
         log("⚠️  no genuine Roman default font (times/arial/cour are all Wine "
             "substitutes) — After Effects will fail at startup. Run "
-            "`winetricks corefonts` against this prefix.")
+            "`neutron fonts repair` against this prefix.")
 
     # Desktop identity: a .desktop + extracted icon per installed app. Gives each app its own
     # dock icon (StartupWMClass = Wine's app_id) instead of inheriting Collider's, and puts the
@@ -3886,12 +4380,16 @@ def cmd_prefix_provision(args):
 
     # WebView2: stage + register the runtime or Adobe's in-app web sign-in (IMS)
     # renders BLANK (the installer's Common Files copy is unregistered).
-    wv2 = register_webview2(wine, prefix)
-    event(args, event="progress", stage="webview2", pct=88, msg="adopted the WebView2 runtime (Adobe sign-in)")
-    steps.append({"step": "webview2", "version": wv2, "ok": wv2 is not None,
-                  "note": None if wv2 else
-                  "no WebView2 runtime source (set NEUTRON_WEBVIEW2 or stage ~/neutron/webview2); "
-                  "Adobe in-app sign-in will render blank without it"})
+    wv2, wv2_src = register_webview2(wine, prefix, args.json)
+    event(args, event="progress", stage="webview2", pct=88, msg="registered the WebView2 runtime (Adobe sign-in)")
+    wv2_step = {"step": "webview2", "version": wv2, "source": wv2 and wv2_src, "ok": wv2 is not None}
+    if not wv2:
+        wv2_step["detail"] = (f"no WebView2 runtime ({wv2_src}); Adobe's in-app sign-in will "
+                              "render blank until provisioning can download it")
+    elif wv2_src == "microsoft" and webview2_untested(wv2):
+        wv2_step["warning"] = (f"WebView2 {wv2} (Microsoft's current release) is untested under "
+                               "neutron-wine; tested: " + ", ".join(map(str, WEBVIEW2_TESTED_MAJORS)))
+    steps.append(wv2_step)
 
     # Mono + Gecko: INSTALL the matching versions so wineboot never prompts at
     # launch and nothing is disabled (the correct, non-clobbering handling — a
@@ -4019,16 +4517,13 @@ def cmd_prefix_provision(args):
     steps.append({"step": "dxvk_conf_per_app", "apps": per_app, "ok": True})
 
 
-    deferred = ["licensing/activation", "desktop-entries + XDG MIME associations"]
-    if not runtime:
-        deferred.insert(0, "native-dll-staging (run `neutron runtime capture` to build the bundle)")
+    deferred = ["licensing/activation (inside the Adobe app)"]
     if not wv2:
-        deferred.insert(0, "webview2-runtime (stage ~/neutron/webview2 or set NEUTRON_WEBVIEW2; "
-                           "Adobe in-app sign-in renders blank without it)")
+        deferred.insert(0, "webview2-runtime (Adobe in-app sign-in renders blank without it)")
     if not (mono_ok and gecko_ok):
-        deferred.insert(0, f"mono/gecko install (stage matching wine-mono-{MONO_VERSION} + "
-                           f"wine-gecko-{GECKO_VERSION} under ~/neutron/{{mono,gecko}} or set "
-                           "NEUTRON_MONO/NEUTRON_GECKO; without them wineboot prompts for Mono at launch)")
+        _mv, _gv = _mono_gecko_versions(wine)
+        deferred.insert(0, f"mono/gecko install (this runtime has no wine-mono-{_mv} / "
+                           f"wine-gecko-{_gv} tree; without them wineboot prompts for Mono at launch)")
 
     emit({
         "ok": True,
@@ -4039,51 +4534,6 @@ def cmd_prefix_provision(args):
         "deferred": deferred,
     }, args.json, streaming=getattr(args, "progress", False))
     return EX_OK
-
-
-def _build_ucrtshim(orig_path, out_path):
-    """(Re)build the 64-bit ucrtbase FH4 + "\\?\"-strip proxy from MS's real UCRT
-    (`ucrtbase_orig.dll`) using the checked-in reproducible source in
-    scripts/ucrtshim/ (see stub.c + memory neutron-native-muxing-idea / collider_notes
-    §3). Capturing the proxy as an opaque binary would freeze whatever fixes the source
-    prefix happened to have; building from source guarantees both the FH4 forwarder and
-    the _wstat64 "\\?\"-strip (Premiere native-muxing fix). Returns True on success. On
-    failure (e.g. mingw-w64 absent) logs a warning and LEAVES whatever ucrtbase.dll the
-    copy loop already staged, so capture still yields a working — if not freshly built —
-    bundle."""
-    builder = os.path.join(NEUTRON_REPO, "scripts", "ucrtshim", "build.sh")
-    if not os.path.isfile(builder):
-        log(f"ucrtshim: builder missing ({builder}); keeping captured ucrtbase.dll")
-        return False
-    try:
-        r = subprocess.run(["bash", builder, orig_path, out_path],
-                           capture_output=True, text=True)
-    except OSError as e:
-        log(f"ucrtshim: build could not start ({e}); keeping captured ucrtbase.dll")
-        return False
-    if r.returncode != 0:
-        detail = (r.stderr or r.stdout or "").strip().splitlines()
-        log(f"ucrtshim: build failed (rc={r.returncode}: "
-            f"{detail[-1] if detail else 'no output'}); keeping captured ucrtbase.dll")
-        return False
-    out = (r.stdout or "").strip().splitlines()
-    log(f"ucrtshim: {out[-1] if out else 'rebuilt ucrtbase.dll from source'}")
-    return True
-
-
-def _copytree_unless_same(src, dst):
-    """copytree, but a no-op when src IS dst.
-
-    `neutron runtime capture --out ~/neutron/runtime` re-resolves mono/gecko/webview2 through
-    the same `_resolve_*` helpers `provision` uses, and those find the BUNDLE's own copy when it
-    is the only one on the machine. copytree then raises SameFileError for every file and the
-    step reports itself as failed -- so a capture that changed nothing about mono read as
-    "capture mono failed" and recorded mono as absent. Nothing was ever wrong with it.
-    """
-    if os.path.realpath(src) == os.path.realpath(dst):
-        return "same"
-    shutil.copytree(src, dst, dirs_exist_ok=True)
-    return "copied"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -4243,118 +4693,6 @@ def cmd_runtime_which(args):
     if not wine:
         die({**out, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
     emit(out, args.json)
-    return EX_OK
-
-
-def cmd_runtime_capture(args):
-    """Build/refresh the Neutron runtime DLL bundle from a proven prefix. Reads
-    the source prefix's DllOverrides, writes the full override manifest, and
-    copies every native DLL file (system32 + syswow64) into the bundle. This is
-    the reproducible source `neutron prefix provision` stages into new prefixes."""
-    import re
-    src = resolve_prefix(args.from_prefix)
-    if not src:
-        die({"ok": False, "reason": "invalid --from prefix"}, EX_BADPREFIX, args.json)
-    out = os.path.abspath(os.path.expanduser(
-        args.out or os.path.join(HOME, "neutron", "runtime")))
-
-    try:
-        with open(os.path.join(src, "user.reg"), encoding="utf-8", errors="replace") as f:
-            reg = f.read()
-    except OSError as e:
-        die({"ok": False, "reason": f"cannot read user.reg: {e}"}, EX_FAIL, args.json)
-
-    m = re.search(r'\[Software\\\\Wine\\\\DllOverrides\](.*?)(\n\[|\Z)', reg, re.S)
-    block = m.group(1) if m else ""
-    overrides = {}
-    for star, name, val in re.findall(r'"(\*?)([^"]+)"="([^"]+)"', block):
-        overrides[star + name] = val
-    if not overrides:
-        die({"ok": False, "reason": "no DllOverrides in source prefix"}, EX_FAIL, args.json)
-
-    staged = {"system32": 0, "syswow64": 0}
-    total = 0
-    for scope in ("system32", "syswow64"):
-        srcdir = os.path.join(src, "drive_c", "windows", scope)
-        dstdir = os.path.join(out, "dlls", scope)
-        os.makedirs(dstdir, exist_ok=True)
-        for full, val in overrides.items():
-            if "native" not in val:
-                continue
-            name = full.lstrip("*")
-            dll = name if name.lower().endswith(".dll") else name + ".dll"
-            # Stage the DLL AND its Wine forwarder companion if present. Wine ships
-            # some builtins split as a forwarder (X.dll) + impl (X_orig.dll); staging
-            # only the forwarder breaks it (e.g. ucrtbase.dll -> ucrtbase_orig).
-            for cand in (dll, dll[:-4] + "_orig.dll"):
-                sp = os.path.join(srcdir, cand)
-                if os.path.isfile(sp):
-                    try:
-                        shutil.copyfile(sp, os.path.join(dstdir, cand))
-                        staged[scope] += 1
-                        total += os.path.getsize(sp)
-                    except OSError as e:
-                        log(f"capture {scope}/{cand} failed: {e}")
-
-    # Rebuild the 64-bit ucrtbase proxy from source rather than shipping the opaquely
-    # captured one, so the bundle always carries BOTH the __CxxFrameHandler4 forwarder and
-    # the _wstat64 "\\?\"-strip (Premiere native-muxing fix). 64-bit only — the FH4 proxy
-    # and the MainConcept muxer are 64-bit; syswow64 ships MS's real ucrtbase untouched.
-    shim_out = None
-    _shim_orig = os.path.join(out, "dlls", "system32", "ucrtbase_orig.dll")
-    if os.path.isfile(_shim_orig):
-        shim_out = _build_ucrtshim(_shim_orig, os.path.join(out, "dlls", "system32", "ucrtbase.dll"))
-
-    with open(os.path.join(out, "overrides.json"), "w") as f:
-        json.dump(overrides, f, indent=2, sort_keys=True)
-
-    # Also capture the font-replacement map (fonts Adobe needs -> Adobe Clean).
-    fm = re.search(r'\[Software\\\\Wine\\\\Fonts\\\\Replacements\](.*?)(\n\[|\Z)', reg, re.S)
-    fonts = dict(re.findall(r'"([^"]+)"="([^"]+)"', fm.group(1))) if fm else {}
-    with open(os.path.join(out, "fonts.json"), "w") as f:
-        json.dump(fonts, f, indent=2, sort_keys=True)
-
-    # Capture the Microsoft Edge WebView2 registered runtime — Adobe's in-app
-    # sign-in (IMS) is a WebView2 web UI and renders BLANK without it (the Adobe
-    # installer ships it UNregistered). Copy the source prefix's registered
-    # EdgeWebView tree into <out>/webview2 so `prefix provision` (register_webview2)
-    # can stage + register it. Large (~550MB) but self-contained, like the DLL set.
-    wv2_src = os.path.join(src, "drive_c", "Program Files (x86)", "Microsoft", "EdgeWebView")
-    wv2_ver = _webview2_version(os.path.join(wv2_src, "Application"))
-    if wv2_ver:
-        try:
-            _copytree_unless_same(wv2_src, os.path.join(out, "webview2"))
-        except OSError as e:
-            log(f"capture webview2 failed: {e}")
-            wv2_ver = None
-
-    # Capture wine-mono + wine-gecko (version-matched to the runtime) into the bundle
-    # so `prefix provision` (install_mono_gecko) installs them on any machine — else a
-    # runtime-version bump / Adobe's mshtml web content re-prompts the Mono/Gecko
-    # installer. Runtime artifacts, like WebView2; sourced from wherever _resolve_* finds.
-    mono_ver = None
-    msi = _resolve_mono_support_msi()
-    if msi:  # msi = <base>/wine-mono-<ver>/support/winemono-support.msi -> copy the tree
-        try:
-            _copytree_unless_same(os.path.dirname(os.path.dirname(msi)),
-                                  os.path.join(out, "mono", f"wine-mono-{MONO_VERSION}"))
-            mono_ver = MONO_VERSION
-        except OSError as e:
-            log(f"capture mono failed: {e}")
-    gecko_arches = []
-    for arch in ("x86", "x86_64"):
-        g = _resolve_gecko_tree(arch)
-        if g:
-            try:
-                _copytree_unless_same(
-                    g, os.path.join(out, "gecko", f"wine-gecko-{GECKO_VERSION}-{arch}"))
-                gecko_arches.append(arch)
-            except OSError as e:
-                log(f"capture gecko {arch} failed: {e}")
-
-    emit({"ok": True, "runtime": out, "source": src, "overrides": len(overrides),
-          "fonts": len(fonts), "webview2": wv2_ver, "mono": mono_ver, "gecko": gecko_arches,
-          "staged": staged, "bytes": total, "ucrtshim": shim_out}, args.json)
     return EX_OK
 
 
@@ -6144,9 +6482,28 @@ def cmd_doctor(args):
                 check("nvcuda-gated", _has_marker(nvcuda, b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT"),
                       "gated release build" if _has_marker(
                           nvcuda, b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT")
-                      else "UNGATED DIAG BUILD - CUDA exports will crash in libcuda. Install "
-                           "~/nvidia-libs/nvcuda/build.release/dlls/nvcuda/nvcuda.dll.so over "
-                           "it (and over ~/neutron/runtime/dlls/system32/nvcuda.dll).")
+                      else "UNGATED DIAG BUILD - CUDA exports will crash in libcuda. Run "
+                           "`neutron prefix provision <prefix>` to restage the runtime's build.")
+            # Microsoft's components, by checksum: a same-named Wine builtin or a different build
+            # would pass a presence test. Without them Adobe's installers and apps fail to start.
+            _win = os.path.join(prefix, "drive_c", "windows")
+            _bad = [f"{d}/{n}" for (_dl, _m, sha, d, n) in MS_FILES.values()
+                    if d and _sha256_file(os.path.join(_win, d, n)) != sha]
+            check("microsoft-components", not _bad,
+                  "VC++ runtimes, UCRT, d3dcompiler_47, GDI+ and core fonts in place" if not _bad
+                  else "%d missing or different (%s%s). Run `neutron prefix provision <prefix>`."
+                       % (len(_bad), ", ".join(_bad[:4]), ", ..." if len(_bad) > 4 else ""))
+            # WebView2 renders Adobe's sign-in window.
+            _wv = _webview2_version(os.path.join(prefix, "drive_c", "Program Files (x86)",
+                                                 "Microsoft", "EdgeWebView", "Application"))
+            check("webview2", bool(_wv),
+                  (f"{_wv}" + (" -- untested under neutron-wine (tested: "
+                               + ", ".join(map(str, WEBVIEW2_TESTED_MAJORS)) + ")"
+                               if webview2_untested(_wv) else "")) if _wv
+                  else "no registered WebView2 runtime: Adobe's sign-in window will be blank. "
+                       "Run `neutron prefix provision <prefix>`.")
+            if webview2_untested(_wv):
+                checks[-1]["warning"] = True
             # 🚨 CoolType's default Roman face. Adobe resolves it by PostScript
             # name, and Wine ships a substitute for all three candidate files
             # under the same Microsoft filenames -- so a prefix can hold
@@ -6332,7 +6689,7 @@ def build_parser():
                         "OPT-IN on purpose: Mud Hut runs `neutron prefix provision` with INHERITED "
                         "stdout, so streaming by default would inject these lines into Mud Hut's own "
                         "event stream and Collider would read our result as Mud Hut's.")
-    p.add_argument("--version", action="store_true",
+    p.add_argument("--version", action="store_true", dest="show_version",
                    help="print the version of every Neutron piece and exit")
     sub = p.add_subparsers(dest="cmd")
 
@@ -6355,6 +6712,9 @@ def build_parser():
     pv = psub.add_parser("provision",
                          help="make a staged prefix Neutron-ready (idempotent)")
     pv.add_argument("path", nargs="?", default=None)
+    pv.add_argument("--microsoft-only", action="store_true",
+                    help="only install Microsoft's components (VC++ runtimes, UCRT, d3dcompiler_47, "
+                         "GDI+, core fonts); Mud Hut runs this before Adobe's installer")
     pv.set_defaults(func=cmd_prefix_provision)
 
     # launch
@@ -6459,16 +6819,9 @@ def build_parser():
     pd.add_argument("--prefix", default=None)
     pd.set_defaults(func=cmd_doctor)
 
-    # runtime: build/refresh the DLL bundle that provision stages
-    prt = sub.add_parser("runtime", help="Neutron runtime DLL bundle")
+    # runtime: the neutron-wine runtimes
+    prt = sub.add_parser("runtime", help="neutron-wine runtimes")
     rsub = prt.add_subparsers(dest="subcmd", required=True)
-    rc = rsub.add_parser("capture",
-                         help="build the DLL bundle from a proven prefix")
-    rc.add_argument("--from", dest="from_prefix", default=None,
-                    help="source prefix to capture from")
-    rc.add_argument("--out", default=None,
-                    help="bundle output dir (default ~/neutron/runtime)")
-    rc.set_defaults(func=cmd_runtime_capture)
 
     ri = rsub.add_parser("install",
                          help="download + verify + unpack a neutron-wine release")
@@ -6494,7 +6847,7 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.version:
+    if args.show_version:
         return cmd_version(args)
     if not args.cmd:
         parser.error("a command is required (or --version)")
