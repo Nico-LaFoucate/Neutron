@@ -3845,11 +3845,12 @@ MS_FILES = {
 # and the ucrtbase shim forwards __CxxFrameHandler4 to Wine's vcruntime140_1.
 MS_OVERRIDES = {
     **{"*" + n: "native,builtin" for n, _, _ in _VC2022},
-    **{"*" + n: "native,builtin" for n in ("atl120", "msvcp120", "msvcr120", "vcomp120")},
     "*ucrtbase": "native,builtin",
     "*d3dcompiler_47": "native,builtin",   # a missing file falls back to Wine's builtin
     "gdiplus": "native,builtin",           # Animate exits on Wine's builtin GDI+
 }
+# Written only when the VC++ 2013 installer runs (what winetricks' vcrun2013 sets).
+MS_OVERRIDES_VC2013 = {"*" + n: "native,builtin" for n in ("atl120", "msvcp120", "msvcr120", "vcomp120")}
 
 
 def _ms_cached(sha):
@@ -4031,11 +4032,15 @@ def _run_ms_installer(wine, prefix, key, args=("/q",)):
     return r.returncode
 
 
-def install_microsoft(wine, prefix, as_json=True):
+def install_microsoft(wine, prefix, as_json=True, vc2013=False):
     """Install the Microsoft components into a prefix. Idempotent; downloads anything not yet
-    cached. VC++ 2013 and 2015-2022 run through Microsoft's own installers (Adobe's installers
-    look for the registration they write), then the 2015-2022 DLLs are pinned to the validated
-    build. Returns a step dict for provision's report."""
+    cached. VC++ 2015-2022 runs through Microsoft's own installer (Adobe's installers look for
+    the registration it writes), then its DLLs are pinned to the validated build.
+
+    VC++ 2013 only with vc2013=True: Mud Hut asks for it right before Adobe's installer, the one
+    place it was ever installed (winetricks vcrun2013). A prefix that is already set up never gets
+    it from a later provision -- .premiere2025 runs all seven apps without it, on Wine's own
+    msvcp120/vcomp120. Returns a step dict for provision's report."""
     fetched = ms_fetch(as_json)
     if not fetched["ok"]:
         return {"step": "microsoft", "ok": False, "failed": fetched["failed"],
@@ -4047,7 +4052,7 @@ def install_microsoft(wine, prefix, as_json=True):
 
     # 1. VC++ 2013 (12.0.40660). Like winetricks: Wine's own msvcp120/msvcr120/vcomp120 builtins
     #    are removed first so Microsoft's installer can put its files in place.
-    if not _ms_installed(prefix, "Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40660"):
+    if vc2013 and not _ms_installed(prefix, "Microsoft Visual C++ 2013 Redistributable (x64) - 12.0.40660"):
         for scope in ("syswow64", "system32"):
             for n in ("msvcp120", "msvcr120", "vcomp120"):
                 p = os.path.join(win, scope, n + ".dll")
@@ -4088,9 +4093,12 @@ def install_microsoft(wine, prefix, as_json=True):
                 shutil.copyfile(src, p)
                 done["restored_wine_builtins"].append(f"{scope}/{n}")
 
-    reg_import(wine, prefix, {r"HKEY_CURRENT_USER\Software\Wine\DllOverrides": MS_OVERRIDES},
+    overrides = dict(MS_OVERRIDES)
+    if any(k.startswith("vc2013") for k in done["installers"]):
+        overrides.update(MS_OVERRIDES_VC2013)
+    reg_import(wine, prefix, {r"HKEY_CURRENT_USER\Software\Wine\DllOverrides": overrides},
                tag="neutron-microsoft")
-    return {"step": "microsoft", "ok": True, "overrides": len(MS_OVERRIDES), **done,
+    return {"step": "microsoft", "ok": True, "overrides": len(overrides), **done,
             "downloaded": fetched["fetched"]}
 
 
@@ -4192,7 +4200,8 @@ def cmd_prefix_provision(args):
     # Microsoft's components BEFORE our DLLs: the ucrtbase shim forwards to ucrtbase_orig.dll.
     event(args, event="progress", stage="microsoft", pct=40,
           msg="installing Microsoft's VC++ runtimes, UCRT, d3dcompiler, GDI+ and core fonts")
-    steps.append(install_microsoft(wine, prefix, args.json))
+    steps.append(install_microsoft(wine, prefix, args.json,
+                                   vc2013=getattr(args, "microsoft_only", False)))
     if getattr(args, "microsoft_only", False):
         wineserver_wait(wine, prefix)
         ok = all(st.get("ok", True) for st in steps)
@@ -6713,8 +6722,9 @@ def build_parser():
                          help="make a staged prefix Neutron-ready (idempotent)")
     pv.add_argument("path", nargs="?", default=None)
     pv.add_argument("--microsoft-only", action="store_true",
-                    help="only install Microsoft's components (VC++ runtimes, UCRT, d3dcompiler_47, "
-                         "GDI+, core fonts); Mud Hut runs this before Adobe's installer")
+                    help="only install Microsoft's components (VC++ 2013 and 2015-2022, UCRT, "
+                         "d3dcompiler_47, GDI+, core fonts); Mud Hut runs this before Adobe's "
+                         "installer")
     pv.set_defaults(func=cmd_prefix_provision)
 
     # launch
