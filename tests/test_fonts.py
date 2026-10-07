@@ -253,7 +253,7 @@ class FontsVerdict(unittest.TestCase):
         self.assertEqual(c["missing"], list(N._MS_CORE_FONTS))
         self.assertEqual(v["status"], "bad")
         self.assertIn("Premiere, After Effects and Media Encoder", v["summary"])
-        self.assertIn("install the Microsoft core fonts (winetricks corefonts)", v["repair"])
+        self.assertIn("install the Microsoft core fonts", v["repair"])
 
     def test_partial_core_fonts_names_the_missing_ones(self):
         self.p.genuine_roman()

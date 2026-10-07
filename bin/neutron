@@ -167,13 +167,13 @@ NEUTRON_RUNTIME_BUNDLE = os.environ.get("NEUTRON_RUNTIME")
 # sign-in window renders BLANK (a big time-sink to diagnose — bank it). provision
 # stages a complete *registered* runtime to the standard path AND writes the
 # EdgeUpdate\Clients\{GUID} "pv" the loader reads (both the 64-bit view and
-# Wow6432Node — the Adobe licensing helper is 32-bit). Sources, in order: a copy already
-# registered in the prefix; Adobe's own copy in the prefix; $NEUTRON_WEBVIEW2; and last,
-# Microsoft's WebView2 Fixed Version runtime, downloaded once into MICROSOFT_DIR.
+# Wow6432Node — the Adobe licensing helper is 32-bit). Sources, in order: Adobe's own copy in the
+# prefix (only some Adobe apps bring it); a copy already staged in the prefix; $NEUTRON_WEBVIEW2;
+# and last, Microsoft's WebView2 Fixed Version runtime, downloaded once into MICROSOFT_DIR.
 WEBVIEW2_CLIENT_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 WEBVIEW2_DEV_SOURCE = os.environ.get("NEUTRON_WEBVIEW2")
-# Only the latest two majors are downloadable, and only 133 and 140 (Adobe's copies) have run
-# under neutron-wine; anything newer is flagged as untested. The pin is refreshed at release time;
+# Microsoft offers only its recent majors (150-154 in October 2026), and only 133 and 140 (Adobe's
+# copies) have run under neutron-wine; anything else is flagged as untested. The pin is refreshed at release time;
 # if it has gone, the current list is read from Microsoft's download page.
 WEBVIEW2_TESTED_MAJORS = (133, 140)
 WEBVIEW2_FIXED_PIN = ("154.0.4258.62", "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/"
@@ -883,6 +883,60 @@ def discover_prefixes():
     return out
 
 
+NEUTRON_PREFIXES_JSON = os.path.join(NEUTRON_DATA_DIR, "prefixes.json")
+
+
+def remember_prefix(prefix):
+    """Record a prefix `prefix provision` was run on: that is what makes it a Neutron prefix."""
+    p = os.path.realpath(prefix)
+    known = _recorded_prefixes()
+    if p in known:
+        return
+    try:
+        os.makedirs(NEUTRON_DATA_DIR, exist_ok=True)
+        tmp = NEUTRON_PREFIXES_JSON + ".part"
+        with open(tmp, "w") as f:
+            json.dump({"prefixes": known + [p]}, f, indent=1)
+        os.replace(tmp, NEUTRON_PREFIXES_JSON)
+    except OSError as e:
+        log(f"could not record prefix {p}: {e}")
+
+
+def _recorded_prefixes():
+    try:
+        with open(NEUTRON_PREFIXES_JSON) as f:
+            return [p for p in json.load(f).get("prefixes", []) if isinstance(p, str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def neutron_prefixes():
+    """Neutron's own prefixes: the ones `prefix provision` recorded, plus any prefix a Neutron menu
+    entry launches (prefixes provisioned before the record existed).
+
+    ⛔ `update` and `uninstall --delete-prefixes` act on THIS list, never on discover_prefixes():
+    discovery returns every directory holding a `drive_c`, which on a real machine includes
+    `~/.wine`, Proton/umu and Lutris prefixes, and copies kept as backups. `update` once
+    re-provisioned all of them with neutron-wine, and uninstall would have deleted them."""
+    out, seen = [], set()
+    cands = list(_recorded_prefixes())
+    for entry in sorted(glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop"))):
+        try:
+            with open(entry, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Exec="):
+                        toks = line.split()
+                        cands += [toks[i + 1] for i, t in enumerate(toks[:-1]) if t == "--prefix"]
+        except OSError:
+            continue
+    for p in cands:
+        r = os.path.realpath(p)
+        if r not in seen and os.path.isdir(os.path.join(r, "drive_c")):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
 def default_prefix():
     """The prefix to use when the caller did not name one.
 
@@ -1361,7 +1415,7 @@ def _webview2_version(appdir):
     vers = [d for d in os.listdir(appdir)
             if re.match(r'^\d+\.\d+\.\d+\.\d+$', d)
             and os.path.isfile(os.path.join(appdir, d, "msedgewebview2.exe"))]
-    return max(vers, default=None)
+    return max(vers, key=lambda v: tuple(int(x) for x in v.split(".")), default=None)
 
 
 def _adopt_adobe_webview2(prefix, app_dir):
@@ -1376,7 +1430,9 @@ def _adopt_adobe_webview2(prefix, app_dir):
     still gets a blank sign-in / blank UXP panel purely because nothing points at them.
 
     We bridge it with a SYMLINK (Application/<version> -> Adobe's dir) rather than a copy: that tree
-    is ~558 MB and duplicating it per prefix is pure waste. Returns the version, or None.
+    is ~558 MB and duplicating it per prefix is pure waste. The link is RELATIVE, so a moved or
+    renamed prefix keeps working; an absolute or dangling one (older CLIs wrote absolute links) is
+    replaced. Returns the version, or None.
 
     Discovered the hard way: this had to be done by hand on ~/.premiere2025 during the Animate
     home-screen investigation, and every offline-installed prefix hits it."""
@@ -1401,11 +1457,16 @@ def _adopt_adobe_webview2(prefix, app_dir):
         log(f"webview2: Adobe copy at {adobe} has no loader/exe, not adopting")
         return None
     link = os.path.join(app_dir, version)
+    rel = os.path.relpath(adobe, app_dir)
     try:
         os.makedirs(app_dir, exist_ok=True)
-        if os.path.islink(link) or os.path.exists(link):
-            return version                      # already adopted; idempotent
-        os.symlink(adobe, link)
+        if os.path.islink(link):
+            if os.readlink(link) == rel:
+                return version                  # already adopted; idempotent
+            os.remove(link)                     # absolute (prefix may have moved) or dangling
+        elif os.path.exists(link):
+            return version                      # a real copy staged there; leave it
+        os.symlink(rel, link)
     except OSError as e:
         log(f"webview2: could not adopt Adobe copy: {e}")
         return None
@@ -1483,11 +1544,21 @@ def register_webview2(wine, prefix, as_json=True):
     The Adobe installer's Common Files copy is NOT registered, hence blank sign-in."""
     ew = os.path.join(prefix, "drive_c", "Program Files (x86)", "Microsoft", "EdgeWebView")
     app = os.path.join(ew, "Application")
-    source = "prefix"
-    version = _webview2_version(app)                 # already staged?
+    # Adobe's own copy wins whenever it is there, even over a runtime staged earlier: only some
+    # Adobe apps bring it (Illustrator's "UXP WebView Support"), so a prefix whose first app was
+    # another one got Microsoft's fallback, and must move to Adobe's copy once it arrives.
+    source = "adobe"
+    version = _adopt_adobe_webview2(prefix, app)
+    if version:
+        fallback = os.path.realpath(os.path.join(MICROSOFT_DIR, "webview2"))
+        for d in (os.listdir(app) if os.path.isdir(app) else []):
+            pth = os.path.join(app, d)
+            if d != version and os.path.islink(pth) and \
+                    os.path.realpath(pth).startswith(fallback + os.sep):
+                os.remove(pth)                  # our Microsoft fallback link, now superseded
     if not version:
-        source = "adobe"
-        version = _adopt_adobe_webview2(prefix, app)  # offline installs: use Adobe's own copy
+        source = "prefix"
+        version = _webview2_version(app)             # already staged?
     if not version and resolve_webview2():
         source = "dev"
         src = resolve_webview2()
@@ -1507,6 +1578,8 @@ def register_webview2(wine, prefix, as_json=True):
         try:
             os.makedirs(app, exist_ok=True)
             link = os.path.join(app, version)
+            if os.path.islink(link) and not os.path.exists(link):
+                os.remove(link)                 # dangling (the shared copy moved); relink
             if not os.path.lexists(link):
                 os.symlink(where, link)
         except OSError as e:
@@ -1627,10 +1700,10 @@ def install_mono_gecko(wine, prefix):
 
     # --- Mono: install via the support MSI unless already installed. ------------
     # Modern wine-mono's support MSI references the extracted tree in place (no
-    # c:\windows\mono copy); its install artifact is syswow64\monodebg.vxd + the
-    # "Wine Mono Windows Support" uninstall record (matches the proven accc2 prefix).
-    mono_marker = os.path.join(win, "syswow64", "monodebg.vxd")
-    if os.path.isfile(mono_marker):
+    # c:\windows\mono copy); what it leaves is the "Wine Mono Windows Support" entry in
+    # Programs and Features (matches the proven accc2 prefix). ⛔ Not syswow64\monodebg.vxd:
+    # wineboot puts that stub in EVERY prefix, so it reported Mono "present" where it never was.
+    if _ms_installed(prefix, "Wine Mono Windows Support"):
         res["mono"] = {"version": mono_ver, "status": "present"}
     else:
         msi = _resolve_mono_support_msi(wine)
@@ -1650,7 +1723,7 @@ def install_mono_gecko(wine, prefix):
                                stderr=subprocess.DEVNULL, timeout=240)
                 wineserver_wait(wine, prefix)
                 res["mono"] = {"version": mono_ver,
-                               "status": "installed" if os.path.isfile(mono_marker)
+                               "status": "installed" if _ms_installed(prefix, "Wine Mono Windows Support")
                                else "ran"}
             except Exception as e:
                 log(f"mono install failed (non-fatal): {e}")
@@ -4185,6 +4258,7 @@ def cmd_prefix_provision(args):
     wine, is_neutron = resolve_wine()
     if not wine:
         die({"ok": False, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
+    remember_prefix(prefix)
 
     steps = []
 
@@ -4410,9 +4484,9 @@ def cmd_prefix_provision(args):
     if not wv2:
         wv2_step["detail"] = (f"no WebView2 runtime ({wv2_src}); Adobe's in-app sign-in will "
                               "render blank until provisioning can download it")
-    elif wv2_src == "microsoft" and webview2_untested(wv2):
-        wv2_step["warning"] = (f"WebView2 {wv2} (Microsoft's current release) is untested under "
-                               "neutron-wine; tested: " + ", ".join(map(str, WEBVIEW2_TESTED_MAJORS)))
+    elif webview2_untested(wv2):
+        wv2_step["warning"] = (f"WebView2 {wv2} is untested under neutron-wine; tested: "
+                               + ", ".join(map(str, WEBVIEW2_TESTED_MAJORS)))
     steps.append(wv2_step)
 
     # Mono + Gecko: INSTALL the matching versions so wineboot never prompts at
@@ -4958,7 +5032,7 @@ def cmd_launch(args):
                        "(wine runs `wineboot -u` when the stamps differ)",
              # Provision re-stamps the prefix for THIS runtime: its `wineboot -u` installs this
              # runtime's own (patched) builtins, and stage_natives then restages the runtime's
-             # DXVK / vkd3d-proton / NVIDIA DLLs. `neutron update` does this for every prefix.
+             # DXVK / vkd3d-proton / NVIDIA DLLs. `neutron update` does this for every Neutron prefix.
              "fix": "Run `neutron update` (or `neutron prefix provision %s`): it moves the "
                     "prefix to this runtime and restages Neutron's DLLs. Or pass --allow-restamp "
                     "to launch anyway." % prefix,
@@ -7144,7 +7218,7 @@ def _reprovision_prefixes(version, as_json):
     and named, so the user can close the app and update again."""
     moved, skipped, failed = [], [], []
     newest = os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{version}", "bin", "wine")
-    for p in discover_prefixes():
+    for p in neutron_prefixes():
         if not stamp_mismatch(p, newest):
             continue
         running = _running_app_ids(p)
@@ -7173,7 +7247,7 @@ def _prefixes_behind():
         return []
     newest = os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{latest}", "bin", "wine")
     out = []
-    for p in discover_prefixes():
+    for p in neutron_prefixes():
         mm = stamp_mismatch(p, newest)
         if mm:
             out.append({"prefix": p, "runtime": ", ".join(mm["prefix_runtimes"]) or "older",
@@ -7196,15 +7270,17 @@ def cmd_uninstall(args):
              ("runtimes", "microsoft", "bin", "collider", "accc", "logs", "icon-stamps",
               "prefs-check", "superseded-desktop-entries")]
     owned.append(NEUTRON_INSTALLED_JSON)
+    owned.append(NEUTRON_PREFIXES_JSON)
     owned.append(os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")),
                               "neutron"))
     owned.append(os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
                               "collider"))                                   # Collider's settings
     owned.append(os.path.join(os.path.dirname(APPS_DIR), "kwin", "scripts", KWIN_SCRIPT_ID))
-    prefixes = discover_prefixes()
-    # Never delete a directory that holds a prefix, whatever it is called.
+    # Only Neutron's own prefixes are offered for deletion (see neutron_prefixes); but never delete
+    # a directory that holds ANY prefix, whatever it is called.
+    prefixes = neutron_prefixes()
     keep = [d for d in owned if any(os.path.realpath(p).startswith(os.path.realpath(d) + os.sep)
-                                    for p in prefixes)]
+                                    for p in discover_prefixes() + prefixes)]
     remove = [d for d in owned if d not in keep and os.path.lexists(d)]
     links = [os.path.join(LOCAL_BIN, n) for n in ("neutron", "mudhut")
              if os.path.islink(os.path.join(LOCAL_BIN, n))
