@@ -73,8 +73,8 @@ patched Wine foundation and shipping the fixes those applications need to run.
 ## Compatibility
 
 > [!NOTE]
-> These are results observed on one machine, and every entry has rough edges. Tiers match the
-> [status board](https://neutronproject.org), which is canonical:
+> These are results observed on the test machines described above, and every entry has rough
+> edges. Tiers match the [status board](https://neutronproject.org), which is canonical:
 >
 > | Tier | Meaning |
 > | :--- | :--- |
@@ -106,23 +106,21 @@ patched Wine foundation and shipping the fixes those applications need to run.
 
 ### Creative Cloud 2026
 
-The table above is the 2025 line; 2026 is being brought up separately.
+The table above is the 2025 line; the 2026 line is below.
 
 | Application | Status | Notes |
 | :--- | :--- | :--- |
 | **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. Not yet used for a paid job on this release. |
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
 | **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job on this release. |
-
 | **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
 | **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
-| **Lightroom Classic 2026** | 🔵 `Likely` | Installed, deliberately **not launched yet** — opening it upgrades the catalog, which is not worth doing mid-backlog. Deferred by choice, not blocked. |
+| **Lightroom Classic 2026** | 🔵 `Likely` | Installed, **not launched yet**: opening it upgrades the Lightroom catalog. Deferred by choice, not blocked. |
 | **Animate** | ⚪ `n/a` | Adobe has not shipped a 2026 Animate. The 2024 build is current and is covered under the 2025 line above. |
 
-The whole planned 2026 support list is confirmed working, and every one of these was installed
-through Mud Hut's **offline path** from a disc image — so the suite bring-up and the offline
-installer were proven in the same exercise. Dynamic Link's prerequisites (Premiere + After Effects)
-both run on 2026, but the round trip has not been exercised on this release yet.
+The 2026 apps above were installed with Mud Hut's **offline** method from a disc image. Dynamic
+Link's prerequisites (Premiere + After Effects) both run on 2026, but the round trip has not been
+exercised on this release yet.
 
 The [status board](https://neutronproject.org) tracks both releases and is the canonical view.
 
@@ -142,8 +140,7 @@ focus areas:
   path that actually works under Wine, so panels, canvases, and monitors render on the GPU.
 - **⚡ GPU & compute mapping** — translating Windows compute APIs (D3D11/12, CUDA) into native
   Vulkan and `libcuda` for real-time effects, rendering, and export.
-- **🔐 Licensing & daemon isolation** — keeping Adobe's background authentication and licensing
-  services running without dropping sessions.
+- **🔐 Licensing & daemon isolation** — keeping Adobe's own background licensing services running.
 - **🔊 Low-latency audio** — routing through modern Linux audio (PipeWire) to avoid sync drift on
   heavy timelines.
 - **🔗 Inter-process communication** — the structural foundation for interoperability between
@@ -160,8 +157,8 @@ patched Wine runtime.
 ## Getting Started
 
 > [!IMPORTANT]
-> Neutron is in beta. You need your own licensed Adobe apps; you sign in inside each app, the
-> same as on Windows.
+> Neutron is in beta. You need your own licensed Adobe apps. You sign in inside the Adobe app, the
+> same as on Windows; Neutron never touches your Adobe account or login.
 
 **Requirements**
 
@@ -219,11 +216,12 @@ command for structured output.
 </div>
 
 Neutron is the engine; **Collider** is the cockpit. It's a graphical launcher and prefix manager
-built to sit on top of Neutron — one tinted tile per installed app, prefix provisioning, display
-scaling, theming, and the hardware-export daemon, all without touching a terminal.
+built to sit on top of Neutron — one tinted tile per installed app, installing apps through Mud
+Hut, prefix provisioning, display scaling and theming, all without touching a terminal.
 
-Collider lives in its **own repository** (public soon). Neutron is fully usable on its own via the
-CLI above — Collider is the convenience layer for people who'd rather click than type.
+Collider lives in its [**own repository**](https://github.com/Nico-LaFoucate/Collider). Neutron is
+fully usable on its own via the CLI above — Collider is the convenience layer for people who'd
+rather click than type.
 
 ---
 
@@ -232,7 +230,7 @@ CLI above — Collider is the convenience layer for people who'd rather click th
 | Path | Contents |
 | :--- | :--- |
 | [`bin/neutron`](bin/) | The Neutron CLI — the engine front door. |
-| [`scripts/`](scripts/) | The ucrtbase shim the CLI builds, and the support snapshot tool. |
+| [`scripts/`](scripts/) | The CLI's release script and the support snapshot tool. |
 | [`tests/`](tests/) | Tests for the CLI. |
 
 Documentation, known issues and guides live on the wiki at
@@ -240,26 +238,38 @@ Documentation, known issues and guides live on the wiki at
 
 ---
 
+## Reporting bugs
+
+This repository's [Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose) are the one
+place to report bugs in any Neutron piece: the CLI, neutron-wine, Collider and Mud Hut. The form
+asks for your `neutron --version` and `neutron doctor` output. Questions go to
+[Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions). Report security problems
+privately: see [`SECURITY.md`](SECURITY.md).
+
+---
+
 ## Contributing
 
-Contributions are welcome — please open an issue to discuss approach before large PRs. A few
-ground rules learned the hard way (full version in [`CONTRIBUTING.md`](CONTRIBUTING.md)):
+Contributions are welcome — please open an issue to discuss approach before large PRs. The ground
+rules (full version in [`CONTRIBUTING.md`](CONTRIBUTING.md)):
 
-- **Verify before patching.** Adobe binaries are stripped; instrument *our* side (Wine / DXVK /
-  vkd3d), don't guess Adobe's logic.
-- **Prefer correct fixes over workarounds.** A single supported preference beats a pile of blits.
-- **Patch discipline:** exact anchors, abort on mismatch, back up, verify the marker landed in the
-  built DLL, confirm a clean build.
-- **Never commit a Wine prefix or build artifacts.**
+- **Test on a real app.** Run the Adobe app your change affects, before and after.
+- **Windows behavior is the reference.** When Neutron behaves differently from Windows, that is our
+  bug, and the fix makes it behave like Windows.
+- **No per-app hacks.** Fix what Wine gets wrong, so every app that depends on it benefits.
+- **Sign off your commits** (`git commit -s`, the Developer Certificate of Origin). There is no CLA.
+
+AI-assisted contributions are welcome if you tested them on real apps and can explain them.
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ---
 
 ## License
 
 The `neutron` CLI is original code, licensed under the **GNU Lesser General Public License,
-version 2.1 or later** (`LGPL-2.1-or-later`). See [`LICENSE`](LICENSE) for the full text. Patch
-files carry the license of the project they modify: Wine and the NVIDIA wrappers
-(LGPL-2.1-or-later), vkd3d-proton (LGPL-2.1-or-later), DXVK (zlib/libpng).
+version 2.1 or later** (`LGPL-2.1-or-later`). See [`LICENSE`](LICENSE) for the full text. The
+patches Neutron runs on live in [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine), where
+each patch file carries the license of the project it modifies.
 
 ---
 
@@ -269,3 +279,7 @@ Neutron is an independent project by Nico LaFoucate and Ficus Media Group. Adobe
 names are trademarks of Adobe Inc. Neutron is not affiliated with or endorsed by Adobe.
 
 Users must provide their own legally acquired Adobe licenses and accounts.
+
+Neutron never modifies Adobe's program files. It changes one display setting in Adobe's own
+preferences (`DS.DisableDirectXDisplay` in `Debug Database.txt`) and adds three compatibility flags
+to aescripts panels' `manifest.xml` (the original is backed up).
