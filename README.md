@@ -102,7 +102,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin/Nautilus into an application. |
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
 | **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. NVENC in particular is NVIDIA-only. |
-| **Third-party plugins** | ⚪ `Untested` | Core application stability comes first. |
+| **Third-party plugins** | 🟢 `Beta` | In daily use: Captioneer and other third-party panels in Premiere Pro, and VST3 audio plugins in Premiere Pro. The aescripts + aeplugins manager runs; installing plugins through it hasn't been tested yet. |
 
 ### Creative Cloud 2026
 
