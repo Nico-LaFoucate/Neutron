@@ -11,8 +11,10 @@ Neutron is four repositories, and this guide covers all of them:
 
 ## Bugs, questions and security
 
-- **Bugs** in any of the four go to [Neutron's Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose).
-  The form asks for your `neutron --version` and `neutron doctor` output.
+- **Bugs** go to the Issues of the repository they belong to. An Adobe app that won't launch or
+  misbehaves while running, and the `neutron` CLI, go to
+  [Neutron's Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose). Collider, Mud Hut
+  (installing an app) and neutron-wine each have their own. Each form asks for what we need.
 - **Questions** go to [Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions).
 - **Security problems** are reported privately. See [SECURITY.md](SECURITY.md).
 - `contact@neutronproject.org` is for press and business only. It is not a support channel.

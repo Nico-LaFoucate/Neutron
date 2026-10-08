@@ -1,5 +1,14 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Collider bug
+    url: https://github.com/Nico-LaFoucate/Collider/issues/new/choose
+    about: Problems with the Collider app itself go to Collider's Issues.
+  - name: Mud Hut bug (installing an app)
+    url: https://github.com/Nico-LaFoucate/Mud-Hut/issues/new/choose
+    about: Problems while installing an Adobe app go to Mud Hut's Issues.
+  - name: neutron-wine bug
+    url: https://github.com/Nico-LaFoucate/neutron-wine/issues/new/choose
+    about: Problems with the neutron-wine runtime itself go to neutron-wine's Issues.
   - name: Questions and help
     url: https://github.com/Nico-LaFoucate/Neutron/discussions
     about: Ask questions and get help in GitHub Discussions.

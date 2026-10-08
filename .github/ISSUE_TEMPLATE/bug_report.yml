@@ -1,11 +1,12 @@
 name: Bug report
-description: Something in Neutron, neutron-wine, Collider or Mud Hut doesn't work.
+description: An Adobe app won't launch or misbehaves while running, or the neutron CLI doesn't work.
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a bug. This one tracker covers every Neutron piece: the `neutron` CLI, neutron-wine, Collider and Mud Hut.
+        Thanks for reporting a bug. This form is for launching and running the Adobe apps, and for the `neutron` CLI (setup, update, uninstall, prefixes).
+        Problems with the Collider app itself, with installing an app (Mud Hut) or with the neutron-wine runtime go to those repositories' Issues.
         Please report one bug per issue. Questions go to [Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions).
   - type: dropdown
     id: app
@@ -21,8 +22,6 @@ body:
         - Media Encoder
         - Animate
         - Lightroom (cloud, experimental)
-        - Collider
-        - Mud Hut (installing an app)
         - neutron setup, update or uninstall
         - Other
     validations:
