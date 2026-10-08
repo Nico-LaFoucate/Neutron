@@ -4262,6 +4262,19 @@ def cmd_prefix_provision(args):
 
     steps = []
 
+    # Adobe's helpers (Adobe Desktop Service and AdobeIPCBroker, which `launch` starts for
+    # Photoshop; CCXProcess and node, which the apps start) outlive the app, so the prefix's wine
+    # session never ends and every wineserver_wait below sat out its 240 s behind them (release
+    # test, 2026-10-07: 495 s instead of 27). With no Adobe app open, close the session first;
+    # with one open, leave it alone.
+    leftover = [_proc_win_exe(pid).rsplit("/", 1)[-1] or c
+                for pid, c, is_app in _prefix_procs(prefix) if is_app]
+    if leftover and not _running_app_ids(prefix):
+        cmd_teardown(argparse.Namespace(prefix=prefix, json=True, force=False, grace=25, app=None),
+                     _emitted=True)
+        steps.append({"step": "closed_helpers", "ok": not _prefix_procs(prefix),
+                      "closed": sorted(set(leftover))})
+
     event(args, event="progress", stage="init", pct=5, msg="initialising the wine prefix (wineboot) — this is the slow part")
     # 1. Initialize / update the prefix under Mono+Gecko suppression. Run wineboot -u
     # ALWAYS (not only on a fresh prefix): an existing prefix launched against a newer
