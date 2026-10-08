@@ -4278,7 +4278,15 @@ def cmd_prefix_provision(args):
         env["WINEPREFIX"] = prefix
         env.setdefault("DISPLAY", ":0")
         env["WINEDLLOVERRIDES"] = "mscoree,mshtml="   # suppress the Mono/Gecko prompt
-        subprocess.run([wine, "wineboot", "-u"], env=env,
+        # -r: without it wineboot also runs the Windows "Run" keys and Startup folder
+        # (wineboot.c: `if (!init && !restart) ProcessRunKeys(... L"Run" ...)`), i.e. every
+        # program set to start at login. Adobe's add-ons register CCXProcess there; it starts
+        # node.exe and an AdobeIPCBroker and never exits, so every wineserver_wait below ran
+        # out its 240 s and the stray broker can take Photoshop's IPC endpoint ("unable to
+        # communicate with Creative Cloud desktop"). -r skips only those; the forced update
+        # and RunOnce are unchanged. App launches never run them: a cold prefix boots with
+        # --init. Release test, 2026-10-07.
+        subprocess.run([wine, "wineboot", "-u", "-r"], env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
         wineserver_wait(wine, prefix)   # wineboot detaches; wait so system.reg lands
     except Exception as e:
