@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help
+    url: https://github.com/Nico-LaFoucate/Neutron/discussions
+    about: Ask questions and get help in GitHub Discussions.
+  - name: Security problem
+    url: https://github.com/Nico-LaFoucate/Neutron/security/advisories/new
+    about: Report security problems privately, never in a public issue.
+  - name: Press and business
+    url: https://neutronproject.org
+    about: contact@neutronproject.org is for press and business only. It is not a support channel.

@@ -1,0 +1,79 @@
+name: Bug report
+description: Something in Neutron, neutron-wine, Collider or Mud Hut doesn't work.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. This one tracker covers every Neutron piece: the `neutron` CLI, neutron-wine, Collider and Mud Hut.
+        Please report one bug per issue. Questions go to [Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions).
+  - type: dropdown
+    id: app
+    attributes:
+      label: App
+      description: Which app were you using when it happened?
+      options:
+        - Premiere Pro
+        - After Effects
+        - Photoshop
+        - Lightroom Classic
+        - Illustrator
+        - Media Encoder
+        - Animate
+        - Lightroom (cloud, experimental)
+        - Collider
+        - Mud Hut (installing an app)
+        - neutron setup, update or uninstall
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: The Adobe app's version or release year, if it's an Adobe app.
+      placeholder: e.g. Premiere Pro 2025
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. For anything visual, a screenshot or screen recording helps.
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      placeholder: e.g. CachyOS, Ubuntu 24.04, Fedora 40
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop and session
+      placeholder: e.g. KDE Plasma on Wayland
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: e.g. NVIDIA RTX 3080, nvidia-open
+    validations:
+      required: true
+  - type: textarea
+    id: neutron-version
+    attributes:
+      label: neutron --version
+      description: Run `neutron --version` and paste everything it prints.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: neutron-doctor
+    attributes:
+      label: neutron doctor
+      description: Run `neutron doctor --prefix <your prefix>` and paste everything it prints. Your prefix is the folder that contains `drive_c`; Collider shows it under Prefixes. You can replace your user name in any paths.
+      render: text
+    validations:
+      required: true
