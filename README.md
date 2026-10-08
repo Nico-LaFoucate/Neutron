@@ -115,7 +115,7 @@ The table above is the 2025 line; the 2026 line is below.
 | **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job on this release. |
 | **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
 | **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
-| **Lightroom Classic 2026** | 🔵 `Likely` | Installed, **not launched yet**: opening it upgrades the Lightroom catalog. Deferred by choice, not blocked. |
+| **Lightroom Classic 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Animate** | ⚪ `n/a` | Adobe has not shipped a 2026 Animate. The 2024 build is current and is covered under the 2025 line above. |
 
 The 2026 apps above were installed with Mud Hut's **offline** method from a disc image. Dynamic
