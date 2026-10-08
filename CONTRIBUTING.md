@@ -32,8 +32,10 @@ Please open an issue to discuss the approach before a large pull request.
   Windows. When Neutron behaves differently, that is our bug, and the fix makes it behave like
   Windows. If you aren't sure how Windows behaves, say so.
 - **No per-app hacks in Wine.** Fix what Wine gets wrong, so every app that depends on it benefits.
-  Per-app launch settings (an environment variable or setting in an app's launch profile) are fine.
-  Per-app code paths in Wine, and changes to Adobe's program files, are not.
+  Per-app settings are fine: an environment variable or setting in an app's launch profile, or a
+  compatibility setting Neutron writes for an app (for example the flags it adds to aescripts
+  panels' `manifest.xml`, with the original backed up). Per-app code paths in Wine, and changes to
+  Adobe's program files, are not.
 - **Never commit** a Wine prefix, build output, or any file from Adobe.
 
 ## AI-assisted contributions
