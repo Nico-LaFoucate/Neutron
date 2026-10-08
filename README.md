@@ -257,7 +257,8 @@ rules (full version in [`CONTRIBUTING.md`](CONTRIBUTING.md)):
 - **Test on a real app.** Run the Adobe app your change affects, before and after.
 - **Windows behavior is the reference.** When Neutron behaves differently from Windows, that is our
   bug, and the fix makes it behave like Windows.
-- **No per-app hacks.** Fix what Wine gets wrong, so every app that depends on it benefits.
+- **No per-app hacks in Wine.** Fix what Wine gets wrong, so every app that depends on it benefits.
+  Per-app launch settings are fine.
 - **Sign off your commits** (`git commit -s`, the Developer Certificate of Origin). There is no CLA.
 
 AI-assisted contributions are welcome if you tested them on real apps and can explain them.

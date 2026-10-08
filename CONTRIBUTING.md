@@ -31,8 +31,9 @@ Please open an issue to discuss the approach before a large pull request.
 - **Windows behavior is the reference.** The goal is for each app to behave the way it does on
   Windows. When Neutron behaves differently, that is our bug, and the fix makes it behave like
   Windows. If you aren't sure how Windows behaves, say so.
-- **No per-app hacks.** Fix what Wine gets wrong, so every app that depends on it benefits. Don't
-  add special cases for one app, and don't change Adobe's program files.
+- **No per-app hacks in Wine.** Fix what Wine gets wrong, so every app that depends on it benefits.
+  Per-app launch settings (an environment variable or setting in an app's launch profile) are fine.
+  Per-app code paths in Wine, and changes to Adobe's program files, are not.
 - **Never commit** a Wine prefix, build output, or any file from Adobe.
 
 ## AI-assisted contributions
