@@ -89,7 +89,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 
 | Application / Feature | Status | Notes |
 | :--- | :--- | :--- |
-| **Premiere Pro 2025** | 🟢 `Beta` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. Frame pacing and third-party plugins are still rough. |
+| **Premiere Pro 2025** | 🟢 `Beta` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. Frame pacing is still rough. |
 | **After Effects 2025** | 🟢 `Beta` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers/guides overlay is disabled pending CUDA↔D3D11 interop. |
 | **Photoshop 2025** | 🟢 `Beta` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). Some warm-up lag remains. |
 | **Lightroom Classic** | 🟢 `Beta` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
