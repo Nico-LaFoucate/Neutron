@@ -13,3 +13,5 @@ That link covers all four Neutron repositories: [Neutron](https://github.com/Nic
 
 Please include what is affected (which piece and version; `neutron --version` prints them all),
 how to reproduce the problem, and what an attacker could do with it.
+
+Only the latest release of each piece gets security fixes.
