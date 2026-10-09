@@ -568,13 +568,21 @@ APP_PROFILES = {
     # EXPERIMENTAL: Lightroom (the cloud app) is "Planned", not supported. This profile exists so
     # people can try it before official support; it borrows Lightroom Classic's settings (same
     # photo-editing engine and GPU path) and has not been validated.
+    # ⛔ No `dxcore=n` (2026-10-09). Our patched dxcore is a Wine BUILTIN since 11.10-22, and Wine
+    # will not load a builtin under a native-only override, so `dxcore=n` means "no dxcore at all".
+    # Lightroom's adobe_c2pa.dll imports dxcore, so with it the app stopped at "Failed to
+    # initialize Camera Raw" (log: "dxcore.dll ... not found", "Unable to load adobe_c2pa").
     "lightroomcc": {
         "name": "Lightroom (experimental)",
         "exe": _adobe("Adobe Lightroom CC", "lightroom.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
-        "overrides": "ucrtbase=n,b;dwrite=b;dxcore=n;nvapi64=n;dcomp=n,b",
+        "overrides": "ucrtbase=n,b;dwrite=b;nvapi64=n;dcomp=n,b",
         "nvapi": True,
-        "env": {"NEUTRON_DISABLE_BTW": "1"},
+        # NEUTRON_D2D_COLOR_MANAGEMENT=1: d2d1's Color Management effect + color contexts (runtime
+        # 11.10-100+). Without them Lightroom quits at "CreateD2DDeviceResources failed. HResult:
+        # 0x88990028". Off for every other app: the effect does not convert colors yet, and the
+        # suite's own fallbacks must not be swapped for a pass-through untested.
+        "env": {"NEUTRON_DISABLE_BTW": "1", "NEUTRON_D2D_COLOR_MANAGEMENT": "1"},
         "accent": "#31a8ff", "export": False,
     },
     "animate": {
