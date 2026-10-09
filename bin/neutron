@@ -4477,8 +4477,8 @@ def cmd_prefix_provision(args):
                   "missing": _missing, "fetched": _core_fetched or _fetched,
                   "detail": ("%d/6 present" % len(_present)) if not _missing else
                             ("%d/6 present, missing %s -- Premiere, After Effects and Media Encoder "
-                             "will not start; run `neutron fonts repair <prefix>` when online"
-                             % (len(_present), ", ".join(_missing)))})
+                             "will not start; run `neutron fonts repair --prefix %s` when online"
+                             % (len(_present), ", ".join(_missing), prefix))})
     # 🚨 UNCONDITIONALLY, even when nothing was repaired. CoolType's cache is
     # keyed on FILENAME, so any font work that overwrites a file in place --
     # ours above, or a font the user copied in -- leaves
@@ -4504,11 +4504,12 @@ def cmd_prefix_provision(args):
                   "detail": ", ".join(f"{fn}={state}" for fn, state, _ in roman) +
                             ("" if genuine else
                              "  — NO genuine Roman face; After Effects WILL fail at startup. "
-                             "Run `neutron fonts repair` to install the Microsoft core fonts.")})
+                             "Run `neutron fonts repair --prefix %s` to install the Microsoft "
+                             "core fonts." % prefix)})
     if not genuine:
         log("⚠️  no genuine Roman default font (times/arial/cour are all Wine "
             "substitutes) — After Effects will fail at startup. Run "
-            "`neutron fonts repair` against this prefix.")
+            "`neutron fonts repair --prefix %s`." % prefix)
 
     # Desktop identity: a .desktop + extracted icon per installed app. Gives each app its own
     # dock icon (StartupWMClass = Wine's app_id) instead of inheriting Collider's, and puts the
@@ -4710,9 +4711,8 @@ NEUTRON_GATES = {
     "wic-seed-skip": {
         "env": "NEUTRON_WIC_SEED_SKIP", "default": True,
         "what": "skip the acquire-time upload when a WIC bitmap comes back untouched",
-        "why": "the Premiere splash rendering half white was traced to this in 11.10-61 "
-               "(TODO.md P1o). Turn it off first if any UI region paints blank and then "
-               "self-corrects on redraw.",
+        "why": "the Premiere splash rendering half white was traced to this in 11.10-61. "
+               "Turn it off first if any UI region paints blank and then self-corrects on redraw.",
     },
     "owned-subsurface": {
         "env": "NEUTRON_OWNED_SUBSURFACE", "default": True,
@@ -4820,7 +4820,7 @@ def cmd_runtime_which(args):
            "version": None, "stamp": _runtime_stamp(wine),
            "pinned_by": ("NEUTRON_WINE" if os.environ.get("NEUTRON_WINE")
                          else "NEUTRON_WINE_VERSION" if os.environ.get("NEUTRON_WINE_VERSION")
-                         else "compiled-in default")}
+                         else "newest installed")}
     if wine and is_neutron:
         root = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(wine))))
         if root.startswith("neutron-wine-"):
@@ -5048,7 +5048,7 @@ def cmd_launch(args):
         # Honest about the v0 gap: the proven launcher has no software branch.
         # Faking support would violate the "meaningful exit codes" contract.
         die({"launched": False, "app": args.app, "gpu_mode": "software",
-             "reason": "software mode not implemented in v0; use --gpu (default)"},
+             "reason": "software mode is not implemented; use --gpu (default)"},
             EX_DEP, args.json)
 
     exe = _resolve_app_exe(prefix, profile["exe"])
@@ -5060,9 +5060,6 @@ def cmd_launch(args):
     if not wine:
         die({"launched": False, "reason": NO_RUNTIME_MSG},
             EX_DEP, args.json)
-    if not is_neutron:
-        log("WARNING: using system wine - Neutron patches (frame pacer / winewayland "
-            "fractional-scale) are NOT present; playback/UI fixes will be inactive")
 
     # 🚨 REFUSE A LAUNCH THAT WOULD RE-STAMP THE PREFIX. Wine compares its wine.inf mtime against
     # <prefix>/.update-timestamp and silently runs `wineboot -u` when they differ, reverting the
@@ -5450,7 +5447,7 @@ def cmd_launch(args):
             # [[state-written-before-the-fact]] in the one place built to prevent it.
             _rtroot = os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(wine))))
             _rtname = (_rtroot[len("neutron-wine-"):] if _rtroot.startswith("neutron-wine-")
-                       else ("system wine" if not is_neutron else "unrecognised layout: " + _rtroot))
+                       else "unrecognized layout: " + _rtroot)
             log_fh.write(("=== neutron runtime %s | %s\n"
                           "    app     : %s (%s)\n"
                           "    exe     : %s\n"
@@ -6586,7 +6583,7 @@ def cmd_doctor(args):
     # reproduced here.
     _wine, _wine_is_neutron = resolve_wine()
     check("wine", bool(_wine),
-          (_wine + ("  (Neutron runtime)" if _wine_is_neutron else "  (system wine)")) if _wine
+          (_wine + "  (Neutron runtime)") if _wine
           else NO_RUNTIME_MSG)
 
     # 🚨 IS THE RUNTIME ITSELF INTACT? Reported from the build tester 2026-08-25: doctor returned
@@ -7471,19 +7468,19 @@ def build_parser():
                          "inheriting the tty as before.")
     pl.add_argument("--allow-restamp", action="store_true",
                     help="launch even when this runtime's stamp differs from the prefix's. Wine "
-                         "will run `wineboot -u` and REVERT the prefix's patched natives. Use "
-                         "only when deliberately moving a prefix to a new runtime, and run "
-                         "`prefix provision` afterwards.")
+                         "will run `wineboot -u` and REVERT the prefix's patched natives. To "
+                         "move a prefix to a new runtime, run `neutron update` or `neutron "
+                         "prefix provision <prefix>` instead.")
     pl.add_argument("project_file", nargs="?", default=None,
                     help="optional file to open, e.g. from a .desktop file association "
                          "(a Linux path is translated to a Windows Z:\\ path)")
     pl.add_argument("--scale", type=float, default=None,
-                    help="display scale (e.g. 1.7); on Wayland Neutron sets "
+                    help="display scale (e.g. 1.75); on Wayland Neutron sets "
                          "LogPixels=round(96*scale). Collider passes this; else auto-detect.")
     grp = pl.add_mutually_exclusive_group()
     grp.add_argument("--gpu", action="store_true", help="GPU/Mercury (default)")
     grp.add_argument("--software", action="store_true",
-                     help="software render (NOT implemented in v0)")
+                     help="software render (not implemented)")
     pl.set_defaults(func=cmd_launch)
 
     # apps: catalog + install status for Collider's per-app widgets
