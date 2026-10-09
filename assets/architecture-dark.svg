@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 508" width="900" height="508" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
 <rect x="40" y="24" width="820" height="84" rx="14" fill="#161b22" stroke="#2d333b" stroke-width="1.4"/>
 <text x="66" y="60" font-size="20" font-weight="700" fill="#e8eaf0">Adobe Creative Applications</text>
-<text x="66" y="84" font-size="14" fill="#9aa3b2">Premiere Pro  ·  Photoshop  ·  Lightroom Classic  ·  After Effects  ·  CEP / UXP panels</text>
+<text x="66" y="84" font-size="14" fill="#9aa3b2">Premiere Pro · After Effects · Photoshop · Lightroom Classic · Illustrator · Media Encoder · Animate</text>
 <line x1="450" y1="112" x2="450" y2="138" stroke="#59626f" stroke-width="2.5"/><path d="M443,132 L450,141 L457,132" fill="none" stroke="#59626f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 <rect x="40" y="144" width="820" height="100" rx="14" fill="#0d2230" stroke="#1f6f96" stroke-width="2.4"/>
 <text x="66" y="188" font-size="25" font-weight="700" fill="#38bdf8">Neutron</text>
 <text x="834" y="184" font-size="13" font-weight="600" text-anchor="end" fill="#38bdf8" letter-spacing="1.5">THE ENGINE</text>
-<text x="66" y="218" font-size="14" fill="#9aa3b2">launch profiles  ·  app-side fixes  ·  runtime DLL bundle  ·  prefix provisioning  ·  hardware-export daemon</text>
+<text x="66" y="218" font-size="14" fill="#9aa3b2">launch profiles  ·  prefix provisioning  ·  Microsoft components  ·  fonts  ·  setup &amp; update</text>
 <line x1="450" y1="248" x2="450" y2="274" stroke="#59626f" stroke-width="2.5"/><path d="M443,268 L450,277 L457,268" fill="none" stroke="#59626f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 <rect x="40" y="280" width="820" height="84" rx="14" fill="#161b22" stroke="#2d333b" stroke-width="1.4"/>
 <text x="66" y="316" font-size="20" font-weight="700" fill="#e8eaf0">Patched Foundation</text>
@@ -14,5 +14,5 @@
 <line x1="450" y1="368" x2="450" y2="394" stroke="#59626f" stroke-width="2.5"/><path d="M443,388 L450,397 L457,388" fill="none" stroke="#59626f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 <rect x="40" y="400" width="820" height="84" rx="14" fill="#161b22" stroke="#2d333b" stroke-width="1.4"/>
 <text x="66" y="436" font-size="20" font-weight="700" fill="#e8eaf0">Linux Graphics &amp; Compute</text>
-<text x="66" y="460" font-size="14" fill="#9aa3b2">Wayland / X11  ·  Vulkan  ·  NVIDIA · CUDA · NVENC  ·  PipeWire</text>
+<text x="66" y="460" font-size="14" fill="#9aa3b2">Wayland  ·  Vulkan  ·  NVIDIA · CUDA · NVENC  ·  PipeWire</text>
 </svg>

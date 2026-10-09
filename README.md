@@ -10,7 +10,7 @@
 
 **A Wine-based compatibility engine tuned for professional creative software on Linux.**
 
-Premiere Pro · After Effects · Photoshop · Lightroom · Illustrator · Animate · Media Encoder
+Premiere Pro · After Effects · Photoshop · Lightroom Classic · Illustrator · Animate · Media Encoder
 — accelerated on your GPU, running on Linux.
 
 <br>
@@ -73,8 +73,8 @@ patched Wine foundation and shipping the fixes those applications need to run.
 ## Compatibility
 
 > [!NOTE]
-> These are results observed on the test machines described above, and every entry has rough
-> edges. Tiers match the [status board](https://neutronproject.org), which is canonical:
+> These are results observed on the test machines described above. Tiers match the
+> [status board](https://neutronproject.org), which is canonical:
 >
 > | Tier | Meaning |
 > | :--- | :--- |
@@ -91,7 +91,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | :--- | :--- | :--- |
 | **Premiere Pro 2025** | 🟢 `Beta` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. |
 | **After Effects 2025** | 🟢 `Beta` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers, guides and layer handles draw too. |
-| **Photoshop 2025** | 🟢 `Beta` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). |
+| **Photoshop 2025** | 🟢 `Beta` | Stable for day-to-day work. The full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). |
 | **Lightroom Classic** | 🟢 `Beta` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
 | **Illustrator 2025** | 🟢 `Beta` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
 | **Media Encoder 2025** | 🟢 `Beta` | Queue, render and export end-to-end, including native muxing. |
@@ -99,7 +99,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, no engine changes required — both applications must be running. |
 | **CEP / UXP panels** | 🟢 `Beta` | Third-party panels render and stay interactive inside their docks. |
 | **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab, at the tablet's native resolution. The first-stroke stray is fixed — Wine's WinTab context declared `lcOutExt` in tablet units where a real Wacom declares screen pixels, a factor-of-UPP error in the mapping Photoshop uses before it calibrates. |
-| **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin/Nautilus into an application. |
+| **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin into an application. |
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
 | **AMD / Intel GPUs** | ⚪ `Untested` | Non-NVIDIA compute/present paths have not been validated. NVENC in particular is NVIDIA-only. |
 | **Third-party plugins** | 🟢 `Beta` | In daily use: Captioneer and other third-party panels in Premiere Pro, and VST3 audio plugins in Premiere Pro. The aescripts + aeplugins manager runs; installing plugins through it hasn't been tested yet. |
@@ -112,9 +112,9 @@ The table above is the 2025 line; the 2026 line is below.
 | :--- | :--- | :--- |
 | **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. Not yet used for a paid job on this release. |
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
-| **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job on this release. |
-| **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
-| **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job on 2026. |
+| **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job. |
+| **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job. |
+| **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job. |
 | **Lightroom Classic 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Animate** | ⚪ `n/a` | Adobe has not shipped a 2026 Animate. The 2024 build is current and is covered under the 2025 line above. |
 
@@ -141,8 +141,6 @@ focus areas:
 - **⚡ GPU & compute mapping** — translating Windows compute APIs (D3D11/12, CUDA) into native
   Vulkan and `libcuda` for real-time effects, rendering, and export.
 - **🔐 Licensing & daemon isolation** — keeping Adobe's own background licensing services running.
-- **🔊 Low-latency audio** — routing through modern Linux audio (PipeWire) to avoid sync drift on
-  heavy timelines.
 - **🔗 Inter-process communication** — the structural foundation for interoperability between
   suite applications (dynamic asset linking, panels, brokers).
 - **📦 Hardware export** — NVENC output muxed natively into valid deliverables. (This began as an
@@ -165,6 +163,7 @@ patched Wine runtime.
 - 64-bit Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, current Arch / CachyOS /
   Manjaro, openSUSE Tumbleweed) and a **Wayland** session.
 - An **NVIDIA GPU**. AMD and Intel GPUs are not validated yet.
+- **32-bit (multilib) system and graphics libraries**: Adobe's apps start 32-bit helper processes.
 - **Python 3** and **cabextract**.
 
 **Install**
@@ -176,18 +175,19 @@ python3 neutron setup
 
 `neutron setup` downloads [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) and the
 [Mud Hut](https://github.com/Nico-LaFoucate/Mud-Hut) installer from GitHub, Microsoft's Visual C++
-runtimes, GDI+ and core fonts from Microsoft, and Adobe's Creative Cloud package from Adobe, and
-installs [Collider](https://github.com/Nico-LaFoucate/Collider) with a menu entry. It may ask for
-your password once, to turn on ntsync, which makes the apps much faster. Then open **Neutron
-Collider** and install your apps from its Mud Hut tab.
+runtimes and GDI+ from Microsoft, Microsoft's core fonts and d3dcompiler_47 from public copies of
+Microsoft's original files (each checked against a pinned checksum), and Adobe's Creative Cloud
+package from Adobe, and installs [Collider](https://github.com/Nico-LaFoucate/Collider) with a menu
+entry. It may ask for your password once, to turn on ntsync, which makes the apps much faster. Then
+open **Neutron Collider** and install your apps from its Mud Hut tab.
 
 `neutron update` updates everything and moves your prefixes to the new runtime.
 `neutron uninstall` removes Neutron; it asks before deleting any prefix.
 
 ### The `neutron` CLI
 
-`neutron` is the engine's front door — the same interface Collider drives. Add `--json` to any
-command for structured output.
+`neutron` is the engine's front door — the same interface Collider drives. For structured output,
+put `--json` before the command: `neutron --json doctor --prefix <path>`.
 
 | Command | What it does |
 | :--- | :--- |

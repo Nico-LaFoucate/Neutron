@@ -76,25 +76,33 @@ def host():
 
 
 # ------------------------------------------------------------------------- runtime
+def active_runtime():
+    """The runtime the CLI resolves, as (version, directory), from `neutron --json runtime which`.
+    Asking the CLI is the only reliable answer: it honors NEUTRON_WINE_VERSION and otherwise uses
+    the newest installed runtime. Returns (None, None) when the CLI can't name one."""
+    try:
+        r = subprocess.run(["neutron", "--json", "runtime", "which"],
+                           capture_output=True, text=True, timeout=60)
+        w = json.loads(r.stdout or "{}")
+    except Exception:
+        return None, None
+    wine = w.get("wine")
+    if not wine:
+        return w.get("version"), None
+    return w.get("version"), os.path.dirname(os.path.dirname(os.path.realpath(wine)))
+
+
 def runtime():
     section("RUNTIME")
     base = os.path.join(HOME, ".local/share/neutron/runtimes")
     rts = sorted(os.listdir(base)) if os.path.isdir(base) else []
     # Only detail the ACTIVE runtime. A dev box accumulates dozens; a tester has one, so listing
     # them all would bury the real differences under 40 spurious diff lines.
-    active = os.environ.get("NEUTRON_WINE_VERSION")
-    if not active:
-        try:
-            src = open(os.path.join(HOME, "neutron/bin/neutron"), encoding="utf-8").read()
-            m = re.search(r'NEUTRON_WINE_VERSION["\']?\s*,\s*["\']([^"\']+)', src)
-            active = m.group(1) if m else None
-        except OSError:
-            active = None
+    active, active_dir = active_runtime()
     out("runtimes-installed", f"{len(rts)} (detailing the active one only)")
     out("runtime-ACTIVE", active or "<unresolved>")
-    rts = [r for r in rts if active and r.endswith(active)] or rts[-1:]
-    for rt in rts:
-        d = os.path.join(base, rt)
+    for d in ([active_dir] if active_dir else []):
+        rt = os.path.basename(d)
         marker = os.path.join(d, "NEUTRON_WINE_VERSION")
         ver = open(marker).read().strip() if os.path.isfile(marker) else "?"
         out(f"  {rt}/VERSION", ver)
@@ -107,20 +115,16 @@ def runtime():
                             ("i386-windows", ("dxcore.dll", "dcomp.dll"))):
             for n in names:
                 out(f"  {rt}/lib/wine/{arch}/{n}", size(os.path.join(d, "lib/wine", arch, n)))
-
-    section("RUNTIME DLL BUNDLE (what `prefix provision` stages)")
-    b = os.path.join(HOME, "neutron/runtime")
-    out("bundle-present", os.path.isdir(b))
-    if os.path.isdir(b):
-        for sub in ("dlls/system32", "dlls/syswow64", "mono", "gecko", "webview2"):
-            p = os.path.join(b, sub)
-            out(f"  {sub}", f"{len(os.listdir(p))} entries" if os.path.isdir(p) else "MISSING")
-        ov = os.path.join(b, "overrides.json")
-        if os.path.isfile(ov):
-            try:
-                out("  overrides.json", f"{len(json.load(open(ov)))} entries")
-            except Exception as e:
-                out("  overrides.json", f"<unreadable: {e}>")
+        # The DLLs `prefix provision` stages from this runtime (DXVK, vkd3d-proton, the NVIDIA
+        # wrappers, the ucrtbase shim).
+        nj = os.path.join(d, "share/neutron/natives.json")
+        try:
+            files = json.load(open(nj)).get("files", [])
+            out(f"  {rt}/share/neutron/natives.json", f"{len(files)} DLLs")
+        except OSError:
+            out(f"  {rt}/share/neutron/natives.json", "MISSING")
+        except Exception as e:
+            out(f"  {rt}/share/neutron/natives.json", f"<unreadable: {e}>")
 
     section("MUD HUT")
     mh = run(["which", "mudhut"])
