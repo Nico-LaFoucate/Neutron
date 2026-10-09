@@ -52,7 +52,7 @@ NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 # The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
 # Collider); `neutron --version` prints all of them for bug reports.
-CLI_VERSION = "1.0.0-beta.1"
+CLI_VERSION = "1.0.0-beta.2"
 NEUTRON_DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
     "neutron")
@@ -6455,12 +6455,12 @@ def cmd_theme_icons(args):
     return EX_OK if ok else EX_FAIL
 
 
-# --- KWin rule: Premiere's home screen position (KDE Plasma, Wayland) ------------------------
-# Wayland does not let a client position its own toplevel, so Premiere's home/Welcome overlay
-# lands at the top of the screen over the menu bar. KWin can place it: an optional rule matching
-# the overlay (app_id contains `neutron-premiere-`, the per-prefix id our .desktop entries and
-# `launch` give Wine; the overlay has an EMPTY title) and forcing its position. Off by default;
-# Collider exposes it in Preferences. Merges into kwinrulesrc, never clobbering other rules.
+# --- KWin rule: Premiere's home screen position (REMOVED in 1.0.0-beta.2) --------------------
+# Earlier versions could install an optional KWin rule (`neutron window-rule premiere-home`, a
+# Collider Preferences setting) meant to keep Premiere's home overlay below the menu bar. Its match
+# only ever caught Premiere's splash (2026-09-01), so the setting and the command were removed
+# (DECISIONS C36). What remains removes a rule an earlier version installed: `setup`/`update` run
+# it once, and `uninstall` runs it. It merges into kwinrulesrc and never touches other rules.
 KWIN_RULE_ID = "neutron-premiere-home"
 KWIN_RULE_KEYS = ("Description", "wmclass", "wmclasscomplete", "wmclassmatch",
                   "title", "titlematch", "position", "positionrule")
@@ -6489,44 +6489,30 @@ def _kwin_rule_list():
     return [x for x in r.stdout.strip().split(",") if x] if r.returncode == 0 else []
 
 
-def kwin_home_rule(enable, y=82):
-    """Write (enable=True) or remove the rule. Returns {"supported", "enabled"}."""
-    if not (session_is_wayland() and _is_kde()):
-        return {"supported": False, "enabled": False}
+def _kwin_home_rule_remove():
+    """Remove the old Premiere home-screen rule if an earlier version installed it.
+    Returns True when something was removed; never touches kwinrulesrc when it is absent."""
+    if not (_is_kde() and have(_kconfig("kreadconfig")) and have(_kconfig("kwriteconfig"))):
+        return False
+    ids = _kwin_rule_list()
+    stanza = subprocess.run([_kconfig("kreadconfig"), "--file", "kwinrulesrc", "--group",
+                             KWIN_RULE_ID, "--key", "positionrule"],
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+    if KWIN_RULE_ID not in ids and not stanza:
+        return False
     kw = _kconfig("kwriteconfig")
-    def write(group, k, v):
-        subprocess.run([kw, "--file", "kwinrulesrc", "--group", group, "--key", k, v],
+    # Delete the stanza's keys too: dropping the id alone leaves positionrule=2 on disk,
+    # one `rules=` edit away from live again.
+    for k in KWIN_RULE_KEYS:
+        subprocess.run([kw, "--file", "kwinrulesrc", "--group", KWIN_RULE_ID, "--key", k,
+                        "--delete"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15)
+    ids = [x for x in ids if x != KWIN_RULE_ID]
+    for k, v in (("rules", ",".join(ids)), ("count", str(len(ids)))):
+        subprocess.run([kw, "--file", "kwinrulesrc", "--group", "General", "--key", k, v],
                        check=True, timeout=15)
-    ids = [x for x in _kwin_rule_list() if x != KWIN_RULE_ID]
-    if enable:
-        for k, v in (("Description", "Neutron: Premiere home screen position"),
-                     ("wmclass", "neutron-premiere-"), ("wmclasscomplete", "false"),
-                     ("wmclassmatch", "2"),             # 2 = substring
-                     ("title", ""), ("titlematch", "1"),  # 1 = exact: empty title = the overlay
-                     ("position", f"0,{int(y)}"), ("positionrule", "2")):  # 2 = Force
-            write(KWIN_RULE_ID, k, v)
-        ids.append(KWIN_RULE_ID)
-    else:
-        # Delete the stanza's keys too: dropping the id alone leaves positionrule=2 on disk,
-        # one `rules=` edit away from live again.
-        for k in KWIN_RULE_KEYS:
-            subprocess.run([kw, "--file", "kwinrulesrc", "--group", KWIN_RULE_ID, "--key", k,
-                            "--delete"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=15)
-    write("General", "rules", ",".join(ids))
-    write("General", "count", str(len(ids)))
     _kwin_reconfigure()
-    return {"supported": True, "enabled": bool(enable)}
-
-
-def cmd_window_rule(args):
-    """`neutron window-rule premiere-home (--y N | --off)`: Premiere's home screen position."""
-    try:
-        res = kwin_home_rule(not args.off, args.y)
-    except (OSError, subprocess.SubprocessError) as e:
-        die({"ok": False, "reason": f"could not write the KWin rule: {e}"}, EX_FAIL, args.json)
-    emit({"ok": True, **res}, args.json)
-    return EX_OK
+    return True
 
 
 def ntsync_status():
@@ -7233,6 +7219,14 @@ def cmd_setup(args, updating=False):
         step("mudhut", do_mudhut)
     if not getattr(args, "no_collider", False):
         step("collider", do_collider)
+    # The Premiere home-screen window rule and its setting were removed in 1.0.0-beta.2: take down
+    # a rule an earlier version installed. Silent when there is none.
+    try:
+        if _kwin_home_rule_remove():
+            steps.append({"step": "kwin_rule", "ok": True,
+                          "detail": "removed the old Premiere home-screen window rule"})
+    except (OSError, subprocess.SubprocessError):
+        pass
     if not getattr(args, "no_ntsync", False):
         st = _enable_ntsync(args.json, getattr(args, "yes", False))
         steps.append({"step": "ntsync", "ok": True, "status": st, "detail": NTSYNC_DETAIL.get(st)})
@@ -7365,7 +7359,7 @@ def cmd_uninstall(args):
         plan["remove"] += prefixes
     # The KWin rule lives in kwinrulesrc next to the user's own rules: removed key by key.
     try:
-        kwin_home_rule(False)
+        _kwin_home_rule_remove()
     except (OSError, subprocess.SubprocessError):
         pass
     if _is_kde() and have(_kconfig("kwriteconfig")):
@@ -7532,12 +7526,6 @@ def build_parser():
     ti.add_argument("--name", default=None, help="the set's name (folder name inside the prefix)")
     ti.add_argument("--off", action="store_true", help="back to Wine's own button glyphs")
     ti.set_defaults(func=cmd_theme_icons)
-
-    pw = sub.add_parser("window-rule", help="KDE: keep Premiere's home screen below the menu bar")
-    pw.add_argument("rule", choices=["premiere-home"])
-    pw.add_argument("--y", type=int, default=82, help="logical-pixel Y position (default 82)")
-    pw.add_argument("--off", action="store_true", help="remove the rule")
-    pw.set_defaults(func=cmd_window_rule)
 
     # fonts: re-verify + repair. The engine half predates this command (it ran inside doctor
     # and provision); this is the first-class surface Collider's Fonts row drives.
