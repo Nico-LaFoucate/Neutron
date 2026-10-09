@@ -3519,6 +3519,74 @@ def _has_marker(path, marker):
         return False
 
 
+def _apply_display_fix_apps(prefix, user, running):
+    """Apply the display fix to every DVA app (Premiere, After Effects, Media Encoder) installed in
+    `prefix`, skipping any that is running. No output. Returns (results, any_changed, any_target).
+    Shared by `prefix apply-display-fix` and `launch`."""
+    results, any_changed, any_target = [], False, False
+    for label, dbg, installed in find_debug_databases(prefix, user):
+        if not installed:
+            results.append({"app": label, "state": "not-installed"})
+            continue
+        any_target = True
+        if label in running:
+            results.append({"app": label, "state": "running",
+                            "reason": "%s is running in this prefix; its prefs are left "
+                                      "alone until it exits" % label})
+            continue
+        if dbg:
+            try:
+                state = _apply_display_fix_to(dbg)
+            except OSError as e:
+                results.append({"app": label, "state": "error", "reason": str(e)})
+                continue
+            any_changed |= (state == "changed")
+            results.append({"app": label, "state": state, "debug_database": dbg})
+        else:
+            # The app is installed but has never written its prefs. Adobe creates this file
+            # itself on a clean exit, so on a never-run app there is nothing to edit -- which
+            # is exactly the state Media Encoder was found in on a real install. Create it
+            # carrying only our line; these are debug OVERRIDES, so absent keys simply take
+            # their defaults, and the app rewrites the file in its own style when it exits.
+            # Proven 2026-08-09 by deleting Premiere's, writing a one-line file and launching.
+            vdir = _display_fix_pref_dir(prefix, user, label)
+            if not vdir:
+                results.append({"app": label, "state": "pending-first-run"})
+                continue
+            try:
+                os.makedirs(vdir, exist_ok=True)
+                path = os.path.join(vdir, "Debug Database.txt")
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(f"{DISPLAY_FIX_KEY}\t{DISPLAY_FIX_CURRENT}"
+                            f"\t{DISPLAY_FIX_DEFAULT}\r\n")
+            except OSError as e:
+                results.append({"app": label, "state": "error", "reason": str(e)})
+                continue
+            any_changed = True
+            results.append({"app": label, "state": "created", "debug_database": path})
+    return results, any_changed, any_target
+
+
+def _display_fix_before_launch(prefix):
+    """Apply the display fix on the way into every launch, the way Collider does, so launches from
+    the app menu, the dock, a file association or a terminal get it too (2026-10-09: only
+    Collider applied it, so a user who never launched through Collider never got it). Best-effort:
+    an app that is running is skipped, any failure is logged to stderr, and the launch always
+    goes ahead. Never writes to stdout, which carries `launch --json`."""
+    try:
+        user = prefix_user(prefix)
+        if not user:
+            return
+        results, _, _ = _apply_display_fix_apps(prefix, user, set(_running_app_ids(prefix)))
+        for r in results:
+            if r["state"] in ("changed", "created"):
+                log(f"display fix {r['state']}: {r['debug_database']}")
+            elif r["state"] == "error":
+                log(f"display fix skipped for {r['app']}: {r['reason']}")
+    except Exception as e:   # never block a launch on a display preference
+        log(f"display fix skipped: {e}")
+
+
 def cmd_apply_display_fix(args):
     """Write DS.DisableDirectXDisplay=true into Debug Database.txt. Idempotent."""
     prefix = resolve_prefix(args.path)
@@ -3540,47 +3608,7 @@ def cmd_apply_display_fix(args):
 
     user = prefix_user(prefix)
     if user:
-        results, any_changed, any_target = [], False, False
-        for label, dbg, installed in find_debug_databases(prefix, user):
-            if not installed:
-                results.append({"app": label, "state": "not-installed"})
-                continue
-            any_target = True
-            if label in running:
-                results.append({"app": label, "state": "running",
-                                "reason": "%s is running in this prefix; its prefs are left "
-                                          "alone until it exits" % label})
-                continue
-            if dbg:
-                try:
-                    state = _apply_display_fix_to(dbg)
-                except OSError as e:
-                    results.append({"app": label, "state": "error", "reason": str(e)})
-                    continue
-                any_changed |= (state == "changed")
-                results.append({"app": label, "state": state, "debug_database": dbg})
-            else:
-                # The app is installed but has never written its prefs. Adobe creates this file
-                # itself on a clean exit, so on a never-run app there is nothing to edit -- which
-                # is exactly the state Media Encoder was found in on a real install. Create it
-                # carrying only our line; these are debug OVERRIDES, so absent keys simply take
-                # their defaults, and the app rewrites the file in its own style when it exits.
-                # Proven 2026-08-09 by deleting Premiere's, writing a one-line file and launching.
-                vdir = _display_fix_pref_dir(prefix, user, label)
-                if not vdir:
-                    results.append({"app": label, "state": "pending-first-run"})
-                    continue
-                try:
-                    os.makedirs(vdir, exist_ok=True)
-                    path = os.path.join(vdir, "Debug Database.txt")
-                    with open(path, "w", encoding="utf-8", newline="") as f:
-                        f.write(f"{DISPLAY_FIX_KEY}\t{DISPLAY_FIX_CURRENT}"
-                                f"\t{DISPLAY_FIX_DEFAULT}\r\n")
-                except OSError as e:
-                    results.append({"app": label, "state": "error", "reason": str(e)})
-                    continue
-                any_changed = True
-                results.append({"app": label, "state": "created", "debug_database": path})
+        results, any_changed, any_target = _apply_display_fix_apps(prefix, user, running)
 
         prem = next((r for r in results if r["app"] == "premiere"), {})
         payload = {"ok": True, "changed": any_changed,
@@ -5340,6 +5368,10 @@ def cmd_launch(args):
         # Linux path -> Windows path. Wine maps Z:\ to the filesystem root, so an
         # absolute Linux path becomes Z:\... — Adobe apps need a Windows-style path.
         project = "Z:" + project.replace("/", "\\")
+
+    # The display fix (DS.DisableDirectXDisplay) for Premiere, After Effects and Media Encoder,
+    # applied before every launch exactly as Collider does. Best-effort; never blocks.
+    _display_fix_before_launch(prefix)
 
     # Start the app's Adobe background services (ADS/IPCBroker) first, if any, and
     # give them a moment to bind their RPC before the app connects.
