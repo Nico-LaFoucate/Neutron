@@ -266,6 +266,13 @@ Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ---
 
+## Support Neutron
+
+Neutron was made for free, and every donation helps keep the project alive and in development.
+
+- [Patreon](https://patreon.com/neutronproject): monthly support
+- [Ko-fi](https://ko-fi.com/neutroncollider): one-time or monthly
+
 ## License
 
 The `neutron` CLI is original code, licensed under the **GNU Lesser General Public License,
