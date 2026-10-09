@@ -89,9 +89,9 @@ patched Wine foundation and shipping the fixes those applications need to run.
 
 | Application / Feature | Status | Notes |
 | :--- | :--- | :--- |
-| **Premiere Pro 2025** | 🟢 `Beta` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. Frame pacing is still rough. |
-| **After Effects 2025** | 🟢 `Beta` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers/guides overlay is disabled pending CUDA↔D3D11 interop. |
-| **Photoshop 2025** | 🟢 `Beta` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). Some warm-up lag remains. |
+| **Premiere Pro 2025** | 🟢 `Beta` | GPU/Mercury rendering, timeline playback, and hardware **NVENC** export that muxes natively into a valid MP4. |
+| **After Effects 2025** | 🟢 `Beta` | Workspace, dialogs, and **composition rendering** (Wine's Direct2D was missing the un-premultiply effect AE treats as fatal). Rulers, guides and layer handles draw too. |
+| **Photoshop 2025** | 🟢 `Beta` | Boots to the home screen; full workspace docks on **File → New**; GPU canvas drawing (~56 fps in testing). |
 | **Lightroom Classic** | 🟢 `Beta` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
 | **Illustrator 2025** | 🟢 `Beta` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
 | **Media Encoder 2025** | 🟢 `Beta` | Queue, render and export end-to-end, including native muxing. |
