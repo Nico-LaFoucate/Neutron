@@ -2485,6 +2485,99 @@ def _family_registered_files(prefix, family):
     return sorted(set(hits))
 
 
+ADOBE_CLEAN = "Adobe Clean"
+_FONT_COPY_SUFFIX = (".ttf", ".otf")
+
+
+def _is_adobe_clean_name(filename):
+    return "adobeclean" in re.sub(r"[^a-z0-9]", "", filename.lower())
+
+
+def _adobe_clean_in_fonts_dir(prefix):
+    """Files in windows/Fonts whose family is Adobe Clean, registered or not."""
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    try:
+        names = sorted(os.listdir(fd))
+    except OSError:
+        return []
+    return [f for f in names
+            if os.path.splitext(f)[1].lower() in _FONT_COPY_SUFFIX and _is_adobe_clean_name(f)
+            and ADOBE_CLEAN in font_family_names(os.path.join(fd, f))]
+
+
+def _adobe_clean_sources(prefix):
+    """The Adobe Clean faces the Adobe apps installed in this prefix ship, one path per file name.
+
+    Every Adobe app carries the family in its own folder -- Photoshop in Resources/ui-fonts,
+    Lightroom Classic at the top of its install dir, Premiere in otf/ and AdobeCleanUX/, the
+    Creative Cloud components in ACC/resources/fonts -- and none of them puts it in windows/Fonts,
+    the only place the Segoe UI -> Adobe Clean replacement can reach it. Mud Hut used to copy
+    Photoshop's ui-fonts only, so a prefix with just Lightroom (Classic or cloud), copied from
+    Windows or downloaded, had no Adobe Clean at all (issue: the fonts check failed and Repair
+    could not fix it). The walk stops four levels below Program Files/Adobe, which covers every
+    layout above and skips the CEP extensions' web assets.
+
+    ONE folder is used, so the same face is never registered twice in two formats (Lightroom
+    Classic ships .ttf, the Creative Cloud components .otf): an app's own folder before the
+    Creative Cloud components (the fallback for Lightroom, the cloud app, which ships only
+    Adobe Clean UX), then the folder with the most Adobe Clean faces, then path order."""
+    drive_c = os.path.join(prefix, "drive_c")
+    by_dir = {}
+    for root in (os.path.join(drive_c, "Program Files", "Adobe"),
+                 os.path.join(drive_c, "Program Files (x86)", "Adobe")):
+        if not os.path.isdir(root):
+            continue
+        base = root.rstrip(os.sep).count(os.sep)
+        for d, dirs, files in os.walk(root):
+            dirs.sort()
+            if d.count(os.sep) - base >= 4:
+                dirs[:] = []
+            for f in sorted(files):
+                if (os.path.splitext(f)[1].lower() not in _FONT_COPY_SUFFIX
+                        or not _is_adobe_clean_name(f)):
+                    continue
+                p = os.path.join(d, f)
+                if ADOBE_CLEAN in font_family_names(p):
+                    by_dir.setdefault(d, []).append(p)
+    if not by_dir:
+        return []
+    best = min(by_dir, key=lambda d: ("Adobe Creative Cloud" in d.split(os.sep), -len(by_dir[d]), d))
+    return sorted(by_dir[best], key=lambda p: os.path.basename(p).lower())
+
+
+def seed_adobe_clean(prefix):
+    """Copy Adobe Clean into windows/Fonts from an installed Adobe app when windows/Fonts has
+    none, so the replacement map points at a family that exists. Never overwrites a file; a
+    prefix that already has Adobe Clean is left alone. register_prefix_fonts() must run after.
+    Returns {ok, present, copied, sources, detail}; `present` is re-read from the prefix."""
+    if _adobe_clean_in_fonts_dir(prefix):
+        return {"ok": True, "present": True, "copied": [], "sources": [],
+                "detail": "already in windows/Fonts"}
+    srcs = _adobe_clean_sources(prefix)
+    if not srcs:
+        return {"ok": True, "present": False, "copied": [], "sources": [],
+                "detail": "no installed Adobe app in this prefix ships Adobe Clean yet"}
+    fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
+    os.makedirs(fd, exist_ok=True)
+    have = {f.lower() for f in os.listdir(fd)}
+    copied, errors = [], []
+    for p in srcs:
+        name = os.path.basename(p)
+        if name.lower() in have:
+            continue
+        try:
+            shutil.copyfile(p, os.path.join(fd, name))
+            copied.append(name)
+        except OSError as e:
+            errors.append("%s: %s" % (name, e))
+    rel = sorted({os.path.relpath(os.path.dirname(p), os.path.join(prefix, "drive_c")) for p in srcs})
+    present = bool(_adobe_clean_in_fonts_dir(prefix))
+    return {"ok": present, "present": present, "copied": copied, "sources": rel,
+            "detail": ("copied %d file%s from %s" % (len(copied), "" if len(copied) == 1 else "s",
+                                                     ", ".join(rel)))
+                      + ("; failed: " + "; ".join(errors) if errors else "")}
+
+
 def _unregistered_prefix_fonts(prefix):
     """Font files in windows/Fonts that no HKLM Fonts value names, or None when system.reg is
     unreadable. Copying a font in is not enough (register_prefix_fonts() explains why)."""
@@ -2599,12 +2692,20 @@ def fonts_verdict(prefix):
                 missing=rep_missing, absent_targets=rep_absent, differ=rep_differ)
             repair.append("restore %d font replacement entries" % len(rep_missing))
         elif rep_absent:
+            clean_src = (sorted({os.path.relpath(os.path.dirname(p), os.path.join(prefix, "drive_c"))
+                                 for p in _adobe_clean_sources(prefix)})
+                         if ADOBE_CLEAN in rep_absent and not _adobe_clean_in_fonts_dir(prefix) else [])
             add("replacements", "bad",
                 "all %d font replacements are present, but they point at %s, which is not present "
                 "and registered in this prefix -- the same Photoshop deadlock with an extra step. "
-                "Repair registers what is in windows/Fonts; if the family is not there at all, the "
-                "Adobe install that ships it must be repaired."
-                % (n_exp, ", ".join(rep_absent)), missing=[], absent_targets=rep_absent, differ=rep_differ)
+                % (n_exp, ", ".join(rep_absent))
+                + ("Repair copies it into windows/Fonts from %s and registers it." % ", ".join(clean_src)
+                   if clean_src else
+                   "Repair registers what is in windows/Fonts; no installed Adobe app in this prefix "
+                   "ships the family, so install one (every Adobe app carries Adobe Clean)."),
+                missing=[], absent_targets=rep_absent, differ=rep_differ)
+            if clean_src:
+                repair.append("copy Adobe Clean into windows/Fonts from " + ", ".join(clean_src))
             repair.append("register the replacement target (%s)" % ", ".join(rep_absent))
         elif not reg_readable:
             add("replacements", "warn",
@@ -2736,6 +2837,10 @@ def repair_prefix_fonts(wine, prefix):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", k, "REG_SZ", expected[k])
     rep_step = {"step": "font_replacements", "ok": None, "restored": to_write}
     steps.append(rep_step)          # `ok` judged from a re-read after the registry has reached disk
+
+    # The map's target: Adobe Clean copied in from an installed app when windows/Fonts has none.
+    # Without this, a prefix with only Lightroom stayed "still broken after repair" for good.
+    steps.append({"step": "adobe_clean", **seed_adobe_clean(prefix)})
 
     # Always: idempotent, and it is the only way a hand-copied font becomes visible.
     n = register_prefix_fonts(wine, prefix)
@@ -4460,6 +4565,11 @@ def cmd_prefix_provision(args):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
     event(args, event="progress", stage="fonts", pct=82, msg="applied the Adobe font replacement map")
     steps.append({"step": "fonts", "count": len(fonts), "ok": True})
+
+    # The replacement map's target must exist: copy Adobe Clean in from whichever Adobe app is
+    # installed (see _adobe_clean_sources), for every install method, before registering.
+    seeded = seed_adobe_clean(prefix)
+    steps.append({"step": "adobe_clean", **seeded})
 
     # Activate the staged fonts. Copying files into windows/Fonts is NOT enough —
     # Wine never registers them, so the replacement targets (Adobe Clean) stay
