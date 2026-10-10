@@ -52,7 +52,7 @@ NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 # The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
 # Collider); `neutron --version` prints all of them for bug reports.
-CLI_VERSION = "1.0.0-beta.3"
+CLI_VERSION = "1.0.0-beta.4"
 NEUTRON_DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
     "neutron")
