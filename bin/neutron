@@ -556,7 +556,14 @@ APP_PROFILES = {
         "name": "Lightroom Classic",
         "exe": _adobe("Adobe Lightroom Classic", "Lightroom.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
-        "overrides": "ucrtbase=n,b;dwrite=b;dxcore=n;nvapi64=n;dcomp=n,b",
+        # ⛔ No `dxcore=n` (2026-10-10, GitHub issue Neutron#2). Our patched dxcore is a Wine
+        # BUILTIN since 11.10-22, and Wine will not load a builtin under a native-only override,
+        # so `dxcore=n` meant no dxcore at all. Lightroom Classic 15.5+ ships adobe_c2pa.dll,
+        # which imports dxcore: it crashed ~3 s into startup ("Adobe Lightroom Classic has
+        # encountered a problem", 0xe06d7363 at the same address as the reporter's crash
+        # report; log: "dxcore.dll ... needed by adobe_c2pa.dll not found"). 15.4 has no
+        # adobe_c2pa.dll, which is why it kept working. Same fix as the lightroomcc profile.
+        "overrides": "ucrtbase=n,b;dwrite=b;nvapi64=n;dcomp=n,b",
         "nvapi": True,
         # NEUTRON_DISABLE_BTW=1: the Develop preview presents a d3d12 swapchain via the BTW
         # software blit-to-window at ~5.5fps (the slider/zoom "stepping"); disabling BTW ->
