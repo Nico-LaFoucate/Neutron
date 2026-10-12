@@ -1746,6 +1746,38 @@ def install_mono_gecko(wine, prefix):
     return res
 
 
+def _mshtml_protocols_registered(prefix):
+    """True when the prefix registers Wine's browser engine (mshtml) as the about: protocol
+    handler, False when it does not, None when system.reg is unreadable."""
+    want = "[Software\\\\Classes\\\\PROTOCOLS\\\\Handler\\\\about]"
+    try:
+        with open(os.path.join(prefix, "system.reg"), encoding="utf-8", errors="replace") as f:
+            return any(line.startswith(want) for line in f)
+    except OSError:
+        return None
+
+
+def register_mshtml(wine, prefix):
+    """Register Wine's built-in browser engine (mshtml): its about:, javascript:, res: ... protocol
+    handlers. Wine does this when a prefix is created, but Mud Hut creates prefixes with mshtml
+    disabled (to keep Wine's Gecko download prompt away), so it never happened. Every embedded
+    browser that starts at about:blank then stays empty -- Lightroom Classic's About box showed a
+    blank panel where its build and copyright text go (GitHub Neutron#10). Idempotent."""
+    if _mshtml_protocols_registered(prefix):
+        return {"status": "present", "ok": True}
+    env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "-all",
+           "WINEDLLOVERRIDES": "winemenubuilder.exe=d"}   # mshtml itself must be ENABLED here
+    env.setdefault("DISPLAY", ":0")
+    try:
+        subprocess.run([wine, "regsvr32", "/s", "mshtml.dll"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=120)
+        wineserver_wait(wine, prefix)   # the registry reaches system.reg when wineserver exits
+    except Exception as e:
+        return {"status": "error", "ok": False, "detail": str(e)}
+    ok = bool(_mshtml_protocols_registered(prefix))
+    return {"status": "registered" if ok else "failed", "ok": ok}
+
+
 # Font-type suffix Wine uses in the HKLM Fonts value name, by extension.
 _FONT_REG_SUFFIX = {".otf": " (OpenType)", ".ttf": " (TrueType)",
                     ".ttc": " (TrueType)", ".fon": ""}
@@ -4676,6 +4708,11 @@ def cmd_prefix_provision(args):
     steps.append({"step": "mono_gecko", "detail": mg,
                   "ok": mono_ok and gecko_ok})
 
+    # Wine's browser engine must be REGISTERED too, or every embedded browser that starts at
+    # about:blank shows an empty panel (Lightroom Classic's About box, GitHub Neutron#10).
+    event(args, event="progress", stage="mshtml", pct=92, msg="registering Wine's browser engine")
+    steps.append({"step": "mshtml_register", **register_mshtml(wine, prefix)})
+
     wineserver_wait(wine, prefix)   # flush the reg.exe writes to user.reg on disk
 
     # The DEFAULT NEUTRON THEME. Applied here, by the engine, so a prefix is themed whether it is
@@ -6824,6 +6861,13 @@ def cmd_doctor(args):
                        "Run `neutron prefix provision <prefix>`.")
             if webview2_untested(_wv):
                 checks[-1]["warning"] = True
+            # Wine's browser engine has to be registered, or embedded browsers stay empty.
+            _mh = _mshtml_protocols_registered(prefix)
+            check("browser-engine", _mh is not False,
+                  "Wine's browser engine registered" if _mh else
+                  "system.reg unreadable; cannot tell" if _mh is None else
+                  "Wine's browser engine is not registered: embedded web panels (Lightroom Classic's "
+                  "About box) stay empty. Run `neutron prefix provision <prefix>`.")
             # 🚨 CoolType's default Roman face. Adobe resolves it by PostScript
             # name, and Wine ships a substitute for all three candidate files
             # under the same Microsoft filenames -- so a prefix can hold
