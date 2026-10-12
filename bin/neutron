@@ -52,7 +52,7 @@ NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 # The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
 # Collider); `neutron --version` prints all of them for bug reports.
-CLI_VERSION = "1.0.0-beta.6"
+CLI_VERSION = "1.0.0-beta.7"
 NEUTRON_DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
     "neutron")
@@ -3338,6 +3338,40 @@ def detect_scale():
     return info["scale"] if info else None
 
 
+def collider_manual_scale():
+    """Collider's Preferences > Display scale when it is set to a value rather than Auto, else None.
+
+    Collider stores it in ~/.config/collider/config.json (`scale_mode: "manual"`, `scale_value`) and
+    used to apply it only by passing --scale to the launches IT started. A launch from the app menu
+    or a desktop icon ran `neutron launch <app>` without --scale and detected the desktop's scale
+    again, so the setting did nothing there (GitHub Neutron#16: 100% in Collider fixed Premiere's
+    clicks, but the desktop icon still opened it at 125%). The same file collider_selected_prefix()
+    reads. Unreadable, missing or out of range means "not set"."""
+    try:
+        with open(os.path.join(HOME, ".config", "collider", "config.json"),
+                  encoding="utf-8") as f:
+            cfg = json.load(f)
+        if cfg.get("scale_mode") != "manual":
+            return None
+        v = float(cfg.get("scale_value"))
+    except Exception:
+        return None
+    return v if 0.5 <= v <= 8 else None
+
+
+def resolve_launch_scale(cli_scale=None):
+    """(scale, source) for a launch: --scale, then Collider's manual setting, then the desktop's
+    own scale. Every launch surface goes through here, so they all agree. (None, None) when
+    nothing can tell."""
+    if cli_scale:
+        return cli_scale, "--scale"
+    v = collider_manual_scale()
+    if v:
+        return v, "collider setting"
+    info = detect_scale_info()
+    return (info["scale"], info["source"]) if info else (None, None)
+
+
 def windows_step_warning(dpi):
     """The warning shown when a scale isn't a Windows step, or None."""
     if dpi is None or dpi % 24 == 0:
@@ -5573,11 +5607,7 @@ def cmd_launch(args):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "wayland")
         # auto-DPI: LogPixels = round(96 * scale) so System-DPI-aware Adobe apps
         # render at device resolution; the wp_fractional_scale patch maps it 1:1.
-        if getattr(args, "scale", None):
-            scale, _scale_src = args.scale, "--scale"
-        else:
-            _si = detect_scale_info()
-            scale, _scale_src = (_si["scale"], _si["source"]) if _si else (None, None)
+        scale, _scale_src = resolve_launch_scale(getattr(args, "scale", None))
         logpixels = round(96 * scale) if (scale and scale > 0) else None
         _warn = windows_step_warning(logpixels)
         if _warn:
@@ -7110,8 +7140,12 @@ def _runtime_version_of(wine):
 def cmd_display(args):
     """The display scale Neutron will use for Adobe apps, where it came from, and every output."""
     info = detect_scale_info()
+    # `scale`/`dpi`/`source` stay the DESKTOP's scale (Collider's "Auto" readout shows them);
+    # `collider_scale` is Collider's manual setting, which every launch uses when set.
+    setting = collider_manual_scale()
     out = {"ok": bool(info), **(info or {}), "outputs": _wayland_outputs() or [],
-           "warning": windows_step_warning(info["dpi"]) if info else None}
+           "warning": windows_step_warning(info["dpi"]) if info else None,
+           "collider_scale": setting}
     if not info:
         out["reason"] = ("could not detect the display scale; pass --scale to `neutron launch` "
                          "or set it in Collider")
@@ -7123,6 +7157,9 @@ def cmd_display(args):
                   info["dpi"], info.get("output") or "?", info["source"]))
         else:
             print(out["reason"])
+        if setting:
+            print("launches use %s%% (%d dpi): set in Collider's Preferences" %
+                  (round(setting * 100, 2), round(96 * setting)))
         for o in out["outputs"]:
             print("  output %-12s %s%%  at %s" % (o["output"], round(o["scale"] * 100, 2),
                                                  o["pos"]))
