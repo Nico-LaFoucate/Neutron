@@ -2087,29 +2087,26 @@ def _stale_roman_cache_records(prefix):
     return stale
 
 
-# ⭐ 2026-08-15 — CEP PANEL CEF FLAGS, and why they must be re-applied rather than set once.
+# ⭐ 2026-10-12 — CEP MANIFESTS ARE SIGNED: Neutron no longer edits them (DECISIONS C47).
 #
-# Chromium inside CEPHtmlEngine splits its output into DirectComposition layers; under Wine the
-# textured tile quads fail to draw (ANGLE->D3D11->DXVK tile-texture interop) and the panel renders
-# as blank/banded solid quads. `--disable-direct-composition` makes Chromium abandon layer
-# splitting and draw one composited frame into a single CreateSwapChainForHwnd swapchain, which
-# our DXVK-hook -> shared-mem -> winewayland transport already delivers. That, with the two
-# sandbox flags, is what made the Captioneer panel render at all (memory
-# `neutron-cep-panel-sandbox`, 2026-07-04).
-#
-# 🚨 The flags live in the EXTENSION'S OWN manifest, which its updater overwrites. Captioneer
-# 1.8.1 (2026-08-15) shipped a manifest with 5 parameters where the working one had 10, and the
-# panel stopped rendering. The 2026-07-04 note already said these should become "Neutron's
-# standard CEP command-line set (manifest patcher)" -- that patcher was never built, so the fix
-# survived only as a hand edit in a file an installer replaces. This is that patcher.
-#
-# ⚠️ Scoped deliberately. `--disable-direct-composition` changes how a panel composites, and
-# Adobe's own panels (com.adobe.ccx.* Home screen) currently render fine WITHOUT it. Applying it
-# suite-wide would be changing working panels on a hunch, so we touch only vendors we have
-# actually validated. Add a prefix here when a panel is confirmed broken without the flags.
-NEUTRON_CEP_FLAGS = ("--no-sandbox", "--disable-gpu-sandbox", "--disable-direct-composition")
-NEUTRON_CEP_VENDORS = ("com.aescripts.",)
+# From 2026-08-15 through 1.0.0-beta.5, provision added three CEF flags to aescripts' manifests
+# (--no-sandbox --disable-gpu-sandbox --disable-direct-composition), because the Captioneer panel
+# rendered blank without them in July (memory `neutron-cep-panel-sandbox`). Two things were wrong:
+#   1. CSXS/manifest.xml is listed in the extension's META-INF/signatures.xml, so the edit made CEP
+#      refuse the extension ("Signature verification failed" in CEP12-<HOST>.log, and the panel
+#      never opens). It only ever worked on a prefix with PlayerDebugMode=1, which skips the check.
+#   2. On 11.10-108 none of the flags is needed: Captioneer's original manifest renders its full,
+#      interactive UI (clean room, 2026-10-12). CEP passes --no-sandbox to its renderers itself, and
+#      Chromium presents through a plain window swapchain.
+# So provision puts back the signed original of each manifest it edited -- the candidate whose
+# SHA-256 matches the extension's own signature -- and never touches one it cannot match. It does
+# so only when provisioning onto 11.10-108 or later, the first runtime verified without the flags.
 CEP_MANIFEST_BACKUP_SUFFIX = ".pre-neutron-cepflags"
+CEP_RESTORE_MIN_RUNTIME = "11.10-108"
+# Exactly what the old patcher inserted in front of </CEFCommandLine>.
+_NEUTRON_CEP_FLAG_INSERT = re.compile(
+    rb"(?:\n            <Parameter>(?:--no-sandbox|--disable-gpu-sandbox|--disable-direct-composition)"
+    rb"</Parameter>)+\n         (?=</CEFCommandLine>)")
 
 
 def _cep_manifests(prefix):
@@ -2138,64 +2135,144 @@ def _cep_manifests(prefix):
     return out
 
 
-def cep_flag_status(prefix):
-    """Which in-scope manifests are missing Neutron's CEF flags.
+def _cep_signed_digests(ext_dir):
+    """{relative path: (hashlib name, base64 digest)} from the extension's META-INF/signatures.xml,
+    or None when the extension is unsigned."""
+    import urllib.parse
+    sig = os.path.join(ext_dir, "META-INF", "signatures.xml")
+    try:
+        with open(sig, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    out = {}
+    for uri, alg, dv in re.findall(r'<Reference URI="([^"#][^"]*)"[^>]*>.*?<DigestMethod Algorithm='
+                                   r'"[^"]*#(sha\d+)"/?>.*?<DigestValue>([^<]*)</DigestValue>',
+                                   text, re.S):
+        out[urllib.parse.unquote(uri)] = (alg, dv.strip())
+    return out
 
-    Returns [(extension_id, manifest_path, [missing flags])]; empty when all are correct.
-    """
-    missing = []
-    for ext_id, man in _cep_manifests(prefix):
-        if not ext_id.startswith(NEUTRON_CEP_VENDORS):
-            continue
+
+def _digest_matches(data, want):
+    import base64, hashlib
+    alg, dv = want
+    try:
+        return base64.b64encode(hashlib.new(alg, data).digest()).decode() == dv
+    except ValueError:
+        return False
+
+
+def cep_extension_name(manifest):
+    """What the user sees for an extension: its bundle name, else its first literal menu entry,
+    else the folder name."""
+    try:
+        with open(manifest, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    m = (re.search(r'ExtensionBundleName="([^"%]+)"', text)
+         or re.search(r"<Menu>\s*([^<%][^<]*?)\s*</Menu>", text))
+    return m.group(1) if m else os.path.basename(os.path.dirname(os.path.dirname(manifest)))
+
+
+def cep_signature_status(ext_dir):
+    """Signed files that are missing or changed, as (missing, changed); None when unsigned.
+
+    Either list non-empty means CEP refuses the extension unless PlayerDebugMode is on. Validated
+    against CEP12's own verdicts 2026-10-12: an edited manifest, a removed `.debug` and an
+    extension missing 119 node_modules files each failed; the untouched extension loaded."""
+    signed = _cep_signed_digests(ext_dir)
+    if signed is None:
+        return None
+    missing, changed = [], []
+    for rel, want in signed.items():
         try:
-            with open(man, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
+            with open(os.path.join(ext_dir, rel), "rb") as f:
+                data = f.read()
         except OSError:
+            missing.append(rel)
             continue
-        # A manifest with no <CEFCommandLine> at all declares no flags; that still counts as
-        # missing, but we cannot safely invent the element, so report it and skip repair.
-        present = set(re.findall(r"<Parameter>([^<]*)</Parameter>", text))
-        absent = [f for f in NEUTRON_CEP_FLAGS if f not in present]
-        if absent:
-            missing.append((ext_id, man, absent))
-    return missing
+        if not _digest_matches(data, want):
+            changed.append(rel)
+    return missing, changed
 
 
-def ensure_cep_flags(prefix, log_fn=None):
-    """Re-add Neutron's CEF flags to in-scope CEP manifests. Returns the list repaired."""
-    repaired = []
-    for ext_id, man, absent in cep_flag_status(prefix):
+def cep_extension_damage(prefix):
+    """Extensions whose signed files are missing or changed, split as (ours, vendor).
+
+    `ours`: Adobe's own (com.adobe.*) or a manifest an older Neutron edited -- a prefix problem.
+    `vendor`: any other extension -- its vendor's install. Each entry is
+    {id, name, missing, changed, edited_by_neutron}."""
+    ours, vendor = [], []
+    for ext_id, man in _cep_manifests(prefix):
+        st = cep_signature_status(os.path.dirname(os.path.dirname(man)))
+        if not st or not (st[0] or st[1]):
+            continue
+        entry = {"id": ext_id, "name": cep_extension_name(man),
+                 "missing": len(st[0]), "changed": len(st[1]),
+                 "edited_by_neutron": os.path.exists(man + CEP_MANIFEST_BACKUP_SUFFIX)}
+        (ours if entry["edited_by_neutron"] or ext_id.startswith("com.adobe.") else vendor).append(entry)
+    return ours, vendor
+
+
+def _cep_debug_mode(prefix):
+    """CSXS versions with PlayerDebugMode=1 in the prefix (CEP then skips signature checks)."""
+    try:
+        with open(os.path.join(prefix, "user.reg"), "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    return sorted(set(re.findall(r'\[Software\\\\Adobe\\\\CSXS\.(\d+)\][^\[]*?"PlayerDebugMode"="1"',
+                                 text)), key=int)
+
+
+def _runtime_at_least(version, minimum):
+    def key(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+    return bool(version) and key(version) >= key(minimum)
+
+
+def restore_cep_manifests(prefix, log_fn=None):
+    """Put back the signed original of every CEP manifest an older Neutron edited.
+
+    Returns (restored, unmatched): extension ids restored, and ids whose manifest is not the signed
+    original and that we could not rebuild (left exactly as they are)."""
+    restored, unmatched = [], []
+    for ext_id, man in _cep_manifests(prefix):
+        bak = man + CEP_MANIFEST_BACKUP_SUFFIX
+        if not os.path.exists(bak):
+            continue                      # never edited by Neutron
+        ext_dir = os.path.dirname(os.path.dirname(man))
+        want = (_cep_signed_digests(ext_dir) or {}).get("CSXS/manifest.xml")
         try:
-            with open(man, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-            if "<CEFCommandLine>" not in text:
+            with open(man, "rb") as f:
+                cur = f.read()
+            if want and _digest_matches(cur, want):
+                os.remove(bak)            # already original; the backup is an unsigned extra file
+                continue
+            candidates = [_NEUTRON_CEP_FLAG_INSERT.sub(b"", cur)]
+            with open(bak, "rb") as f:
+                candidates.append(f.read())
+            good = next((c for c in candidates if want and _digest_matches(c, want)), None)
+            if good is None:
+                unmatched.append(ext_id)
                 if log_fn:
-                    log_fn("cep-flags: %s has no <CEFCommandLine>; not editing" % ext_id)
+                    log_fn("cep-manifest: %s does not match its signature and could not be "
+                           "rebuilt; not editing" % ext_id)
                 continue
-
-            def _add(m, absent=absent):
-                block = m.group(0)
-                have = set(re.findall(r"<Parameter>([^<]*)</Parameter>", block))
-                ins = "".join("\n            <Parameter>%s</Parameter>" % f
-                              for f in absent if f not in have)
-                return block.replace("</CEFCommandLine>",
-                                     ins + "\n         </CEFCommandLine>") if ins else block
-
-            new = re.sub(r"<CEFCommandLine>.*?</CEFCommandLine>", _add, text, flags=re.S)
-            if new == text:
-                continue
-            bak = man + CEP_MANIFEST_BACKUP_SUFFIX
-            if not os.path.exists(bak):
-                shutil.copy2(man, bak)
-            with open(man, "w", encoding="utf-8") as f:
-                f.write(new)
-            repaired.append((ext_id, absent))
+            tmp = man + ".neutron-tmp"
+            with open(tmp, "wb") as f:
+                f.write(good)
+            shutil.copymode(man, tmp)
+            os.replace(tmp, man)
+            os.remove(bak)
+            restored.append(ext_id)
             if log_fn:
-                log_fn("cep-flags: %s <- %s" % (ext_id, " ".join(absent)))
+                log_fn("cep-manifest: %s restored to its signed original" % ext_id)
         except OSError as e:
             if log_fn:
-                log_fn("cep-flags: %s FAILED: %s" % (ext_id, e))
-    return repaired
+                log_fn("cep-manifest: %s FAILED: %s" % (ext_id, e))
+    return restored, unmatched
 
 
 def invalidate_cooltype_caches(prefix):
@@ -4670,14 +4747,23 @@ def cmd_prefix_provision(args):
     # their fonts were already correct. Adobe rebuilds these on next launch.
     ncache = invalidate_cooltype_caches(prefix)
     steps.append({"step": "cooltype_cache_invalidate", "count": ncache, "ok": True})
-    # CEP panel CEF flags: unconditional, because the thing that removes them is an extension
-    # update that can happen at any time and leaves no other trace than "the panel is blank".
-    cep_fixed = ensure_cep_flags(prefix, log_fn=log)
-    steps.append({"step": "cep_cef_flags", "ok": True,
-                  "repaired": [e for e, _f in cep_fixed],
-                  "detail": ("re-applied to " + ", ".join(e for e, _f in cep_fixed) +
-                             "  — RESTART the app; manifests are read only at startup")
-                            if cep_fixed else "all in-scope manifests already correct"})
+    # CEP manifests an older Neutron edited: put back the signed originals, or CEP refuses the
+    # extension (restore_cep_manifests). Only onto a runtime verified without the old flags.
+    rt = _runtime_version_of(wine)
+    if _runtime_at_least(rt, CEP_RESTORE_MIN_RUNTIME):
+        cep_restored, cep_unmatched = restore_cep_manifests(prefix, log_fn=log)
+        steps.append({"step": "cep_manifests", "ok": True,
+                      "restored": cep_restored, "unmatched": cep_unmatched,
+                      "detail": "; ".join(filter(None, [
+                          ("restored the signed manifest of %s  — RESTART the app; manifests are "
+                           "read only at startup" % ", ".join(cep_restored)) if cep_restored else "",
+                          ("could not rebuild the signed manifest of %s; reinstall the extension"
+                           % ", ".join(cep_unmatched)) if cep_unmatched else ""]))
+                                or "no manifests edited by Neutron"})
+    else:
+        steps.append({"step": "cep_manifests", "ok": True, "skipped": True,
+                      "detail": "left as they are on runtime %s (restoring needs %s or later)"
+                                % (rt or "unknown", CEP_RESTORE_MIN_RUNTIME)})
     roman = _roman_default_status(prefix)
     genuine = [fn for fn, state, _ in roman if state == "real"]
     steps.append({"step": "cooltype_roman_default",
@@ -6947,23 +7033,44 @@ def cmd_doctor(args):
             check("font-replacements", _rep["status"] != "bad",
                   _rep["detail"] + ("" if _rep["status"] != "bad" else
                                     "  Run `neutron fonts repair --prefix <prefix>`."))
-            # CEP panel CEF flags. An extension UPDATE silently reverts these (Captioneer 1.8.1
-            # did, 2026-08-15) and the only symptom is "the panel does not load" -- nothing in
-            # Premiere's log says why, so without this check it costs an investigation every time.
-            cep_missing = cep_flag_status(prefix)
-            if cep_missing:
-                check("cep-cef-flags", False,
-                      "; ".join("%s missing %s" % (e, " ".join(m)) for e, _p, m in cep_missing) +
-                      "  — the panel will load but render blank (Chromium composites through "
-                      "DirectComposition, whose tile quads do not draw under Wine). An extension "
-                      "update overwrites the manifest; run `neutron prefix provision <prefix>` to "
-                      "re-apply, then RESTART the app (manifests are read only at startup).")
+            # CEP extension signatures. CEP refuses an extension whose signed files are missing or
+            # changed, and the only trace is "Signature verification failed" in CEP12-<HOST>.log:
+            # the panel never opens (Light Equalizer, 119 signed files missing, 2026-10-12).
+            # Damage to Adobe's own extensions, or to a manifest an older Neutron edited, is a
+            # prefix problem (`cep-signatures`). Damage to a third-party extension is its vendor's
+            # install, so it gets its own flagged warning (`cep-third-party`) and does not make
+            # the prefix unhealthy.
+            exts = _cep_manifests(prefix)
+            debug = _cep_debug_mode(prefix)
+            ours, vendor = cep_extension_damage(prefix)
+
+            def _damage(e):
+                return "%s (%s): %s" % (e["name"], e["id"], ", ".join(filter(None, [
+                    "%d signed file(s) missing" % e["missing"] if e["missing"] else "",
+                    "%d changed" % e["changed"] if e["changed"] else ""])))
+            loads_anyway = ("  — loads here only because PlayerDebugMode is on (CSXS.%s), which "
+                            "skips CEP's signature check" % ", CSXS.".join(debug)) if debug else ""
+            if not ours:
+                check("cep-signatures", True,
+                      "%d CEP extension(s), none damaged%s" % (len(exts) - len(vendor),
+                                                               " apart from third-party ones"
+                                                               if vendor else ""))
+            elif debug:
+                check("cep-signatures", True, "; ".join(map(_damage, ours)) + loads_anyway)
+                checks[-1]["warning"] = True
             else:
-                n_scoped = len([1 for e, _p in _cep_manifests(prefix)
-                                if e.startswith(NEUTRON_CEP_VENDORS)])
-                check("cep-cef-flags", True,
-                      "%d in-scope extension(s) carry %s" % (n_scoped, " ".join(NEUTRON_CEP_FLAGS))
-                      if n_scoped else "no in-scope CEP extensions installed")
+                check("cep-signatures", False,
+                      "; ".join(map(_damage, ours)) + "  — CEP refuses these, so their panels never "
+                      "open. " + ("Run `neutron prefix provision <prefix>` to restore the manifests "
+                                  "an older Neutron edited." if any(e["edited_by_neutron"] for e in ours)
+                                  else "Reinstall the Adobe app that ships them."))
+            if vendor:
+                check("cep-third-party", True,
+                      "; ".join(map(_damage, vendor)) + (loads_anyway or
+                      "  — CEP refuses %s, so %s panel never opens. The extension's own install is "
+                      "damaged, not Neutron: reinstall it from its vendor."
+                      % (("it", "its") if len(vendor) == 1 else ("them", "their"))))
+                checks[-1].update({"warning": True, "third_party": True, "extensions": vendor})
             # Premiere-only checks (Debug Database display fix) apply ONLY when
             # Premiere is installed; they must not fail a Photoshop/other prefix.
             if os.path.isfile(os.path.join(prefix, PREMIERE_SUBPATH)):
