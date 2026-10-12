@@ -192,7 +192,7 @@ put `--json` before the command: `neutron --json doctor --prefix <path>`.
 | Command | What it does |
 | :--- | :--- |
 | `neutron setup` / `update` / `uninstall` | Install, update or remove everything (see above). |
-| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, and `lightroomcc` (Lightroom, experimental). Supports `--prefix`, `--scale`, and opening a project file. |
+| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, and three experimental ones: `lightroomcc` (Lightroom), `audition` and `indesign`. Supports `--prefix`, `--scale`, and opening a project file. |
 | `neutron prefix provision <path>` | Make a Wine prefix Neutron-ready: Microsoft's components, the runtime's DXVK / vkd3d-proton / NVIDIA DLLs, fonts, display fixes. |
 | `neutron prefix info <path>` | Report the paths and state Collider needs. |
 | `neutron apps --prefix <path>` | List apps and install status in a prefix. |

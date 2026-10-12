@@ -22,6 +22,8 @@ body:
         - Media Encoder
         - Animate
         - Lightroom (cloud, experimental)
+        - Audition (experimental)
+        - InDesign (experimental)
         - neutron setup, update or uninstall
         - Other
     validations:
