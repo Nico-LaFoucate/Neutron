@@ -52,7 +52,7 @@ NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 # The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
 # Collider); `neutron --version` prints all of them for bug reports.
-CLI_VERSION = "1.0.0-beta.7"
+CLI_VERSION = "1.0.0-beta.8"
 NEUTRON_DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
     "neutron")
@@ -461,6 +461,184 @@ def _resolve_app_dxvk_conf(prefix, profile):
         return os.path.join(prefix, rel)
     exe = _resolve_app_exe(prefix, profile["exe"])
     return os.path.join(os.path.dirname(exe), os.path.basename(rel))
+
+
+def _app_exe_variants(prefix, exe_rel):
+    """Every installed copy of a profile's exe in this prefix: the literal path plus every year of it
+    (`Adobe After Effects 2025` beside `2026`). `_resolve_app_exe` picks ONE to launch; an app started by
+    another app can be any of them."""
+    import re
+    out = []
+    literal = os.path.join(prefix, exe_rel)
+    if os.path.isfile(literal):
+        out.append(literal)
+    pat_rel = re.sub(r'(?<!\d)(?:19|20)\d{2}(?!\d)', '*', exe_rel, count=1)
+    if pat_rel != exe_rel:
+        out += [h for h in sorted(glob.glob(os.path.join(prefix, pat_rel)))
+                if os.path.isfile(h) and h not in out]
+    return out
+
+
+def _dxvk_conf_for_exe(prefix, profile, exe):
+    """The DXVK config for one installed copy of an app -- `_resolve_app_dxvk_conf`, for a given exe."""
+    rel = profile.get("dxvk_conf") or ""
+    if not rel:
+        return ""
+    if os.sep not in rel:
+        return os.path.join(prefix, rel)
+    return os.path.join(os.path.dirname(exe), os.path.basename(rel))
+
+
+def _read_env_conf(prefix):
+    """<prefix>/neutron-env.conf as {KEY: VALUE} (one `KEY=VALUE` per line, `#` comments)."""
+    out = {}
+    _envconf = os.path.join(prefix, "neutron-env.conf")
+    try:
+        if os.path.isfile(_envconf):
+            with open(_envconf) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#") or "=" not in ln:
+                        continue
+                    k, v = ln.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k:
+                        out[k] = v
+    except OSError as e:
+        log("neutron-env.conf unreadable (%s); ignoring" % e)
+    return out
+
+
+def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=()):
+    """Put one app's launch settings into `env`. THE one place they are computed: `neutron launch` calls
+    it for the app it starts, and `write_appenv_conf` for every installed app, so an app started BY
+    ANOTHER APP (Dynamic Link, Edit in Photoshop) gets exactly what launching it directly gives it.
+
+    `protected` names the keys the caller set itself (its own environment, --with/--without): the
+    per-prefix neutron-env.conf does not override those, and the profile only fills in what is still
+    unset. Returns the neutron-env.conf entries applied, for the launch log.
+    """
+    # NEUTRON_APP tells Neutron's Wine which app's settings this environment already carries, so
+    # neutron-appenv.conf leaves a directly launched app alone (see write_appenv_conf).
+    env["NEUTRON_APP"] = app
+
+    # ⭐ PER-PREFIX WAYLAND app_id, so two prefixes with the same app are distinguishable.
+    #
+    # Wine's default app_id is the lowercased EXE basename, which is IDENTICAL for the same app in
+    # every prefix. The desktop environment matches a running window back to a .desktop entry by
+    # that id, so with Premiere installed in two prefixes it labelled a window launched from the
+    # .premiere2025 icon "Premiere Pro (Adobe2026)" (operator, 2026-09-18 -- the app was in the
+    # right prefix; only the label and the window grouping were wrong).
+    #
+    # Set it here rather than only in the generated Exec= line, so a launch from Collider or a
+    # terminal gets the same identity as a launch from the menu. An explicit value in the caller's
+    # environment still wins. The id is the .desktop basename for this app+prefix, which is the XDG
+    # convention for binding a window to its entry. Honoured by winewayland.drv
+    # `wayland_init_process_name`; harmless on a runtime that predates it (Wine keeps the EXE name).
+    if not env.get("NEUTRON_WAYLAND_APP_ID"):
+        try:
+            env["NEUTRON_WAYLAND_APP_ID"] = "neutron-%s-%s" % (app, _prefix_slug(prefix))
+        except Exception:
+            pass
+
+    # ⭐ PER-PREFIX GATE OVERRIDES: <prefix>/neutron-env.conf, `KEY=VALUE` per line.
+    #
+    # Every behaviour change this project ships is env-gated so it can be A/B'd without a
+    # rebuild -- and that is worthless on the launch surfaces a tester actually uses. A menu
+    # entry, the dock and a file association all run a fixed `Exec=` line with no way to set a
+    # variable, and Collider's launch button has no field for one. So the only surface that
+    # could be A/B'd was a terminal -- which is useless precisely when the surface itself is
+    # what differs, as with the build tester's 2026-08-27 report that Premiere's splash renders
+    # half white from the application menu but not from Collider.
+    #
+    # Applied BEFORE the profile's own gates, which use setdefault -- so this wins over a
+    # profile default. The caller's real environment still wins over this, so a terminal
+    # `NEUTRON_FOO=1 neutron launch ...` overrides the file for a one-off.
+    applied = {}
+    for k, v in _read_env_conf(prefix).items():
+        if k not in protected:
+            env[k] = v
+            applied[k] = v
+    env["DXVK_CONFIG_FILE"] = dxvk_conf
+    if profile["overrides"]:                     # empty => leave unset (match the proven minimal launch)
+        # MERGE, never assign. This used to be a bare assignment, which silently discarded any
+        # WINEDLLOVERRIDES the caller set or that neutron-env.conf had just applied -- and
+        # `neutron gates` advertises neutron-env.conf as reaching EVERY launch surface, so the
+        # one variable it did not cover was invisible. A build tester lost a test run to this on
+        # 2026-09-08 and had to go around us via the registry. The profile's own overrides come
+        # LAST so they still win a same-DLL conflict; anything naming a different DLL survives.
+        _pre = env.get("WINEDLLOVERRIDES", "").strip(";")
+        env["WINEDLLOVERRIDES"] = (_pre + ";" + profile["overrides"]) if _pre else profile["overrides"]
+    if profile.get("nvapi"):
+        env["DXVK_ENABLE_NVAPI"] = "1"
+    # setdefault, NOT assignment: an explicitly pre-set NEUTRON_* in the caller's environment
+    # must WIN, or no gate can ever be turned off from outside. Two independent failures of the
+    # old `env[k] = v` (both 2026-08-09):
+    #   1. premiere-soak.sh's isolation runs (`RTG=0 DIRG=0`) were silently overwritten back to 1
+    #      the moment those gates moved into the profile on 08-08 -- our own A/B tool went inert
+    #      and would have reported "no difference" for every isolation run since.
+    #   2. the build tester could not bisect the Photoshop dcomp-gate bug at all, because every
+    #      gate they set on the command line was discarded before the app saw it.
+    # Trade-off accepted: a stale exported NEUTRON_* in a shell now sticks instead of being
+    # corrected. That is the price of having an override at all, and it is the behaviour the
+    # validated soak path always assumed it had.
+    for k, v in profile.get("env", {}).items():
+        env.setdefault(k, v)
+    return applied
+
+
+APPENV_CONF = "neutron-appenv.conf"
+
+
+def write_appenv_conf(prefix):
+    """Write <prefix>/neutron-appenv.conf: every installed app's own settings, for when ANOTHER app starts it.
+
+    🚨 2026-10-13: Premiere's Dynamic Link started After Effects with PREMIERE'S settings -- a child
+    process inherits its parent's environment, and the per-app settings only ever reached the process
+    `neutron launch` started. After Effects came up with no splash and a black Composition panel: it
+    lacked NEUTRON_WL_ORPHAN_TOPLEVEL and NEUTRON_DXVK_EXPORT_TEXTURES and carried Premiere's
+    NEUTRON_D2D_COMPOSEREAD. Same for every app-starts-app path (Edit in Photoshop, Send to Media
+    Encoder, ...). The profiles genuinely conflict, so no single environment can serve both apps.
+
+    Neutron's Wine (ntdll, `neutron_apply_app_env`, runtime 11.10-118+) reads this file whenever a
+    process starts: if the image path names a section and the inherited NEUTRON_APP differs from the
+    section's, it applies the section -- `KEY=VALUE` sets, `-KEY` clears -- to the Windows environment
+    and the Unix environ before anything reads them. Each section lists every variable that differs
+    between apps, so the child loses the parent's per-app settings as well as gaining its own.
+
+    What a started app gets: exactly what `neutron launch <app>` gives it from a clean shell -- its
+    profile plus this prefix's neutron-env.conf. Variables set on the launcher's command line (or
+    --with/--without) apply to the app that was launched, not to apps it starts. Variables no profile
+    sets (WINEDEBUG, diagnostics) are not listed and still inherit.
+
+    Rewritten on every launch, atomically. Never blocks a launch."""
+    sections = []
+    drive_c = os.path.join(prefix, "drive_c")
+    for app, profile in APP_PROFILES.items():
+        for exe in _app_exe_variants(prefix, profile["exe"]):
+            rel = os.path.relpath(exe, drive_c)
+            if rel.startswith(".."):
+                continue
+            e = {}
+            _apply_app_env(e, app, profile, prefix, _dxvk_conf_for_exe(prefix, profile, exe))
+            sections.append(("C:\\" + rel.replace("/", "\\"), e))
+    managed = sorted(set().union(*(e for _, e in sections))) if sections else []
+    out = ["# Written by `neutron launch` on every launch -- edits here are overwritten.",
+           "# Each installed app's own settings. Neutron's Wine applies an app's section when ANOTHER app",
+           "# starts it (Dynamic Link, Edit in Photoshop, ...), so it does not run with the starting app's",
+           "# settings. KEY=VALUE sets a variable, -KEY clears it. To change a setting for every app in",
+           "# this prefix, use neutron-env.conf.",
+           ""]
+    for path, e in sections:
+        out.append("[%s]" % path)
+        out += ["%s=%s" % (k, e[k]) if k in e else "-%s" % k for k in managed]
+        out.append("")
+    dst = os.path.join(prefix, APPENV_CONF)
+    tmp = dst + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(out))
+    os.replace(tmp, dst)
+    return [path for path, _ in sections]
 
 
 APP_PROFILES = {
@@ -5401,38 +5579,6 @@ def cmd_launch(args):
     dxvk_conf = _resolve_app_dxvk_conf(prefix, profile)
     env = dict(os.environ)
 
-    # ⭐ PER-PREFIX WAYLAND app_id, so two prefixes with the same app are distinguishable.
-    #
-    # Wine's default app_id is the lowercased EXE basename, which is IDENTICAL for the same app in
-    # every prefix. The desktop environment matches a running window back to a .desktop entry by
-    # that id, so with Premiere installed in two prefixes it labelled a window launched from the
-    # .premiere2025 icon "Premiere Pro (Adobe2026)" (operator, 2026-09-18 -- the app was in the
-    # right prefix; only the label and the window grouping were wrong).
-    #
-    # Set it here rather than only in the generated Exec= line, so a launch from Collider or a
-    # terminal gets the same identity as a launch from the menu. An explicit value in the caller's
-    # environment still wins. The id is the .desktop basename for this app+prefix, which is the XDG
-    # convention for binding a window to its entry. Honoured by winewayland.drv
-    # `wayland_init_process_name`; harmless on a runtime that predates it (Wine keeps the EXE name).
-    if not env.get("NEUTRON_WAYLAND_APP_ID"):
-        try:
-            env["NEUTRON_WAYLAND_APP_ID"] = "neutron-%s-%s" % (args.app, _prefix_slug(prefix))
-        except Exception:
-            pass
-
-    # ⭐ PER-PREFIX GATE OVERRIDES: <prefix>/neutron-env.conf, `KEY=VALUE` per line.
-    #
-    # Every behaviour change this project ships is env-gated so it can be A/B'd without a
-    # rebuild -- and that is worthless on the launch surfaces a tester actually uses. A menu
-    # entry, the dock and a file association all run a fixed `Exec=` line with no way to set a
-    # variable, and Collider's launch button has no field for one. So the only surface that
-    # could be A/B'd was a terminal -- which is useless precisely when the surface itself is
-    # what differs, as with the build tester's 2026-08-27 report that Premiere's splash renders
-    # half white from the application menu but not from Collider.
-    #
-    # Applied BEFORE the profile's own gates, which use setdefault -- so this wins over a
-    # profile default. The caller's real environment still wins over this, so a terminal
-    # `NEUTRON_FOO=1 neutron launch ...` overrides the file for a one-off.
     # --with / --without: the named form of the same thing. Applied FIRST so an explicit flag
     # beats both the per-prefix file and the profile default -- the flag is the most deliberate
     # statement of intent available, and a bisect is worthless if something quietly overrides it.
@@ -5448,50 +5594,12 @@ def cmd_launch(args):
         _from_flag.add(_k)
         log("gate: --%s %s -> %s=%s" % ("with" if _on else "without", _name, _k, _v))
 
-    _envconf = os.path.join(prefix, "neutron-env.conf")
-    _applied = {}
-    try:
-        if os.path.isfile(_envconf):
-            with open(_envconf) as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if not ln or ln.startswith("#") or "=" not in ln:
-                        continue
-                    k, v = ln.split("=", 1)
-                    k, v = k.strip(), v.strip()
-                    if k and k not in os.environ and k not in _from_flag:
-                        env[k] = v
-                        _applied[k] = v
-            if _applied:
-                log("neutron-env.conf: %s" % " ".join("%s=%s" % kv for kv in sorted(_applied.items())))
-    except OSError as e:
-        log("neutron-env.conf unreadable (%s); ignoring" % e)
+    # The profile itself: ONE function computes it for this launch and for neutron-appenv.conf below.
+    _applied = _apply_app_env(env, args.app, profile, prefix, dxvk_conf,
+                              protected=set(os.environ) | _from_flag)
+    if _applied:
+        log("neutron-env.conf: %s" % " ".join("%s=%s" % kv for kv in sorted(_applied.items())))
     env["WINEPREFIX"] = prefix
-    env["DXVK_CONFIG_FILE"] = dxvk_conf
-    if profile["overrides"]:                     # empty => leave unset (match the proven minimal launch)
-        # MERGE, never assign. This used to be a bare assignment, which silently discarded any
-        # WINEDLLOVERRIDES the caller set or that neutron-env.conf had just applied -- and
-        # `neutron gates` advertises neutron-env.conf as reaching EVERY launch surface, so the
-        # one variable it did not cover was invisible. A build tester lost a test run to this on
-        # 2026-09-08 and had to go around us via the registry. The profile's own overrides come
-        # LAST so they still win a same-DLL conflict; anything naming a different DLL survives.
-        _pre = env.get("WINEDLLOVERRIDES", "").strip(";")
-        env["WINEDLLOVERRIDES"] = (_pre + ";" + profile["overrides"]) if _pre else profile["overrides"]
-    if profile.get("nvapi"):
-        env["DXVK_ENABLE_NVAPI"] = "1"
-    # setdefault, NOT assignment: an explicitly pre-set NEUTRON_* in the caller's environment
-    # must WIN, or no gate can ever be turned off from outside. Two independent failures of the
-    # old `env[k] = v` (both 2026-08-09):
-    #   1. premiere-soak.sh's isolation runs (`RTG=0 DIRG=0`) were silently overwritten back to 1
-    #      the moment those gates moved into the profile on 08-08 -- our own A/B tool went inert
-    #      and would have reported "no difference" for every isolation run since.
-    #   2. the build tester could not bisect the Photoshop dcomp-gate bug at all, because every
-    #      gate they set on the command line was discarded before the app saw it.
-    # Trade-off accepted: a stale exported NEUTRON_* in a shell now sticks instead of being
-    # corrected. That is the price of having an override at all, and it is the behaviour the
-    # validated soak path always assumed it had.
-    for k, v in profile.get("env", {}).items():
-        env.setdefault(k, v)
     # NEUTRON_PREMIERE_GPU=0 -> drop Premiere's GPU-UI env so the app falls back to its GDI+
     # SOFTWARE drawbot. Needed as an A/B: GPU mode fixes the interface but the Program Monitor
     # renders black in it, while the software drawbot shows video (with playhead trails). Pair
@@ -5672,6 +5780,13 @@ def cmd_launch(args):
     # The display fix (DS.DisableDirectXDisplay) for Premiere, After Effects and Media Encoder,
     # applied before every launch exactly as Collider does. Best-effort; never blocks.
     _display_fix_before_launch(prefix)
+
+    # Each installed app's own settings, for when THIS app starts another one (Dynamic Link, Edit in
+    # Photoshop). Best-effort: without the file a started app inherits this one's settings, as before.
+    try:
+        write_appenv_conf(prefix)
+    except Exception as e:
+        log("%s not written (%s); apps started by this one inherit its settings" % (APPENV_CONF, e))
 
     # Start the app's Adobe background services (ADS/IPCBroker) first, if any, and
     # give them a moment to bind their RPC before the app connects.
