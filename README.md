@@ -114,9 +114,9 @@ The table above is the 2025 line; the 2026 line is below.
 
 | Application | Status | Notes |
 | :--- | :--- | :--- |
-| **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. |
+| **Premiere Pro 2026** | 🟢 `Beta` | Runs on this release, inheriting the 2025 fixes with no new engine work. |
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
-| **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. |
+| **After Effects 2026** | 🟢 `Beta` | Opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. |
 | **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Lightroom Classic 2026** | 🟢 `Beta` | Installs and runs on this release. |
@@ -125,8 +125,6 @@ The table above is the 2025 line; the 2026 line is below.
 | **InDesign 2026** | 🟢 `Beta` | Experimental profile (`neutron launch indesign`): new documents, typing and the Type → Font menu work. |
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Works the same way as on 2025, where it needed no engine changes — both applications must be running. |
-
-The 2026 apps above were installed with Mud Hut's **offline** method from a disc image.
 
 The [status board](https://neutronproject.org) tracks both releases and is the canonical view.
 
