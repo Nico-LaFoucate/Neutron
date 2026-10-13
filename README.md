@@ -83,6 +83,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 > | 🔵 `Likely` | Inherits fixes from another release, unverified |
 > | 🔴 `Not working` | Confirmed broken |
 > | ⚪ `Untested` | Assume broken |
+> | 🟣 `Planned` | Not supported yet |
 >
 > Support is tracked **per release** — a fix landing on one version does not automatically carry
 > to the next.
@@ -95,7 +96,10 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Lightroom Classic** | 🟢 `Beta` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
 | **Illustrator 2025** | 🟢 `Beta` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
 | **Media Encoder 2025** | 🟢 `Beta` | Queue, render and export end-to-end, including native muxing. |
-| **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is blank — that is Adobe's own bug, blank on Windows too; File → New works. |
+| **Audition 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Experimental profile: `neutron launch audition`. |
+| **InDesign 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Experimental profile: `neutron launch indesign`. |
+| **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
+| **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, no engine changes required — both applications must be running. |
 | **CEP / UXP panels** | 🟢 `Beta` | Third-party panels render and stay interactive inside their docks. |
 | **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab, at the tablet's native resolution. The first-stroke stray is fixed — Wine's WinTab context declared `lcOutExt` in tablet units where a real Wacom declares screen pixels, a factor-of-UPP error in the mapping Photoshop uses before it calibrates. |
@@ -110,17 +114,19 @@ The table above is the 2025 line; the 2026 line is below.
 
 | Application | Status | Notes |
 | :--- | :--- | :--- |
-| **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. Not yet used for a paid job on this release. |
+| **Premiere Pro 2026** | 🟢 `Beta` | Installed from an offline package and verified launching and running on the 2026 stack, inheriting the 2025 fixes with no new engine work. |
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
-| **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. Not yet used for a paid job. |
-| **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job. |
-| **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. Not yet used for a paid job. |
+| **After Effects 2026** | 🟢 `Beta` | Installed from an offline package; opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. |
+| **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. |
+| **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Lightroom Classic 2026** | 🟢 `Beta` | Installs and runs on this release. |
-| **Animate** | ⚪ `n/a` | Adobe has not shipped a 2026 Animate. The 2024 build is current and is covered under the 2025 line above. |
+| **Animate** | 🟢 `Beta` | Adobe stopped updating Animate in 2024, so Creative Cloud 2026 installs the same app as 2025. Canvas, panels and playback; its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
+| **Audition 2026** | 🟢 `Beta` | Experimental profile (`neutron launch audition`): recording, playback and effects work, and its Learn panel renders. |
+| **InDesign 2026** | 🟢 `Beta` | Experimental profile (`neutron launch indesign`): new documents, typing and the Type → Font menu work. |
+| **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
+| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Works the same way as on 2025, where it needed no engine changes — both applications must be running. |
 
-The 2026 apps above were installed with Mud Hut's **offline** method from a disc image. Dynamic
-Link's prerequisites (Premiere + After Effects) both run on 2026, but the round trip has not been
-exercised on this release yet.
+The 2026 apps above were installed with Mud Hut's **offline** method from a disc image.
 
 The [status board](https://neutronproject.org) tracks both releases and is the canonical view.
 
