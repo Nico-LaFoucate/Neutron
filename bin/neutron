@@ -150,6 +150,30 @@ NO_RUNTIME_MSG = "neutron-wine isn't installed. Run `neutron setup` first."
 
 # GPU-vendor ICD selection (NVIDIA default; TODO: generalize per detected GPU).
 NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+NVIDIA_PCI_VENDOR = "0x10de"
+
+
+def drm_gpus(sysfs="/sys/class/drm"):
+    """The GPUs the kernel exposes, as [(pci_vendor, driver)], e.g. [("0x8086", "i915"), ("0x10de", "nvidia")].
+    Only cardN nodes; connectors (card1-HDMI-A-1) and devices without a PCI vendor (simpledrm) are skipped."""
+    gpus = []
+    for d in sorted(glob.glob(os.path.join(sysfs, "card[0-9]*"))):
+        if "-" in os.path.basename(d):
+            continue
+        try:
+            with open(os.path.join(d, "device", "vendor")) as f:
+                vendor = f.read().strip().lower()
+        except OSError:
+            continue
+        driver = os.path.basename(os.path.realpath(os.path.join(d, "device", "driver")))
+        gpus.append((vendor, driver))
+    return gpus
+
+
+def nvidia_hybrid(gpus):
+    """True for an NVIDIA GPU next to another vendor's (a laptop's Intel/AMD iGPU)."""
+    vendors = {v for v, _ in gpus}
+    return NVIDIA_PCI_VENDOR in vendors and len(vendors) > 1
 
 # --- DLLs staged into every prefix ---------------------------------------------------------
 # Two sources, nothing else:
@@ -5796,9 +5820,18 @@ def cmd_launch(args):
         env["NODE_OPTIONS"] = (_node_opts + " --dns-result-order=ipv4first").strip()
 
     # GPU-vendor ICD (NVIDIA default; TODO: generalize per detected GPU).
+    gpus = drm_gpus()
     if os.path.isfile(NVIDIA_EGL_ICD):
         env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", NVIDIA_EGL_ICD)
         env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        # GitHub Neutron#12: on a laptop the desktop usually runs on the Intel/AMD iGPU, and NVIDIA's
+        # EGL then renders for it only in PRIME render offload. Without __NV_PRIME_RENDER_OFFLOAD=1
+        # Wine's EGL got no configs at all ("Failed to get any configs from eglChooseConfig"), so no
+        # OpenGL context, and Premiere's CUDA renderer never delivered a frame: black Program
+        # Monitor, Export never opened. Only hybrid machines get it; NVIDIA-only ones keep the
+        # environment they were tested with (it was harmless there too, 2026-10-13).
+        if nvidia_hybrid(gpus):
+            env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
 
     # --- Display path: Wayland-native (crisp UI + native-smooth playback) vs
     #     X11 (software frame pacer). Selected per session; merged here so there
@@ -5950,6 +5983,9 @@ def cmd_launch(args):
             # provenance into the file itself, before the child inherits the fd.
             _gates = " ".join("%s=%s" % (k, v) for k, v in sorted(env.items())
                               if k.startswith("NEUTRON_")) or "(none)"
+            _gpus = (", ".join("%s %s" % g for g in gpus) or "(none found)") + \
+                ("  (hybrid: __NV_PRIME_RENDER_OFFLOAD=%s)" % env["__NV_PRIME_RENDER_OFFLOAD"]
+                 if "__NV_PRIME_RENDER_OFFLOAD" in env else "")
             # ⛔ Report the runtime we RESOLVED, never NEUTRON_WINE_VERSION. That variable is what
             # was ASKED FOR; the binary is what ran. Caught in testing 2026-08-26 when a scratch
             # XDG_DATA_HOME moved the runtimes directory, resolution fell through to the dev build
@@ -5965,11 +6001,12 @@ def cmd_launch(args):
                           "    prefix  : %s  (stamp %s)\n"
                           "    wine    : %s\n"
                           "    display : %s\n"
+                          "    gpus    : %s\n"
                           "    gates   : %s\n"
                           "=== everything below this line is the application's own output\n\n"
                           % (_rtname, time.strftime("%Y-%m-%d %H:%M:%S"),
                              args.app, profile["name"], exe, prefix,
-                             _prefix_stamp(prefix), wine, display_mode, _gates)
+                             _prefix_stamp(prefix), wine, display_mode, _gpus, _gates)
                           ).encode("utf-8", "replace"))
             log_fh.flush()
         except OSError as e:
