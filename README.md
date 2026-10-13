@@ -100,7 +100,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **InDesign 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Experimental profile: `neutron launch indesign`. |
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
 | **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
-| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, no engine changes required — both applications must be running. |
+| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu (runtime 11.10-118 or later). |
 | **CEP / UXP panels** | 🟢 `Beta` | Third-party panels render and stay interactive inside their docks. |
 | **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab, at the tablet's native resolution. The first-stroke stray is fixed — Wine's WinTab context declared `lcOutExt` in tablet units where a real Wacom declares screen pixels, a factor-of-UPP error in the mapping Photoshop uses before it calibrates. |
 | **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin into an application. |
@@ -124,7 +124,7 @@ The table above is the 2025 line; the 2026 line is below.
 | **Audition 2026** | 🟢 `Beta` | Experimental profile (`neutron launch audition`): recording, playback and effects work, and its Learn panel renders. |
 | **InDesign 2026** | 🟢 `Beta` | Experimental profile (`neutron launch indesign`): new documents, typing and the Type → Font menu work. |
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
-| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Works the same way as on 2025, where it needed no engine changes — both applications must be running. |
+| **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu — tested both ways on this release (runtime 11.10-118 or later). |
 
 The [status board](https://neutronproject.org) tracks both releases and is the canonical view.
 
