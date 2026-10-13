@@ -116,7 +116,7 @@ The table above is the 2025 line; the 2026 line is below.
 | :--- | :--- | :--- |
 | **Premiere Pro 2026** | 🟢 `Beta` | Runs on this release, inheriting the 2025 fixes with no new engine work. |
 | **Photoshop 2026** | 🟢 `Beta` | Stable for day-to-day work on this release. |
-| **After Effects 2026** | 🟢 `Beta` | Opens a project and the **composition viewer renders**. Needed a fix on our side — AE 2026 keeps two preference databases and `DS.DisableDirectXDisplay` was being written to the one it does not read. |
+| **After Effects 2026** | 🟢 `Beta` | Installs and runs on this release. It has been used for day-to-day work. |
 | **Illustrator 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Lightroom Classic 2026** | 🟢 `Beta` | Installs and runs on this release. |
