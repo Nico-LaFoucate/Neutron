@@ -210,6 +210,60 @@ DISPLAY_FIX_KEY = "DS.DisableDirectXDisplay"
 DISPLAY_FIX_CURRENT = "true"
 DISPLAY_FIX_DEFAULT = "false"
 
+# ⭐ 2026-10-14 (Neutron#21) — PREMIERE 2026+ RUNS ON ADOBE'S DIRECTX DISPLAY.
+# Premiere 26.x draws the Program Monitor's Transform/Crop handles with a new GPU overlay renderer
+# (`OverlayRendererGPU_Manta`), and its OpenGL display -- the one `DS.DisableDirectXDisplay=true`
+# selects -- "does not handle Manta texture frames" (Adobe's own message), so on that display the
+# handles were drawn and dropped: invisible but working. Premiere 2025 draws them the older way and
+# shows them on either display. The DirectX display needs runtime 11.10-121+ (DXVK dxgi stores the
+# swap chain background color; it used to fail and Premiere never presented -> black monitor) and
+# blit-to-window off (NEUTRON_DISABLE_BTW=1, set in _apply_app_env): with it on, every Program Monitor
+# frame was read back and repainted through GDI and playback ran at 6-7 fps; off, 30 fps.
+# So Premiere 2026+ gets Adobe's default (`false`) -- including undoing the `true` older CLIs wrote --
+# while Premiere 2025, After Effects and Media Encoder keep `true`. Both halves apply only when the
+# prefix's dxgi.dll has the fix (_prefix_dxgi_presents_directx_display): on an older runtime -- a
+# launcher can pin one -- Premiere 2026 stays on the OpenGL display with blit-to-window on, as before.
+PREMIERE_DIRECTX_DISPLAY_FROM = 26   # Premiere major version: prefs dir "26.0", install "Adobe Premiere Pro 2026"
+
+
+def _premiere_major(path):
+    """Premiere's major version from a prefs path (".../Premiere Pro/26.0/Debug Database.txt" or the
+    "26.0" dir) or an install path (".../Adobe Premiere Pro 2026/..."). 0 if it names none."""
+    m = re.search(r"Adobe Premiere Pro (20\d\d)", path or "")
+    if m:
+        return int(m.group(1)) - 2000
+    m = re.search(r"Premiere Pro[/\\](\d+)\.\d+", path or "")
+    return int(m.group(1)) if m else 0
+
+
+def _prefix_dxgi_presents_directx_display(prefix):
+    """True iff this prefix's DXVK dxgi.dll can carry Premiere 2026's DirectX display: runtime 11.10-121+
+    stores the swap chain background color, and its dxgi has no "BackgroundColor" string at all, where the
+    old stubs logged "...BackgroundColor: Not implemented" (the build gate in neutron-wine checks the same).
+    Checked on the prefix's own copy -- what Premiere loads -- not the runtime's, because a launcher can
+    pin an older runtime and the CLI must never switch Premiere to a display that runtime leaves black."""
+    try:
+        with open(os.path.join(prefix, "drive_c", "windows", "system32", "dxgi.dll"), "rb") as f:
+            b = f.read()
+    except OSError:
+        return False
+    return b"DxgiSwapChain" in b and b"BackgroundColor" not in b
+
+
+def _premiere_directx_display(prefix, path):
+    """Premiere 2026+ in a prefix whose dxgi can show its DirectX display (see PREMIERE_DIRECTX_DISPLAY_FROM)."""
+    return (_premiere_major(path) >= PREMIERE_DIRECTX_DISPLAY_FROM
+            and _prefix_dxgi_presents_directx_display(prefix))
+
+
+def _display_fix_wanted(label, path, prefix):
+    """The DS.DisableDirectXDisplay value Neutron wants for this app's Debug Database (or prefs dir):
+    "true" (Adobe's OpenGL display) everywhere except Premiere 2026+ on a runtime that can show its DirectX
+    display, which keeps Adobe's default "false". See PREMIERE_DIRECTX_DISPLAY_FROM."""
+    if label == "premiere" and _premiere_directx_display(prefix, path):
+        return DISPLAY_FIX_DEFAULT
+    return DISPLAY_FIX_CURRENT
+
 # ⭐ 2026-08-09 — THE DISPLAY FIX IS NOT PREMIERE-ONLY.
 # `DS.DisableDirectXDisplay` lives in the Debug Database of every DVA-based app: Premiere,
 # After Effects AND Media Encoder. apply-display-fix only ever resolved Premiere's, so on any
@@ -509,7 +563,7 @@ def _read_env_conf(prefix):
     return out
 
 
-def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=()):
+def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None):
     """Put one app's launch settings into `env`. THE one place they are computed: `neutron launch` calls
     it for the app it starts, and `write_appenv_conf` for every installed app, so an app started BY
     ANOTHER APP (Dynamic Link, Edit in Photoshop) gets exactly what launching it directly gives it.
@@ -584,6 +638,13 @@ def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=()):
     # validated soak path always assumed it had.
     for k, v in profile.get("env", {}).items():
         env.setdefault(k, v)
+    # Premiere 2026+ runs on Adobe's DirectX display (PREMIERE_DIRECTX_DISPLAY_FROM). Its Program Monitor
+    # presents through vkd3d-proton straight to its own surface; blit-to-window would ALSO read every
+    # frame back and repaint it through GDI, which held playback at 6-7 fps (30 fps without it).
+    # setdefault, so NEUTRON_DISABLE_BTW=0 from the caller still turns it back on for an A/B.
+    # Tied to the same check as the display value: on the OpenGL display Premiere still needs it.
+    if app == "premiere" and _premiere_directx_display(prefix, exe or dxvk_conf):
+        env.setdefault("NEUTRON_DISABLE_BTW", "1")
     return applied
 
 
@@ -620,7 +681,7 @@ def write_appenv_conf(prefix):
             if rel.startswith(".."):
                 continue
             e = {}
-            _apply_app_env(e, app, profile, prefix, _dxvk_conf_for_exe(prefix, profile, exe))
+            _apply_app_env(e, app, profile, prefix, _dxvk_conf_for_exe(prefix, profile, exe), exe=exe)
             sections.append(("C:\\" + rel.replace("/", "\\"), e))
     managed = sorted(set().union(*(e for _, e in sections))) if sections else []
     out = ["# Written by `neutron launch` on every launch -- edits here are overwritten.",
@@ -1352,8 +1413,8 @@ def _display_fix_pref_dir(prefix, user, label):
     return None
 
 
-def _apply_display_fix_to(dbg):
-    """Set DISPLAY_FIX_KEY=true in one Debug Database, preserving every other byte.
+def _apply_display_fix_to(dbg, want=DISPLAY_FIX_CURRENT):
+    """Set DISPLAY_FIX_KEY to `want` in one Debug Database, preserving every other byte.
 
     Returns "already" | "changed". Raises OSError on read/write failure.
     Adobe writes these lines as key\\tcurrent\\tdefault terminated by CR CR LF; we write a
@@ -1361,9 +1422,9 @@ def _apply_display_fix_to(dbg):
     """
     with open(dbg, "r", encoding="utf-8", errors="replace", newline="") as f:
         raw = f.read()
-    if _display_fix_is_on(raw):
+    if _display_fix_matches(raw, want):
         return "already"
-    new_line = f"{DISPLAY_FIX_KEY}\t{DISPLAY_FIX_CURRENT}\t{DISPLAY_FIX_DEFAULT}\r\n"
+    new_line = f"{DISPLAY_FIX_KEY}\t{want}\t{DISPLAY_FIX_DEFAULT}\r\n"
     out_lines, found = [], False
     for ln in raw.splitlines(keepends=True):
         if ln.lstrip("﻿").startswith(DISPLAY_FIX_KEY + "\t"):
@@ -3582,6 +3643,23 @@ def ensure_dxvk_gpl(conf_path, full_body=None):
         log(f"dxvk gpl workaround write failed (non-fatal): {e}")
 
 
+def _display_fix_value(content):
+    """The display-fix key's current value ("true"/"false", lowercased), or None when the key is absent."""
+    for raw in content.splitlines():
+        line = raw.rstrip("\r").lstrip("\ufeff")
+        if line.startswith(DISPLAY_FIX_KEY + "\t"):
+            parts = line.split("\t")
+            return parts[1].strip().lower() if len(parts) >= 2 else ""
+    return None
+
+
+def _display_fix_matches(content, want):
+    """True iff this Debug Database already has the value Neutron wants. An absent key means Adobe's
+    default, which is right when that is what Neutron wants (Premiere 2026+)."""
+    cur = _display_fix_value(content)
+    return cur == want or (cur is None and want == DISPLAY_FIX_DEFAULT)
+
+
 def _display_fix_is_on(content):
     """True iff the display-fix key is present AND its current value is 'true'.
 
@@ -3934,7 +4012,8 @@ def cmd_prefix_info(args):
         try:
             with open(dbg, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            display_fix_applied = _display_fix_is_on(content)
+            # "Applied" = the value Neutron wants for this Premiere version (Premiere 2026+: Adobe's default).
+            display_fix_applied = _display_fix_matches(content, _display_fix_wanted("premiere", dbg, prefix))
         except OSError:
             display_fix_applied = False
 
@@ -4000,14 +4079,24 @@ def _apply_display_fix_apps(prefix, user, running):
                             "reason": "%s is running in this prefix; its prefs are left "
                                       "alone until it exits" % label})
             continue
-        if dbg:
-            try:
-                state = _apply_display_fix_to(dbg)
-            except OSError as e:
-                results.append({"app": label, "state": "error", "reason": str(e)})
-                continue
-            any_changed |= (state == "changed")
-            results.append({"app": label, "state": state, "debug_database": dbg})
+        # Premiere keeps one Debug Database PER VERSION (Premiere Pro/25.0, 26.0) and the value differs by
+        # version (PREMIERE_DIRECTX_DISPLAY_FROM), so every one is set, not only the highest.
+        dbgs = [dbg] if dbg else []
+        if label == "premiere" and dbg:
+            dbgs = sorted(h for h in glob.glob(os.path.join(os.path.dirname(os.path.dirname(dbg)), "*",
+                                                            "Debug Database.txt"))
+                          if ".bak" not in h and "Team Projects" not in h)
+        if dbgs:
+            for one in dbgs:
+                want = _display_fix_wanted(label, one, prefix)
+                try:
+                    state = _apply_display_fix_to(one, want)
+                except OSError as e:
+                    results.append({"app": label, "state": "error", "reason": str(e)})
+                    continue
+                any_changed |= (state == "changed")
+                results.append({"app": label, "state": state, "debug_database": one,
+                                "value": want})
         else:
             # The app is installed but has never written its prefs. Adobe creates this file
             # itself on a clean exit, so on a never-run app there is nothing to edit -- which
@@ -4018,6 +4107,10 @@ def _apply_display_fix_apps(prefix, user, running):
             vdir = _display_fix_pref_dir(prefix, user, label)
             if not vdir:
                 results.append({"app": label, "state": "pending-first-run"})
+                continue
+            if _display_fix_wanted(label, vdir, prefix) == DISPLAY_FIX_DEFAULT:
+                # Premiere 2026+ wants Adobe's default, which an absent file already is.
+                results.append({"app": label, "state": "already", "value": DISPLAY_FIX_DEFAULT})
                 continue
             try:
                 os.makedirs(vdir, exist_ok=True)
@@ -5596,7 +5689,8 @@ def cmd_launch(args):
 
     # The profile itself: ONE function computes it for this launch and for neutron-appenv.conf below.
     _applied = _apply_app_env(env, args.app, profile, prefix, dxvk_conf,
-                              protected=set(os.environ) | _from_flag)
+                              protected=set(os.environ) | _from_flag,
+                              exe=_resolve_app_exe(prefix, profile["exe"]))
     if _applied:
         log("neutron-env.conf: %s" % " ".join("%s=%s" % kv for kv in sorted(_applied.items())))
     env["WINEPREFIX"] = prefix
@@ -7226,7 +7320,7 @@ def cmd_doctor(args):
                     check("debug-database", True, dbg)
                     try:
                         with open(dbg, "r", encoding="utf-8", errors="replace") as f:
-                            applied = _display_fix_is_on(f.read())
+                            applied = _display_fix_matches(f.read(), _display_fix_wanted("premiere", dbg, prefix))
                     except OSError:
                         applied = False
                     check("display_fix", applied, None if applied else

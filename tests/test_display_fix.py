@@ -131,5 +131,122 @@ class DisplayFixBeforeLaunch(unittest.TestCase):
                         launch.index("subprocess.Popen("), "the fix must run before the app starts")
 
 
+class Premiere2026DirectXDisplay(unittest.TestCase):
+    """Neutron#21 (2026-10-14): Premiere 2026+ draws its Transform/Crop handles with a GPU overlay renderer
+    that Adobe's OpenGL display drops, so Premiere 2026+ keeps Adobe's default DirectX display (`false`) --
+    including undoing the `true` older CLIs wrote -- and launches with blit-to-window off. Premiere 2025
+    keeps `true`. Each test starts from the state an older CLI left behind (the known-bad state)."""
+
+    def setUp(self):
+        self.prefix = tempfile.mkdtemp(prefix="neutron-dfix26-")
+        drive = os.path.join(self.prefix, "drive_c")
+        self.adobe = os.path.join(drive, "Program Files", "Adobe")
+        self.roaming = os.path.join(drive, "users", USER, "AppData", "Roaming", "Adobe")
+        os.makedirs(self.roaming)   # a real user profile; without it no user is found and nothing runs
+        self.sys32 = os.path.join(drive, "windows", "system32")
+        os.makedirs(self.sys32)
+        self._dxgi(fixed=True)      # runtime 11.10-121+ provisioned this prefix
+        self._running = N._running_app_ids
+        N._running_app_ids = lambda prefix: []
+        self._user = os.environ.get("USER")
+        os.environ["USER"] = USER
+
+    def tearDown(self):
+        N._running_app_ids = self._running
+        if self._user is None:
+            os.environ.pop("USER", None)
+        else:
+            os.environ["USER"] = self._user
+        shutil.rmtree(self.prefix, ignore_errors=True)
+
+    def _dxgi(self, fixed):
+        """The prefix's DXVK dxgi.dll: 11.10-121+ has no BackgroundColor strings; older ones have the stubs'."""
+        with open(os.path.join(self.sys32, "dxgi.dll"), "wb") as f:
+            f.write(b"MZ...DxgiSwapChain::Present..." if fixed else
+                    b"MZ...DxgiSwapChain::GetBackgroundColor: Not implemented...")
+
+    def _premiere(self, year, prefs=None):
+        os.makedirs(os.path.join(self.adobe, "Adobe Premiere Pro %d" % year), exist_ok=True)
+        with open(os.path.join(self.adobe, "Adobe Premiere Pro %d" % year, "Adobe Premiere Pro.exe"), "w"):
+            pass
+        if prefs is None:
+            return None
+        d = os.path.join(self.roaming, "Premiere Pro", "%d.0" % (year - 2000))
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "Debug Database.txt")
+        with open(path, "w", newline="") as f:
+            f.write(prefs)
+        return path
+
+    def _run(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            N._display_fix_before_launch(self.prefix)
+        return out.getvalue(), err.getvalue()
+
+    def _read(self, path):
+        with open(path, newline="") as f:
+            return f.read()
+
+    def test_2026_reverts_old_fix_and_2025_keeps_it(self):
+        old_cli = PREMIERE_PREFS.replace("DisableDirectXDisplay\tfalse", "DisableDirectXDisplay\ttrue")
+        p25 = self._premiere(2025, PREMIERE_PREFS)    # fix off: must become true
+        p26 = self._premiere(2026, old_cli)           # an older CLI forced true: must go back to false
+        out, err = self._run()
+        self.assertEqual(out, "")
+        self.assertEqual(_settings(self._read(p25))[1], ["DS.DisableDirectXDisplay", "true", "false"])
+        self.assertEqual(_settings(self._read(p26)), [
+            ["BE.Prefs.Version", "1", "1"],
+            ["DS.DisableDirectXDisplay", "false", "false"],
+            ["MZ.Some.Other.Key", "42", "0"]])
+        before = (self._read(p25), self._read(p26))
+        self.assertEqual(self._run(), ("", ""))       # idempotent
+        self.assertEqual((self._read(p25), self._read(p26)), before)
+
+    def test_2026_without_the_key_is_left_alone(self):
+        prefs = "BE.Prefs.Version\t1\t1\r\r\n"
+        p26 = self._premiere(2026, prefs)
+        self.assertEqual(self._run(), ("", ""))
+        self.assertEqual(self._read(p26), prefs)      # absent key = Adobe's default = what we want
+
+    def test_never_run_2026_gets_no_file(self):
+        self._premiere(2026)
+        self.assertEqual(self._run(), ("", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.roaming, "Premiere Pro")))
+
+    def test_status_reports_2026_default_as_applied(self):
+        p26 = self._premiere(2026, PREMIERE_PREFS)
+        self.assertTrue(N._display_fix_matches(self._read(p26), N._display_fix_wanted("premiere", p26, self.prefix)))
+        p25 = os.path.join(self.roaming, "Premiere Pro", "25.0", "Debug Database.txt")
+        self.assertFalse(N._display_fix_matches(PREMIERE_PREFS, N._display_fix_wanted("premiere", p25, self.prefix)))
+
+    def test_launch_env_blit_to_window_off_for_2026_only(self):
+        prof = N.APP_PROFILES["premiere"]
+        for year, want in ((2025, None), (2026, "1")):
+            exe = os.path.join(self.adobe, "Adobe Premiere Pro %d" % year, "Adobe Premiere Pro.exe")
+            env = {}
+            N._apply_app_env(env, "premiere", prof, self.prefix, os.path.join(os.path.dirname(exe), "dxvk.conf"),
+                             exe=exe)
+            self.assertEqual(env.get("NEUTRON_DISABLE_BTW"), want, year)
+        self._premiere(2026)
+        env = {"NEUTRON_DISABLE_BTW": "0"}           # a caller's A/B still wins
+        N._apply_app_env(env, "premiere", prof, self.prefix, "x", protected={"NEUTRON_DISABLE_BTW"},
+                         exe=os.path.join(self.adobe, "Adobe Premiere Pro 2026", "Adobe Premiere Pro.exe"))
+        self.assertEqual(env["NEUTRON_DISABLE_BTW"], "0")
+
+    def test_older_runtime_keeps_2026_on_the_opengl_display(self):
+        """A launcher pinned to a runtime before 11.10-121: its dxgi still fails SetBackgroundColor, so the
+        DirectX display would be black. Premiere 2026 must stay exactly as before: true + blit-to-window on."""
+        self._dxgi(fixed=False)
+        p26 = self._premiere(2026, PREMIERE_PREFS)
+        self._run()
+        self.assertEqual(_settings(self._read(p26))[1], ["DS.DisableDirectXDisplay", "true", "false"])
+        exe = os.path.join(self.adobe, "Adobe Premiere Pro 2026", "Adobe Premiere Pro.exe")
+        env = {}
+        N._apply_app_env(env, "premiere", N.APP_PROFILES["premiere"], self.prefix,
+                         os.path.join(os.path.dirname(exe), "dxvk.conf"), exe=exe)
+        self.assertNotIn("NEUTRON_DISABLE_BTW", env)
+
+
 if __name__ == "__main__":
     unittest.main()
