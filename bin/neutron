@@ -5610,21 +5610,17 @@ def cmd_launch(args):
                   "NEUTRON_CEF_MAX_FPS", "NEUTRON_D2D_COMPOSEREAD"):
             env.pop(k, None)
         log("premiere: GPU-UI env DROPPED (NEUTRON_PREMIERE_GPU=0) -> software drawbot")
-    # ⭐ 2026-08-15 — AUDIO DROPOUTS DURING PLAYBACK. winepulse asks PulseAudio for a very small
-    # buffer; against PipeWire's pulse shim and a USB interface that is not enough headroom, and
-    # Premiere's playback drops audio while reporting NOTHING -- its own log shows zero audio lines
-    # and "Frames dropped during playback: 0". The gap is entirely below the app, which is why
-    # looking in Premiere for it finds nothing.
-    #
-    # 90 ms is the smallest value that held up in testing here (PipeWire 1.6.8, quantum 1024 @ 48k,
-    # Focusrite Scarlett Solo over USB). The cost is 90 ms of output latency, which matters for
-    # live monitoring but not for timeline playback.
-    #
-    # setdefault, so anyone chasing latency can lower or unset it per launch.
-    # ⚠️ Provisional: confirmed by ear over one session, not by an xrun count. If dropouts persist,
-    # measure with `pw-top` during playback (the ERR column) before raising this further -- a bigger
-    # buffer that does not help means the problem is elsewhere (USB scheduling, winepulse itself).
-    env.setdefault("PULSE_LATENCY_MSEC", "90")
+    # ⛔ 2026-10-13 — NO PULSE_LATENCY_MSEC. From 08-17 every launch set PULSE_LATENCY_MSEC=90 for
+    # audio dropouts in Premiere playback ("confirmed by ear over one session, not by an xrun
+    # count"). libpulse applies it to CAPTURE too, and PipeWire gives a source twice that: the
+    # Scarlett's mic delivered audio in 180 ms chunks. Since runtime 11.10-117 Premiere opens its
+    # MME input at startup and keeps it running, and with 180 ms input chunks its playback jumped
+    # and the audio cut out (operator: "the audio cuts out and jumps with the footage"); with the
+    # variable off it is smooth. Measured on 10-13 (preserved-fixes/harnesses/playback-underruns.c,
+    # winepulse Underflow count, 30 s, idle and with 22 of 24 threads busy): unset / 30 / 60 / 90 ms
+    # -> 0 / 0 / 0-1 / 0 underflows -- the August dropouts no longer reproduce, so the variable bought
+    # nothing. Anyone who needs it can still set it themselves (it passes through), at the cost of
+    # Premiere's playback with the mic open. Wiki OPEN-ISSUES "Program Monitor playback jitter".
 
     # --- silence Wine's FIXME chatter -------------------------------------------------
     # Wine prints four classes: err, warn, fixme, trace. fixme is on by default and means
