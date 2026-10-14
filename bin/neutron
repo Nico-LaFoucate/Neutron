@@ -5472,30 +5472,76 @@ def cmd_runtime_which(args):
     return EX_OK
 
 
+# Seconds to wait before the 2nd, 3rd and 4th attempt of a download. A fresh-HOME release test of 119
+# (2026-10-13) failed setup on one HTTP 500 from GitHub for a font file; the second run passed.
+DOWNLOAD_RETRY_DELAYS = (2, 5, 10)
+DOWNLOAD_TIMEOUT = 60                        # per connect / per read, not for the whole file
+
+
+class ShortDownload(OSError):
+    """The connection ended before Content-Length bytes arrived."""
+
+
+def _download_retryable(e):
+    """A failure another attempt can fix: the server's fault (5xx, 429), a timed-out, reset or dropped
+    connection, or a body cut short. Never another 4xx (a 404 is a wrong URL every time), and never a
+    checksum mismatch, which callers check after the download."""
+    import http.client
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500 or e.code == 429
+    if isinstance(e, urllib.error.URLError) and isinstance(e.reason, BaseException):
+        e = e.reason
+    return isinstance(e, (TimeoutError, ConnectionResetError, ConnectionAbortedError, ShortDownload,
+                          http.client.IncompleteRead))
+
+
 def _download(src, dest, as_json):
     """Stream `src` (http(s)/file URL or local path) to `dest`. Shows a simple
-    stderr progress line in human mode. Returns bytes written."""
-    import urllib.request
+    stderr progress line in human mode. Returns bytes written. A transient failure
+    (see _download_retryable) is retried after each of DOWNLOAD_RETRY_DELAYS; the
+    last failure is raised."""
     if "://" not in src:                     # plain local path
         shutil.copyfile(src, dest)
         return os.path.getsize(dest)
+    for attempt in range(len(DOWNLOAD_RETRY_DELAYS) + 1):
+        try:
+            return _download_once(src, dest, as_json)
+        except Exception as e:
+            if attempt == len(DOWNLOAD_RETRY_DELAYS) or not _download_retryable(e):
+                raise
+            wait = DOWNLOAD_RETRY_DELAYS[attempt]
+            log(f"download failed ({e}); trying again in {wait} s "
+                f"(attempt {attempt + 2} of {len(DOWNLOAD_RETRY_DELAYS) + 1}): {src}")
+            time.sleep(wait)
+
+
+def _download_once(src, dest, as_json):
+    import http.client
+    import urllib.request
     req = urllib.request.Request(src, headers={"User-Agent": "neutron-cli"})
     done = 0
-    with urllib.request.urlopen(req) as r, open(dest, "wb") as out:
-        total = int(r.headers.get("Content-Length") or 0)
-        last = -1
-        for chunk in iter(lambda: r.read(1 << 20), b""):
-            out.write(chunk)
-            done += len(chunk)
-            if not as_json and total:
-                pct = done * 100 // total
-                if pct != last:
-                    print(f"\r[neutron]   {pct:3d}%  "
-                          f"({done/(1<<20):6.1f}/{total/(1<<20):.1f} MiB)",
-                          end="", file=sys.stderr, flush=True)
-                    last = pct
-    if not as_json and done:
-        print(file=sys.stderr)               # newline after the progress line
+    last = -1
+    try:
+        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r, open(dest, "wb") as out:
+            total = int(r.headers.get("Content-Length") or 0)
+            for chunk in iter(lambda: r.read(1 << 20), b""):
+                out.write(chunk)
+                done += len(chunk)
+                if not as_json and total:
+                    pct = done * 100 // total
+                    if pct != last:
+                        print(f"\r[neutron]   {pct:3d}%  "
+                              f"({done/(1<<20):6.1f}/{total/(1<<20):.1f} MiB)",
+                              end="", file=sys.stderr, flush=True)
+                        last = pct
+            if total and done < total:
+                raise ShortDownload(f"connection closed after {done} of {total} bytes")
+    except http.client.IncompleteRead as e:
+        raise ShortDownload(f"connection closed after {done + len(e.partial)} bytes") from e
+    finally:
+        if not as_json and last >= 0:
+            print(file=sys.stderr)           # newline after the progress line
     return done
 
 
@@ -7860,6 +7906,8 @@ def cmd_setup(args, updating=False):
             mark = "✓" if s["ok"] else "✗"
             info = s.get("version") or s.get("status") or ""
             print(f"[neutron] {mark} {s['step']:<13} {info}  {s.get('detail') or s.get('note') or ''}".rstrip())
+        if not out["ok"]:
+            print("[neutron] " + setup_rerun_hint(updating))
         for p in out.get("prefixes_on_older_runtimes", []):
             print(f"[neutron]   {p['prefix']} still runs neutron-wine {p['runtime']}; move it to "
                   f"{p['latest']} with: neutron prefix provision {p['prefix']}")
@@ -7867,6 +7915,15 @@ def cmd_setup(args, updating=False):
             print("[neutron] Done. Open Neutron Collider from your application menu to install "
                   "the Adobe apps.")
     return EX_OK if out["ok"] else EX_FAIL
+
+
+def setup_rerun_hint(updating):
+    """The line under a failed setup/update summary. A second run is safe (the runtime and the
+    Microsoft files are skipped when present, Mud Hut and Collider are replaced) and usually
+    enough, since a failed download is mostly a passing error."""
+    cmd = "neutron update" if updating else "neutron setup"
+    return (f"Run `{cmd}` again. A failed download is usually a temporary network or server "
+            "error.")
 
 
 def _reprovision_prefixes(version, as_json):
