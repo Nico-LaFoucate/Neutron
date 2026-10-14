@@ -5390,6 +5390,26 @@ NEUTRON_GATES = {
         "why": "an experiment left in, gated OFF -- it chased rounding noise and oscillated. "
                "Do not enable it to 'fix' a misplaced menu without measuring first.",
     },
+    "output-transform": {
+        "env": "NEUTRON_OUTPUT_TRANSFORM", "default": True,
+        "what": "report a rotated (portrait) monitor in its real orientation and dpi",
+        "why": "runtime 11.10-122 (Neutron#20): without it a portrait screen came out landscape at "
+               "~171 dpi and Illustrator drew its menus at half size. Turn it off if monitor "
+               "positions, window placement or menu scale go wrong with a rotated screen. Wine "
+               "builds the monitor list once per session, so close every app in the prefix first.",
+    },
+    "vkd3d-shared-buffers": {
+        "env": "NEUTRON_VKD3D_SHARED_BUFFERS", "default": True,
+        "what": "give shared D3D12 buffers exportable memory (a real CreateSharedHandle)",
+        "why": "runtime 11.10-122, with cuda-d3d-interop: Premiere 2026 hands frames between CUDA "
+               "and D3D12 this way. Turn both off if Premiere 2026's Program Monitor misdraws.",
+    },
+    "cuda-d3d-interop": {
+        "env": "NEUTRON_CUDA_D3D_INTEROP", "default": True,
+        "what": "let CUDA import D3D12/D3D11 memory and fences",
+        "why": "runtime 11.10-122, with vkd3d-shared-buffers. Off = CUDA refuses those handles and "
+               "Premiere copies frames through host memory, as on 11.10-121.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
