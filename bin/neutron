@@ -175,6 +175,31 @@ def nvidia_hybrid(gpus):
     vendors = {v for v, _ in gpus}
     return NVIDIA_PCI_VENDOR in vendors and len(vendors) > 1
 
+
+def boot_gpu_vendor(sysfs="/sys/class/drm"):
+    """PCI vendor of the GPU the firmware booted on (device/boot_vga = 1), or None if no card says.
+    KWin and Mutter render the desktop on this GPU by default."""
+    for d in sorted(glob.glob(os.path.join(sysfs, "card[0-9]*"))):
+        if "-" in os.path.basename(d):
+            continue
+        try:
+            with open(os.path.join(d, "device", "boot_vga")) as f:
+                if f.read().strip() != "1":
+                    continue
+            with open(os.path.join(d, "device", "vendor")) as f:
+                return f.read().strip().lower()
+        except OSError:
+            continue
+    return None
+
+
+def nvidia_render_offload(gpus, boot_vendor):
+    """True when NVIDIA must render for a desktop another vendor's GPU drives (PRIME render offload):
+    a hybrid machine whose boot GPU is not the NVIDIA one. A desktop that runs its monitors on NVIDIA
+    with the CPU's iGPU also enabled boots on NVIDIA and keeps the NVIDIA-only environment. With no
+    boot_vga anywhere, a hybrid machine is assumed to be a laptop."""
+    return nvidia_hybrid(gpus) and boot_vendor != NVIDIA_PCI_VENDOR
+
 # --- DLLs staged into every prefix ---------------------------------------------------------
 # Two sources, nothing else:
 #   * our open-source builds (DXVK, vkd3d-proton, dxvk-nvapi, the NVIDIA wrappers, the ucrtbase
@@ -5828,9 +5853,11 @@ def cmd_launch(args):
         # EGL then renders for it only in PRIME render offload. Without __NV_PRIME_RENDER_OFFLOAD=1
         # Wine's EGL got no configs at all ("Failed to get any configs from eglChooseConfig"), so no
         # OpenGL context, and Premiere's CUDA renderer never delivered a frame: black Program
-        # Monitor, Export never opened. Only hybrid machines get it; NVIDIA-only ones keep the
-        # environment they were tested with (it was harmless there too, 2026-10-13).
-        if nvidia_hybrid(gpus):
+        # Monitor, Export never opened. Only hybrid machines whose desktop runs on the other GPU get
+        # it (nvidia_render_offload); NVIDIA-only machines, and desktops that boot on NVIDIA with an
+        # iGPU also enabled, keep the environment they were tested with (it was harmless on
+        # NVIDIA-only too, 2026-10-13).
+        if nvidia_render_offload(gpus, boot_gpu_vendor()):
             env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
 
     # --- Display path: Wayland-native (crisp UI + native-smooth playback) vs
@@ -5983,7 +6010,9 @@ def cmd_launch(args):
             # provenance into the file itself, before the child inherits the fd.
             _gates = " ".join("%s=%s" % (k, v) for k, v in sorted(env.items())
                               if k.startswith("NEUTRON_")) or "(none)"
+            _boot = boot_gpu_vendor()
             _gpus = (", ".join("%s %s" % g for g in gpus) or "(none found)") + \
+                ("  (boot %s)" % _boot if _boot and len(gpus) > 1 else "") + \
                 ("  (hybrid: __NV_PRIME_RENDER_OFFLOAD=%s)" % env["__NV_PRIME_RENDER_OFFLOAD"]
                  if "__NV_PRIME_RENDER_OFFLOAD" in env else "")
             # ⛔ Report the runtime we RESOLVED, never NEUTRON_WINE_VERSION. That variable is what
