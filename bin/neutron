@@ -3530,12 +3530,15 @@ def _wayland_outputs(timeout=2.0):
     for o in outs.values():
         if "mode" not in o:
             continue
-        mw = o["mode"][1] if o["transform"] & 1 else o["mode"][0]   # logical is rotated, mode not
+        mw, mh = o["mode"][::-1] if o["transform"] & 1 else o["mode"]   # logical is rotated, mode not
         lw = o.get("logical", (mw,))[0] or mw
         physical = lw == mw and o["int_scale"] > 1                     # Mutter physical layout
         sc = o["int_scale"] if physical else mw / lw
+        # size: the mode in the desktop's orientation (a portrait 1080p reads 1080x1920). Without it
+        # the position was the only pair of numbers shown, and a reporter read it as a wrong
+        # resolution (GitHub Neutron#20).
         res.append({"output": o.get("name"), "pos": tuple(o.get("pos", (0, 0))),
-                    "scale": round(sc * 120) / 120})
+                    "size": (mw, mh), "scale": round(sc * 120) / 120})
     return res
 
 
@@ -7366,8 +7369,8 @@ def cmd_display(args):
             print("launches use %s%% (%d dpi): set in Collider's Preferences" %
                   (round(setting * 100, 2), round(96 * setting)))
         for o in out["outputs"]:
-            print("  output %-12s %s%%  at %s" % (o["output"], round(o["scale"] * 100, 2),
-                                                 o["pos"]))
+            print("  output %-12s %-10s %s%%  at %s" % (o["output"], "%dx%d" % tuple(o["size"]),
+                                                       round(o["scale"] * 100, 2), o["pos"]))
         if out["warning"]:
             print("⚠️  " + out["warning"])
     return EX_OK if info else EX_FAIL
