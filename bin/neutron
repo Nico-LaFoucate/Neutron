@@ -5410,6 +5410,67 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-122, with vkd3d-shared-buffers. Off = CUDA refuses those handles and "
                "Premiere copies frames through host memory, as on 11.10-121.",
     },
+    "dxcore-identity": {
+        "env": "NEUTRON_DXCORE_IDENTITY", "default": True,
+        "what": "DXCore reports the real GPU adapters (vendor, device, memory)",
+        "why": "runtime 11.10-123 (Neutron#18): Photoshop rejected AMD GPUs because DXCore said "
+               "nothing about them. Turn it off if GPU detection in Photoshop or Premiere changes.",
+    },
+    "deact-end-menu": {
+        "env": "NEUTRON_DEACT_ENDMENU", "default": True,
+        "what": "close an open menu when its app loses focus, as Windows does",
+        "why": "runtime 11.10-123: dropdowns stayed open on top of other apps. Turn it off if a "
+               "menu closes while you are still using its app.",
+    },
+    "mount-notify-mounted": {
+        "env": "NEUTRON_MOUNT_NOTIFY_MOUNTED", "default": True,
+        "what": "announce a memory card or USB stick once it is mounted, not when it is inserted",
+        "why": "runtime 11.10-123 (Neutron#15): Lightroom Classic opened Import on an empty card. "
+               "Read when the prefix's Wine starts, so close every app in the prefix first.",
+    },
+    "mount-removable-type": {
+        "env": "NEUTRON_MOUNT_REMOVABLE_TYPE", "default": True,
+        "what": "report card readers and USB sticks as removable drives",
+        "why": "runtime 11.10-123 (Neutron#15): Import listed a card under Files, not Devices. "
+               "Turn it off if a USB drive is suddenly treated as removable.",
+    },
+    "follow-output": {
+        "env": "NEUTRON_FOLLOW_OUTPUT", "default": True,
+        "what": "move a maximized window onto the monitor KDE/GNOME actually shows it on",
+        "why": "runtime 11.10-123 (Neutron#20): a window maximized for the wrong monitor kept that "
+               "monitor's size. Turn it off if maximized windows jump between monitors.",
+    },
+    "max-crop": {
+        "env": "NEUTRON_MAX_CROP", "default": True,
+        "what": "don't draw a maximized window's border on the neighboring monitor",
+        "why": "runtime 11.10-124: a few-pixel sliver of a maximized app showed on the next "
+               "monitor. Turn it off if a maximized window's edge or its menus look shifted.",
+    },
+    "kde-primary": {
+        "env": "NEUTRON_KDE_PRIMARY", "default": True,
+        "what": "Wine's main monitor is the one KDE's display settings call primary",
+        "why": "runtime 11.10-124: Wine used the top-left monitor. Wine builds the monitor list "
+               "once per session, so close every app in the prefix before changing it.",
+    },
+    "monitor-raw-lookup": {
+        "env": "NEUTRON_MONITOR_RAW_LOOKUP", "default": True,
+        "what": "find the monitor under a point in physical pixels on mixed-DPI desktops",
+        "why": "runtime 11.10-124: with monitors at different scales Wine named the wrong monitor, "
+               "so a maximized window stayed on the wrong one. Turn it off if apps open or "
+               "maximize on the wrong monitor.",
+    },
+    "follow-scale": {
+        "env": "NEUTRON_FOLLOW_SCALE", "default": True,
+        "what": "size a window moved to another monitor at that monitor's scale",
+        "why": "runtime 11.10-124, with follow-output: a window moved to a monitor of another "
+               "scale came out too big or too small.",
+    },
+    "workarea-per-output": {
+        "env": "NEUTRON_WORKAREA_PER_OUTPUT", "default": True,
+        "what": "remember the usable height (minus panels) of each monitor separately",
+        "why": "runtime 11.10-124: one remembered height for every monitor left maximized windows "
+               "short on a monitor without a panel. Off = the single value of earlier runtimes.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
