@@ -200,6 +200,40 @@ def nvidia_render_offload(gpus, boot_vendor):
     boot_vga anywhere, a hybrid machine is assumed to be a laptop."""
     return nvidia_hybrid(gpus) and boot_vendor != NVIDIA_PCI_VENDOR
 
+
+NVIDIA_PROC_GPUS = "/proc/driver/nvidia/gpus"   # one entry per GPU NVIDIA's own driver has bound
+
+
+def nvidia_gpu_expected(gpus):
+    """False only when the kernel lists GPUs, none is NVIDIA's, and NVIDIA's driver reports no GPU either
+    (it has one with no DRM node when nvidia-drm is not loaded). Gates the NVIDIA-API launch settings
+    (DXVK_ENABLE_NVAPI=1 and the nvapi64 DLL override) -- see _apply_app_env. An empty list means the
+    GPUs could not be read, not that there are none, so it keeps the settings NVIDIA was tested with."""
+    if not gpus or any(v == NVIDIA_PCI_VENDOR for v, _ in gpus):
+        return True
+    try:
+        return bool(os.listdir(NVIDIA_PROC_GPUS))
+    except OSError:
+        return False
+
+
+# DLL overrides that exist only for NVIDIA's API (dxvk-nvapi); a profile's copy is dropped when
+# nvidia_gpu_expected() is False.
+NVIDIA_ONLY_DLL_OVERRIDES = ("nvapi64",)
+
+
+def _drop_dll_overrides(spec, dlls):
+    """A WINEDLLOVERRIDES string without the named DLLs: "a=n,b;nvapi64=n;c=b" -> "a=n,b;c=b"."""
+    out = []
+    for entry in spec.split(";"):
+        if not entry.strip():
+            continue
+        names, sep, mode = entry.partition("=")
+        keep = [n for n in names.split(",") if n.strip().lower() not in dlls]
+        if keep:
+            out.append(",".join(keep) + sep + mode)
+    return ";".join(out)
+
 # --- DLLs staged into every prefix ---------------------------------------------------------
 # Two sources, nothing else:
 #   * our open-source builds (DXVK, vkd3d-proton, dxvk-nvapi, the NVIDIA wrappers, the ucrtbase
@@ -472,7 +506,8 @@ PROVISION_DXVK_CONF = (
 # plus the Neutron suite display fixes (dxcore/nvapi/dcomp native overrides).
 #   - dxvk_conf: relative to the prefix. Premiere uses its own dxvk.conf beside the
 #     exe; the rest use the shared neutron-apps-dxvk.conf (Adobe panel render fix).
-#   - nvapi: export DXVK_ENABLE_NVAPI=1 (real-NVIDIA reporting).
+#   - nvapi: export DXVK_ENABLE_NVAPI=1 (real-NVIDIA reporting). This and an nvapi64 entry in
+#     overrides apply only when an NVIDIA GPU is present (_apply_app_env, nvidia_gpu_expected).
 #   - env: extra environment (e.g. Photoshop's GPU-present BTW gate).
 #   - accent: brand tint for the Collider app widget.
 #   - export: produces video output (native HW-export muxing).
@@ -612,14 +647,15 @@ def _read_env_conf(prefix):
     return out
 
 
-def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None):
+def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None, gpus=None):
     """Put one app's launch settings into `env`. THE one place they are computed: `neutron launch` calls
     it for the app it starts, and `write_appenv_conf` for every installed app, so an app started BY
     ANOTHER APP (Dynamic Link, Edit in Photoshop) gets exactly what launching it directly gives it.
 
     `protected` names the keys the caller set itself (its own environment, --with/--without): the
     per-prefix neutron-env.conf does not override those, and the profile only fills in what is still
-    unset. Returns the neutron-env.conf entries applied, for the launch log.
+    unset. `gpus` is drm_gpus() (read here when not given). Returns the neutron-env.conf entries
+    applied, for the launch log.
     """
     # NEUTRON_APP tells Neutron's Wine which app's settings this environment already carries, so
     # neutron-appenv.conf leaves a directly launched app alone (see write_appenv_conf).
@@ -663,7 +699,18 @@ def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None)
             env[k] = v
             applied[k] = v
     env["DXVK_CONFIG_FILE"] = dxvk_conf
-    if profile["overrides"]:                     # empty => leave unset (match the proven minimal launch)
+    # NVIDIA's API only where Windows has it (GitHub Neutron#18). DXVK_ENABLE_NVAPI=1 and nvapi64=n
+    # exist for an NVIDIA GPU: DXVK reports a fake AMD card in its place unless NVAPI is on (or the
+    # app's dxvk conf says hideNvidiaGpu = False), and nvapi64 is dxvk-nvapi. Windows on a machine
+    # with only AMD or Intel GPUs has no nvapi64.dll, so both are left out there. They were inert
+    # there anyway: DXVK hides only NVIDIA adapters, the prefix registry already loads nvapi64
+    # native, and dxvk-nvapi's NvAPI_Initialize finds no NVIDIA adapter. Any NVIDIA GPU, or GPUs that
+    # could not be read, keeps both exactly as before.
+    nvidia = nvidia_gpu_expected(drm_gpus() if gpus is None else gpus)
+    overrides = profile["overrides"]
+    if not nvidia:
+        overrides = _drop_dll_overrides(overrides, NVIDIA_ONLY_DLL_OVERRIDES)
+    if overrides:                                # empty => leave unset (match the proven minimal launch)
         # MERGE, never assign. This used to be a bare assignment, which silently discarded any
         # WINEDLLOVERRIDES the caller set or that neutron-env.conf had just applied -- and
         # `neutron gates` advertises neutron-env.conf as reaching EVERY launch surface, so the
@@ -671,8 +718,8 @@ def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None)
         # 2026-09-08 and had to go around us via the registry. The profile's own overrides come
         # LAST so they still win a same-DLL conflict; anything naming a different DLL survives.
         _pre = env.get("WINEDLLOVERRIDES", "").strip(";")
-        env["WINEDLLOVERRIDES"] = (_pre + ";" + profile["overrides"]) if _pre else profile["overrides"]
-    if profile.get("nvapi"):
+        env["WINEDLLOVERRIDES"] = (_pre + ";" + overrides) if _pre else overrides
+    if profile.get("nvapi") and nvidia:
         env["DXVK_ENABLE_NVAPI"] = "1"
     # setdefault, NOT assignment: an explicitly pre-set NEUTRON_* in the caller's environment
     # must WIN, or no gate can ever be turned off from outside. Two independent failures of the
@@ -724,13 +771,15 @@ def write_appenv_conf(prefix):
     Rewritten on every launch, atomically. Never blocks a launch."""
     sections = []
     drive_c = os.path.join(prefix, "drive_c")
+    gpus = drm_gpus()                            # once: every section sees the same machine
     for app, profile in APP_PROFILES.items():
         for exe in _app_exe_variants(prefix, profile["exe"]):
             rel = os.path.relpath(exe, drive_c)
             if rel.startswith(".."):
                 continue
             e = {}
-            _apply_app_env(e, app, profile, prefix, _dxvk_conf_for_exe(prefix, profile, exe), exe=exe)
+            _apply_app_env(e, app, profile, prefix, _dxvk_conf_for_exe(prefix, profile, exe), exe=exe,
+                           gpus=gpus)
             sections.append(("C:\\" + rel.replace("/", "\\"), e))
     managed = sorted(set().union(*(e for _, e in sections))) if sections else []
     out = ["# Written by `neutron launch` on every launch -- edits here are overwritten.",
@@ -6158,11 +6207,14 @@ def cmd_launch(args):
                           "    wine    : %s\n"
                           "    display : %s\n"
                           "    gpus    : %s\n"
+                          "    nvapi   : DXVK_ENABLE_NVAPI=%s  WINEDLLOVERRIDES=%s\n"
                           "    gates   : %s\n"
                           "=== everything below this line is the application's own output\n\n"
                           % (_rtname, time.strftime("%Y-%m-%d %H:%M:%S"),
                              args.app, profile["name"], exe, prefix,
-                             _prefix_stamp(prefix), wine, display_mode, _gpus, _gates)
+                             _prefix_stamp(prefix), wine, display_mode, _gpus,
+                             env.get("DXVK_ENABLE_NVAPI", "(unset)"),
+                             env.get("WINEDLLOVERRIDES", "(unset)"), _gates)
                           ).encode("utf-8", "replace"))
             log_fh.flush()
         except OSError as e:

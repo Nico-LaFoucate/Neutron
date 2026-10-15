@@ -78,8 +78,13 @@ class AppEnvConf(unittest.TestCase):
             open(p, "w").close()
         with open(os.path.join(self.prefix, "neutron-env.conf"), "w") as f:
             f.write("# per-prefix gate\nNEUTRON_TEST_PREFIXWIDE=7\nWINEDLLOVERRIDES=foo=d\n")
+        # The NVIDIA-API settings depend on the machine's GPUs; pin an NVIDIA one so these tests give the
+        # same answer anywhere (the vendor gate itself is tests/test_nvapi_vendor_gate.py).
+        self._drm_gpus = cli.drm_gpus
+        cli.drm_gpus = lambda *a, **k: [("0x10de", "nvidia")]
 
     def tearDown(self):
+        cli.drm_gpus = self._drm_gpus
         self.tmp.cleanup()
 
     def own_env(self, app, exe_rel):
