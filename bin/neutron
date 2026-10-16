@@ -148,7 +148,7 @@ NEUTRON_WINE_CANDIDATES = [
 ]
 NO_RUNTIME_MSG = "neutron-wine isn't installed. Run `neutron setup` first."
 
-# GPU-vendor ICD selection (NVIDIA default; TODO: generalize per detected GPU).
+# NVIDIA's EGL vendor file: forced on a launch only when an NVIDIA GPU is in use (_apply_gl_vendor_env).
 NVIDIA_EGL_ICD = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
 NVIDIA_PCI_VENDOR = "0x10de"
 
@@ -207,14 +207,42 @@ NVIDIA_PROC_GPUS = "/proc/driver/nvidia/gpus"   # one entry per GPU NVIDIA's own
 def nvidia_gpu_expected(gpus):
     """False only when the kernel lists GPUs, none is NVIDIA's, and NVIDIA's driver reports no GPU either
     (it has one with no DRM node when nvidia-drm is not loaded). Gates the NVIDIA-API launch settings
-    (DXVK_ENABLE_NVAPI=1 and the nvapi64 DLL override) -- see _apply_app_env. An empty list means the
-    GPUs could not be read, not that there are none, so it keeps the settings NVIDIA was tested with."""
+    (DXVK_ENABLE_NVAPI=1 and the nvapi64 DLL override, see _apply_app_env) and NVIDIA's EGL/GLX vendor
+    (_apply_gl_vendor_env). An empty list means the GPUs could not be read, not that there are none,
+    so it keeps the settings NVIDIA was tested with."""
     if not gpus or any(v == NVIDIA_PCI_VENDOR for v, _ in gpus):
         return True
     try:
         return bool(os.listdir(NVIDIA_PROC_GPUS))
     except OSError:
         return False
+
+
+def _apply_gl_vendor_env(env, gpus):
+    """NVIDIA's EGL and GLX vendor for a launch, plus PRIME render offload on a hybrid laptop. `gpus` is
+    drm_gpus(). Returns True when NVIDIA's vendor was requested.
+
+    Only when NVIDIA's EGL vendor file is installed AND an NVIDIA GPU is in use (nvidia_gpu_expected).
+    Until 2026-10-15 the file alone decided, so a machine with only AMD or Intel GPUs that still had
+    NVIDIA's userspace installed (a GPU swap, or nvidia-utils pulled in by another package) was handed
+    NVIDIA's EGL in place of Mesa's: no EGL display, so no OpenGL in Wine, and with it no OpenGL display
+    for After Effects, Media Encoder and Premiere 2025 (AMD support audit, X5). Any NVIDIA GPU, or GPUs
+    that could not be read, keeps exactly the environment NVIDIA was tested with."""
+    if not (os.path.isfile(NVIDIA_EGL_ICD) and nvidia_gpu_expected(gpus)):
+        return False
+    env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", NVIDIA_EGL_ICD)
+    env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+    # GitHub Neutron#12: on a laptop the desktop usually runs on the Intel/AMD iGPU, and NVIDIA's
+    # EGL then renders for it only in PRIME render offload. Without __NV_PRIME_RENDER_OFFLOAD=1
+    # Wine's EGL got no configs at all ("Failed to get any configs from eglChooseConfig"), so no
+    # OpenGL context, and Premiere's CUDA renderer never delivered a frame: black Program
+    # Monitor, Export never opened. Only hybrid machines whose desktop runs on the other GPU get
+    # it (nvidia_render_offload); NVIDIA-only machines, and desktops that boot on NVIDIA with an
+    # iGPU also enabled, keep the environment they were tested with (it was harmless on
+    # NVIDIA-only too, 2026-10-13).
+    if nvidia_render_offload(gpus, boot_gpu_vendor()):
+        env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+    return True
 
 
 # DLL overrides that exist only for NVIDIA's API (dxvk-nvapi); a profile's copy is dropped when
@@ -6020,21 +6048,9 @@ def cmd_launch(args):
     if "--dns-result-order" not in _node_opts:
         env["NODE_OPTIONS"] = (_node_opts + " --dns-result-order=ipv4first").strip()
 
-    # GPU-vendor ICD (NVIDIA default; TODO: generalize per detected GPU).
+    # GPU-vendor EGL/GLX: NVIDIA's when an NVIDIA GPU is in use, else the system's (Mesa).
     gpus = drm_gpus()
-    if os.path.isfile(NVIDIA_EGL_ICD):
-        env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", NVIDIA_EGL_ICD)
-        env.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
-        # GitHub Neutron#12: on a laptop the desktop usually runs on the Intel/AMD iGPU, and NVIDIA's
-        # EGL then renders for it only in PRIME render offload. Without __NV_PRIME_RENDER_OFFLOAD=1
-        # Wine's EGL got no configs at all ("Failed to get any configs from eglChooseConfig"), so no
-        # OpenGL context, and Premiere's CUDA renderer never delivered a frame: black Program
-        # Monitor, Export never opened. Only hybrid machines whose desktop runs on the other GPU get
-        # it (nvidia_render_offload); NVIDIA-only machines, and desktops that boot on NVIDIA with an
-        # iGPU also enabled, keep the environment they were tested with (it was harmless on
-        # NVIDIA-only too, 2026-10-13).
-        if nvidia_render_offload(gpus, boot_gpu_vendor()):
-            env.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+    _apply_gl_vendor_env(env, gpus)
 
     # --- Display path: Wayland-native (crisp UI + native-smooth playback) vs
     #     X11 (software frame pacer). Selected per session; merged here so there
@@ -6208,13 +6224,16 @@ def cmd_launch(args):
                           "    display : %s\n"
                           "    gpus    : %s\n"
                           "    nvapi   : DXVK_ENABLE_NVAPI=%s  WINEDLLOVERRIDES=%s\n"
+                          "    egl     : __EGL_VENDOR_LIBRARY_FILENAMES=%s\n"
                           "    gates   : %s\n"
                           "=== everything below this line is the application's own output\n\n"
                           % (_rtname, time.strftime("%Y-%m-%d %H:%M:%S"),
                              args.app, profile["name"], exe, prefix,
                              _prefix_stamp(prefix), wine, display_mode, _gpus,
                              env.get("DXVK_ENABLE_NVAPI", "(unset)"),
-                             env.get("WINEDLLOVERRIDES", "(unset)"), _gates)
+                             env.get("WINEDLLOVERRIDES", "(unset)"),
+                             env.get("__EGL_VENDOR_LIBRARY_FILENAMES", "(unset: system default)"),
+                             _gates)
                           ).encode("utf-8", "replace"))
             log_fh.flush()
         except OSError as e:
