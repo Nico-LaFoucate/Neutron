@@ -7320,6 +7320,465 @@ NTSYNC_DETAIL = {
 }
 
 
+# --- doctor: GPU checks (AMD support audit X3, 2026-10-15) ----------------------------------------
+# What each GPU needs for the Adobe apps. Every finding is at most a WARNING: the apps still start
+# without any of it, and a check that misreads an unusual setup must never turn a working machine red.
+# Everything is read from the filesystem (sysfs, ICD files, library directories); nothing is loaded
+# or run. `root` exists so the tests can point all of it at a fake tree.
+AMD_PCI_VENDOR = "0x1002"
+INTEL_PCI_VENDOR = "0x8086"
+GPU_VENDOR_NAMES = {NVIDIA_PCI_VENDOR: "NVIDIA", AMD_PCI_VENDOR: "AMD", INTEL_PCI_VENDOR: "Intel"}
+
+# Vulkan drivers, recognized by the library their ICD file names: (basename prefix, PCI vendor, name).
+# Order matters: hasvk before the general Intel prefix.
+VULKAN_ICD_DRIVERS = (
+    ("libvulkan_radeon", AMD_PCI_VENDOR, "RADV"),
+    ("amdvlk", AMD_PCI_VENDOR, "AMDVLK"),
+    ("libvulkan_intel_hasvk", INTEL_PCI_VENDOR, "Intel hasvk"),
+    ("libvulkan_intel", INTEL_PCI_VENDOR, "Intel ANV"),
+    ("libGLX_nvidia", NVIDIA_PCI_VENDOR, "NVIDIA"),
+    ("libEGL_nvidia", NVIDIA_PCI_VENDOR, "NVIDIA"),
+    ("libvulkan_nouveau", NVIDIA_PCI_VENDOR, "NVK"),
+)
+# The Vulkan loader's system search path on Linux (user directories are added from the environment).
+VULKAN_ICD_DIRS = ("etc/xdg/vulkan/icd.d", "etc/vulkan/icd.d", "usr/local/etc/vulkan/icd.d",
+                   "usr/local/share/vulkan/icd.d", "usr/share/vulkan/icd.d")
+VULKAN_DRIVER_HINT = {
+    AMD_PCI_VENDOR: "vulkan-radeon (Arch), mesa-vulkan-drivers (Fedora, Debian, Ubuntu), "
+                    "libvulkan_radeon (openSUSE)",
+    INTEL_PCI_VENDOR: "vulkan-intel (Arch), mesa-vulkan-drivers (Fedora, Debian, Ubuntu), "
+                      "libvulkan_intel (openSUSE)",
+    NVIDIA_PCI_VENDOR: "NVIDIA's driver package (nvidia-utils on Arch)",
+}
+VULKAN_LOADER_HINT = "vulkan-icd-loader (Arch), vulkan-loader (Fedora), libvulkan1 (Debian, Ubuntu, openSUSE)"
+OPENCL_VENDORS_DIR = "etc/OpenCL/vendors"
+OPENCL_LOADER_HINT = "ocl-icd (Arch, Fedora), ocl-icd-libopencl1 (Debian, Ubuntu), libOpenCL1 (openSUSE)"
+ROCM_OPENCL_HINT = ("rocm-opencl-runtime (Arch, CachyOS), rocm-opencl (Fedora, openSUSE Tumbleweed), "
+                    "rocm-opencl-icd (Ubuntu 25.10+, Debian 13+)")
+# 64-bit library directories the dynamic linker searches, plus whatever /etc/ld.so.conf adds (ROCm
+# puts libamdocl64.so in /opt/rocm/lib and adds that directory there).
+LIB_DIRS = ("usr/lib64", "usr/lib/x86_64-linux-gnu", "usr/lib", "lib64", "lib/x86_64-linux-gnu", "lib",
+            "usr/local/lib64", "usr/local/lib")
+PCI_IDS_FILES = ("usr/share/hwdata/pci.ids", "usr/share/misc/pci.ids", "usr/share/pci.ids")
+
+# Premiere, After Effects and Media Encoder render on an AMD GPU only through AMD's own OpenCL, ROCm:
+# GPUSniffer accepts the platform vendor "Advanced Micro Devices" and refuses Mesa's Rusticl by name
+# (GitHub Neutron#18). Which GPUs ROCm runs on, by shader ISA (the kernel's KFD gfx target):
+#   * on AMD's ROCm 10.1.0 Linux list (Radeon, Radeon PRO, Ryzen APUs;
+#     https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html):
+ROCM_SUPPORTED_GFX = frozenset({"gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150",
+                                "gfx1151", "gfx1152", "gfx1153", "gfx1200", "gfx1201"})
+#   * the other RDNA2 chips (gfx1031-gfx1037: RX 6700/6600/6500 class, RDNA2 APUs) are not on it. ROCm
+#     runs them as gfx1030 with HSA_OVERRIDE_GFX_VERSION=10.3.0, which is how the one proven AMD setup
+#     runs (RX 6750 XT, gfx1031, CachyOS; Discussion #4). Nobody has run Neutron on one without it.
+ROCM_RDNA2_OVERRIDE = "10.3.0"
+#   * RX 5000 (gfx101x), Vega and Polaris (gfx9xx, gfx8xx) and older: no ROCm, so those three apps
+#     render on the CPU, where Windows would use the GPU. Instinct targets (gfx908, gfx90a, gfx94x,
+#     gfx95x) are left as unknown; doctor makes no claim about them.
+HSA_OVERRIDE_VAR = "HSA_OVERRIDE_GFX_VERSION"
+
+
+def _gfx_name(ver):
+    """KFD's gfx_target_version (major*10000 + minor*100 + stepping) as an ISA name: 100301 -> gfx1031,
+    90010 -> gfx90a."""
+    return "gfx%d%d%x" % (ver // 10000, (ver // 100) % 100, ver % 100)
+
+
+def rocm_gfx_support(gfx_version):
+    """What ROCm does with a GPU, from KFD's gfx_target_version: "supported" (on AMD's list),
+    "override" (an RDNA2 chip ROCm runs as gfx1030 with HSA_OVERRIDE_GFX_VERSION=10.3.0), "none" (no
+    ROCm: RX 5000, Vega, Polaris and older) or "unknown"."""
+    if not gfx_version:
+        return "unknown"
+    major, minor, step = gfx_version // 10000, (gfx_version // 100) % 100, gfx_version % 100
+    if _gfx_name(gfx_version) in ROCM_SUPPORTED_GFX:
+        return "supported"
+    if (major, minor) == (10, 3):
+        return "override"
+    if major <= 8 or (major, minor) == (10, 1):
+        return "none"
+    if major == 9 and not ((minor, step) in ((0, 8), (0, 10)) or minor in (4, 5)):
+        return "none"
+    return "unknown"
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _pci_slot_location(slot):
+    """'0000:03:00.0' -> (domain, location_id) as KFD writes them (location_id = bus << 8 | devfn)."""
+    m = re.fullmatch(r"([0-9a-fA-F]+):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])", slot or "")
+    if not m:
+        return None
+    dom, bus, dev, fn = (int(x, 16) for x in m.groups())
+    return dom, (bus << 8) | (dev << 3) | fn
+
+
+def _kfd_gpu_nodes(root="/"):
+    """The kernel's compute (KFD) GPU nodes: [{"gfx_version", "vendor_id", "location"}]. Readable by any
+    user, and present whenever amdgpu runs with compute enabled, ROCm installed or not."""
+    nodes = []
+    for p in sorted(glob.glob(os.path.join(root, "sys/class/kfd/kfd/topology/nodes/*/properties"))):
+        props = {}
+        for ln in (_read_text(p) or "").splitlines():
+            k, _, v = ln.strip().partition(" ")
+            props[k] = v.strip()
+        try:
+            ver = int(props.get("gfx_target_version", "0"))
+            vendor = int(props.get("vendor_id", "0"))
+            loc = (int(props.get("domain", "0")), int(props.get("location_id", "-1")))
+        except ValueError:
+            continue
+        if ver > 0:                              # CPU nodes have none
+            nodes.append({"gfx_version": ver, "vendor_id": "0x%04x" % vendor, "location": loc})
+    return nodes
+
+
+def _pci_device_name(vendor_id, device_id, root="/"):
+    """The device's name from the system's pci.ids ('Navi 22 [Radeon RX 6700/6700 XT/6750 XT ...]' ->
+    the bracketed part), or None."""
+    v, d = (vendor_id or "")[2:].lower(), (device_id or "")[2:].lower()
+    if not v or not d:
+        return None
+    for rel in PCI_IDS_FILES:
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as f:
+                in_vendor = False
+                for ln in f:
+                    if ln.startswith("#") or not ln.strip():
+                        continue
+                    if not ln.startswith("\t"):
+                        if in_vendor:
+                            return None
+                        in_vendor = ln[:4].lower() == v
+                    elif in_vendor and not ln.startswith("\t\t") and ln[1:5].lower() == d:
+                        name = ln[5:].strip()
+                        m = re.search(r"\[(.+)\]\s*$", name)
+                        return m.group(1) if m else name
+        except OSError:
+            continue
+    return None
+
+
+def host_gpus(root="/"):
+    """Every GPU the kernel exposes, for doctor: [{"pci", "vendor_id", "device_id", "vendor", "name",
+    "driver", "gfx", "gfx_version"}]. `gfx` (AMD only) is the shader ISA from the kernel's KFD topology,
+    None when the kernel has no compute node for the card. A GPU NVIDIA's driver has bound with no DRM
+    node (nvidia-drm not loaded) is listed from /proc/driver/nvidia/gpus."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(root, "sys/class/drm/card[0-9]*"))):
+        if "-" in os.path.basename(d):
+            continue
+        dev = os.path.join(d, "device")
+        vendor = (_read_text(os.path.join(dev, "vendor")) or "").lower()
+        if not vendor:
+            continue                             # simpledrm and friends: no PCI device
+        drv = os.path.join(dev, "driver")
+        device_id = (_read_text(os.path.join(dev, "device")) or "").lower() or None
+        out.append({"pci": os.path.basename(os.path.realpath(dev)), "vendor_id": vendor,
+                    "device_id": device_id, "vendor": GPU_VENDOR_NAMES.get(vendor, vendor),
+                    "name": _pci_device_name(vendor, device_id, root),
+                    "driver": os.path.basename(os.path.realpath(drv)) if os.path.exists(drv) else None,
+                    "gfx": None, "gfx_version": None})
+    # AMD cards get their gfx target from the KFD node at the same PCI address (with one AMD card and
+    # one AMD node, from that node whatever its address says).
+    amd = [g for g in out if g["vendor_id"] == AMD_PCI_VENDOR]
+    nodes = [n for n in _kfd_gpu_nodes(root) if n["vendor_id"] == AMD_PCI_VENDOR]
+    for g in amd:
+        loc = _pci_slot_location(g["pci"])
+        node = next((n for n in nodes if loc and n["location"] == loc), None)
+        if node is None and len(amd) == 1 and len(nodes) == 1:
+            node = nodes[0]
+        if node:
+            g["gfx_version"] = node["gfx_version"]
+            g["gfx"] = _gfx_name(node["gfx_version"])
+    try:
+        nv_proc = sorted(os.listdir(os.path.join(root, NVIDIA_PROC_GPUS.lstrip("/"))))
+    except OSError:
+        nv_proc = []
+    for slot in nv_proc:
+        if not any(g["pci"].lower() == slot.lower() for g in out):
+            out.append({"pci": slot, "vendor_id": NVIDIA_PCI_VENDOR, "device_id": None, "vendor": "NVIDIA",
+                        "name": None, "driver": "nvidia", "gfx": None, "gfx_version": None})
+    return out
+
+
+def _ld_so_conf_dirs(root="/"):
+    """Library directories /etc/ld.so.conf adds (following `include` globs)."""
+    out, seen = [], set()
+
+    def read(path):
+        if path in seen:
+            return
+        seen.add(path)
+        for ln in (_read_text(path) or "").splitlines():
+            ln = ln.split("#", 1)[0].strip()
+            if ln.startswith("include "):
+                for p in sorted(glob.glob(os.path.join(root, ln[8:].strip().lstrip("/")))):
+                    read(p)
+            elif ln.startswith("/"):
+                out.append(ln.lstrip("/"))
+    read(os.path.join(root, "etc/ld.so.conf"))
+    return out
+
+
+def _is_elf64(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(5)
+    except OSError:
+        return False
+    return head[:4] == b"\x7fELF" and head[4:5] == b"\x02"
+
+
+def find_shared_lib(name, root="/"):
+    """Where the dynamic linker would find a 64-bit library: `name` itself when it is a path, else the
+    first 64-bit match in the standard and ld.so.conf directories. None when there is none (a 32-bit
+    copy in Fedora's /usr/lib does not count)."""
+    if "/" in name:
+        p = os.path.join(root, name.lstrip("/"))
+        return p if _is_elf64(p) else None
+    for d in list(LIB_DIRS) + _ld_so_conf_dirs(root):
+        p = os.path.join(root, d, name)
+        if _is_elf64(p):
+            return p
+    return None
+
+
+def vulkan_drivers(root="/", env=None):
+    """{pci_vendor: [driver names]} for every Vulkan driver the loader can find whose library exists.
+    VK_DRIVER_FILES / VK_ICD_FILENAMES replace the search, VK_ADD_DRIVER_FILES adds to it, as in the
+    Vulkan loader."""
+    env = os.environ if env is None else env
+    explicit = env.get("VK_DRIVER_FILES") or env.get("VK_ICD_FILENAMES")
+    if explicit:
+        paths = explicit.split(":")
+    else:
+        home = env.get("HOME", "")
+        dirs = [os.path.join(root, d) for d in VULKAN_ICD_DIRS]
+        for var, default in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share")):
+            base = env.get(var) or (os.path.join(home, default) if home else "")
+            if base:
+                dirs.append(os.path.join(base, "vulkan", "icd.d"))
+        for d in (env.get("XDG_DATA_DIRS") or "").split(":"):
+            if d:
+                dirs.append(os.path.join(root, d.lstrip("/"), "vulkan", "icd.d"))
+        paths = dirs
+    paths += [p for p in (env.get("VK_ADD_DRIVER_FILES") or "").split(":") if p]
+    files = []
+    for p in paths:
+        files += sorted(glob.glob(os.path.join(p, "*.json"))) if os.path.isdir(p) else [p]
+    found = {}
+    for fpath in files:
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                lib = (json.load(f).get("ICD") or {}).get("library_path") or ""
+        except (OSError, ValueError, AttributeError):
+            continue
+        if "/" in lib and not lib.startswith("/"):
+            present = _is_elf64(os.path.join(os.path.dirname(fpath), lib))   # relative to the ICD file
+        else:
+            present = bool(find_shared_lib(lib, root)) if lib else False
+        base = os.path.basename(lib)
+        for prefix, vendor, name in VULKAN_ICD_DRIVERS:
+            if base.startswith(prefix):
+                if present and name not in found.setdefault(vendor, []):
+                    found[vendor].append(name)
+                break
+    return found
+
+
+def opencl_icds(root="/"):
+    """Every OpenCL driver registered in /etc/OpenCL/vendors: [{"icd", "library", "path", "kind"}].
+    `path` is where the library was found (None if it is missing); `kind` is "rocm" for AMD's own
+    (libamdocl64.so), "rusticl" or "clover" for Mesa's, else "other"."""
+    out = []
+    for icd in sorted(glob.glob(os.path.join(root, OPENCL_VENDORS_DIR, "*.icd"))):
+        lib = (_read_text(icd) or "").splitlines()
+        lib = lib[0].strip() if lib else ""
+        base = os.path.basename(lib).lower()
+        kind = ("rocm" if base.startswith("libamdocl") else "rusticl" if "rusticl" in base
+                else "clover" if base.startswith("libmesaopencl") else "other")
+        out.append({"icd": icd, "library": lib, "path": find_shared_lib(lib, root) if lib else None,
+                    "kind": kind})
+    return out
+
+
+def _shown(path, root):
+    """A path under `root` as the user would see it on the real system."""
+    r = root.rstrip("/")
+    return path[len(r):] if r and path.startswith(r + "/") else path
+
+
+def _gpu_label(g, gfx=False):
+    """'AMD Radeon RX 6700/6700 XT/6750 XT / 6800M/6850M XT (1002:73df)', with `gfx` '(1002:73df, gfx1031)'."""
+    ids = "%s:%s" % (g["vendor_id"][2:], (g["device_id"] or "0x????")[2:])
+    if gfx and g.get("gfx"):
+        ids += ", " + g["gfx"]
+    return "%s %s(%s)" % (g["vendor"], (g["name"] + " ") if g.get("name") else "", ids)
+
+
+def gpu_checks(gpus, root="/", env=None):
+    """The machine-level GPU checks for `neutron doctor`, as check dicts: `gpu` (each GPU's vendor,
+    kernel driver and Vulkan driver) and, on a machine whose GPUs are AMD's with no NVIDIA one, the
+    OpenCL that Premiere, After Effects and Media Encoder need (`amd-rocm-opencl`, `opencl-loader`).
+    On an NVIDIA machine those apps use CUDA, so the AMD checks do not apply and are left out."""
+    env = os.environ if env is None else env
+    checks = []
+    vk = vulkan_drivers(root, env)
+    loader = find_shared_lib("libvulkan.so.1", root)
+    parts, warn, listed = [], [], []
+    for g in gpus:
+        names = vk.get(g["vendor_id"], [])
+        if g["vendor_id"] == NVIDIA_PCI_VENDOR:   # NVIDIA's driver and NVK each serve only their kernel driver
+            names = [n for n in names if (n == "NVK") == (g["driver"] == "nouveau")]
+        if g["vendor_id"] == AMD_PCI_VENDOR and g["driver"] == "radeon":
+            names = []                           # neither RADV nor AMDVLK runs on the old radeon driver
+        listed.append(dict(g, vulkan=names))
+        parts.append("%s on %s%s, Vulkan: %s" % (
+            _gpu_label(g), g["driver"] or "no kernel driver",
+            (", " + g["gfx"]) if g.get("gfx") else "", ", ".join(names) if names else "none"))
+        if not names:
+            if g["vendor_id"] == AMD_PCI_VENDOR and g["driver"] == "radeon":
+                warn.append("%s runs on the old radeon kernel driver, which has no Vulkan driver, so "
+                            "DirectX apps cannot use it" % _gpu_label(g))
+            elif g["vendor_id"] in VULKAN_DRIVER_HINT:
+                warn.append("no Vulkan driver for the %s GPU: install %s"
+                            % (g["vendor"], VULKAN_DRIVER_HINT[g["vendor_id"]]))
+    if not gpus:
+        warn.append("the kernel lists no GPU in /sys/class/drm")
+    if not loader:
+        warn.append("the Vulkan loader libvulkan.so.1 is missing, so no app can use the GPU: install "
+                    + VULKAN_LOADER_HINT)
+    c = {"name": "gpu", "ok": True, "detail": "; ".join(parts + warn) or "no GPU found",
+         "gpus": listed}
+    if warn:
+        c["warning"] = True
+    checks.append(c)
+
+    amd = [g for g in gpus if g["vendor_id"] == AMD_PCI_VENDOR]
+    if not amd or any(g["vendor_id"] == NVIDIA_PCI_VENDOR for g in gpus):
+        return checks
+
+    # --- AMD's ROCm OpenCL: the only GPU path of Premiere, After Effects and Media Encoder on AMD ---
+    apps = "Premiere, After Effects and Media Encoder"
+    status = {id(g): ("radeon" if g["driver"] == "radeon" else "no-kfd" if not g["gfx_version"]
+                      else rocm_gfx_support(g["gfx_version"])) for g in amd}
+    usable = [g for g in amd if status[id(g)] in ("supported", "override", "unknown")]
+    icds = opencl_icds(root)
+    rocm = [i for i in icds if i["kind"] == "rocm"]
+    rocm_ok = [i for i in rocm if i["path"]]
+
+    def why_not(g):
+        s = status[id(g)]
+        if s == "radeon":
+            return "%s runs on the old radeon kernel driver, which ROCm does not support" % _gpu_label(g)
+        if s == "no-kfd":
+            return ("the kernel offers no ROCm compute device for %s (no KFD node in "
+                    "/sys/class/kfd)" % _gpu_label(g))
+        return "AMD's ROCm does not support %s" % _gpu_label(g, gfx=True)
+
+    if not usable:
+        c = {"name": "amd-rocm-opencl", "ok": True, "warning": True,
+             "detail": "; ".join(why_not(g) for g in amd) +
+                       ", so %s render on the CPU, not on the GPU" % apps}
+    elif not rocm:
+        others = sorted({{"rusticl": "Mesa's Rusticl", "clover": "Mesa's Clover"}.get(i["kind"],
+                         os.path.basename(i["library"]) or os.path.basename(i["icd"])) for i in icds})
+        c = {"name": "amd-rocm-opencl", "ok": True, "warning": True,
+             "detail": "AMD's ROCm OpenCL is not installed, so %s render on the CPU: they accept only "
+                       "AMD's own OpenCL%s. Install %s"
+                       % (apps, (" (found: %s)" % ", ".join(others)) if others else "",
+                          ROCM_OPENCL_HINT)}
+    elif not rocm_ok:
+        c = {"name": "amd-rocm-opencl", "ok": True, "warning": True,
+             "detail": "%s names %s, which is not installed, so %s render on the CPU. Reinstall %s"
+                       % (_shown(rocm[0]["icd"], root), rocm[0]["library"], apps, ROCM_OPENCL_HINT)}
+    else:
+        kfd = os.path.join(root, "dev/kfd")
+        detail = "AMD's ROCm OpenCL: %s (%s)" % (_shown(rocm_ok[0]["icd"], root),
+                                                 _shown(rocm_ok[0]["path"], root))
+        c = {"name": "amd-rocm-opencl", "ok": True, "detail": detail}
+        if os.path.exists(kfd) and not os.access(kfd, os.R_OK | os.W_OK):
+            c["warning"] = True
+            c["detail"] = (detail + " -- but you cannot open /dev/kfd, so it finds no GPU and %s "
+                           "render on the CPU. Add yourself to the render and video groups (sudo "
+                           "usermod -a -G render,video $LOGNAME), then log out and back in" % apps)
+        elif len(usable) < len(amd):
+            c["detail"] = detail + "; " + "; ".join(why_not(g) for g in amd
+                                                    if all(g is not u for u in usable))
+    checks.append(c)
+
+    # --- the OpenCL ICD loader: Neutron's OpenCL.dll links libOpenCL.so.1 and cannot load without it ---
+    ocl = find_shared_lib("libOpenCL.so.1", root)
+    if ocl:
+        checks.append({"name": "opencl-loader", "ok": True, "detail": _shown(ocl, root)})
+    else:
+        checks.append({"name": "opencl-loader", "ok": True, "warning": True,
+                       "detail": "the OpenCL loader libOpenCL.so.1 is missing, so Wine's OpenCL.dll "
+                                 "cannot load and no app gets OpenCL. Install " + OPENCL_LOADER_HINT})
+    return checks
+
+
+def gfx_override_check(gpus, prefix, env=None):
+    """`amd-gfx-override`: HSA_OVERRIDE_GFX_VERSION for this prefix, from the caller's environment
+    (which wins at launch) or <prefix>/neutron-env.conf (which reaches every launch surface). A check
+    dict, or None when it does not apply (no AMD GPU, an NVIDIA GPU present, or nothing to say)."""
+    env = os.environ if env is None else env
+    amd = [g for g in gpus if g["vendor_id"] == AMD_PCI_VENDOR and g["driver"] != "radeon"]
+    if not amd or any(g["vendor_id"] == NVIDIA_PCI_VENDOR for g in gpus):
+        return None
+    conf_path = os.path.join(prefix, "neutron-env.conf")
+    conf_v = (_read_env_conf(prefix).get(HSA_OVERRIDE_VAR) or "").strip() or None
+    env_v = (env.get(HSA_OVERRIDE_VAR) or "").strip() or None
+    value = conf_v or env_v
+    where = (conf_path if conf_v else "this environment") if value else None
+    status = {id(g): rocm_gfx_support(g["gfx_version"]) if g["gfx_version"] else "no-kfd" for g in amd}
+    native = [g for g in amd if status[id(g)] == "supported"]
+    need = [g for g in amd if status[id(g)] == "override"]
+    # the override applies to every GPU ROCm sees: these would be affected too
+    others = [g for g in amd if status[id(g)] in ("none", "unknown")]
+
+    def labels(gs):
+        return ", ".join(_gpu_label(g, gfx=True) for g in gs)
+
+    def warn(detail):
+        return {"name": "amd-gfx-override", "ok": True, "warning": True, "detail": detail}
+
+    if native:
+        if value:
+            return warn("%s=%s (%s) applies to every AMD GPU, and ROCm supports %s as it is: remove it"
+                        % (HSA_OVERRIDE_VAR, value, where, labels(native)))
+        return None
+    if need and others:
+        return warn("%s needs %s=%s for ROCm, but the override would also apply to %s; Neutron has not "
+                    "been tested on this combination%s"
+                    % (labels(need), HSA_OVERRIDE_VAR, ROCM_RDNA2_OVERRIDE, labels(others),
+                       (" (currently %s, from %s)" % (value, where)) if value else ""))
+    if need:
+        line = "%s=%s" % (HSA_OVERRIDE_VAR, ROCM_RDNA2_OVERRIDE)
+        if conf_v == ROCM_RDNA2_OVERRIDE:
+            return {"name": "amd-gfx-override", "ok": True,
+                    "detail": "%s in %s, so ROCm treats %s as gfx1030" % (line, conf_path, labels(need))}
+        if env_v == ROCM_RDNA2_OVERRIDE and not conf_v:
+            return warn("%s is set in this environment only: add that line to %s so launches from the "
+                        "app menu and Collider get it too" % (line, conf_path))
+        if value:
+            return warn("%s=%s (%s) is not the RDNA2 setting: put %s in %s"
+                        % (HSA_OVERRIDE_VAR, value, where, line, conf_path))
+        return warn("%s is not on ROCm's supported list; the tested setup (RX 6750 XT) runs it with %s. "
+                    "Add that line to %s" % (labels(need), line, conf_path))
+    if value and others:
+        return warn("%s=%s (%s) is set, but ROCm does not support %s; Neutron has not been tested with "
+                    "an override on it" % (HSA_OVERRIDE_VAR, value, where, labels(others)))
+    return None
+
+
 def cmd_doctor(args):
     """Health check. Powers Collider's prefix-health status surface.
 
@@ -7366,6 +7825,17 @@ def cmd_doctor(args):
     _nts = ntsync_status()
     check("ntsync", True, NTSYNC_DETAIL[_nts])
     if _nts != "active":
+        checks[-1]["warning"] = True
+
+    # GPUs: each one's vendor, kernel driver and Vulkan driver, and on an AMD machine the OpenCL that
+    # Premiere, After Effects and Media Encoder need. Warnings at most, and a check that trips over an
+    # unusual system reports that instead of taking the rest of doctor down with it.
+    try:
+        _gpus = host_gpus()
+        checks.extend(gpu_checks(_gpus))
+    except Exception as e:
+        _gpus = []
+        check("gpu", True, "could not read the GPUs: %s" % e)
         checks[-1]["warning"] = True
 
     if args.prefix:
@@ -7420,6 +7890,15 @@ def cmd_doctor(args):
                          if os.path.isfile(_resolve_app_exe(prefix, p["exe"]))]
             check("adobe-app", bool(installed),
                   ", ".join(installed) if installed else "no known Adobe app found")
+            # The ROCm override some AMD GPUs need, from this prefix's neutron-env.conf (or the caller's
+            # environment). Only on AMD machines, and only when there is something to say.
+            try:
+                _ovr = gfx_override_check(_gpus, prefix)
+            except Exception as e:
+                _ovr = {"name": "amd-gfx-override", "ok": True, "warning": True,
+                        "detail": "could not check %s: %s" % (HSA_OVERRIDE_VAR, e)}
+            if _ovr:
+                checks.append(_ovr)
             # Adobe's CC-desktop IPC broker -- a PHOTOSHOP prerequisite, not a suite-wide one.
             # Only the `photoshop` profile declares `daemons` (ADOBE_DAEMONS); Premiere, LrC,
             # Animate, AME, AE and Illustrator all launch without the broker running, which is why
