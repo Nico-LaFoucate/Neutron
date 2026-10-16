@@ -4906,11 +4906,97 @@ def install_microsoft(wine, prefix, as_json=True, vc2013=False):
             "downloaded": fetched["fetched"]}
 
 
+# --- What stage_natives put into a prefix -------------------------------------------------------
+# A runtime's natives.json says which DLLs it stages, and the next runtime a prefix moves to may list
+# FEWER: `neutron update` after trying a pre-release goes back to the Latest release, and 11.10-128
+# added amfrt64.dll (AMD hardware encoding) with `amfrt64=native`, which 11.10-127 does not have.
+# Staging used to only add, so the newer runtime's DLL and its override stayed behind.
+# So each staging records in the prefix what Neutron put there: per file the path under
+# drive_c/windows, its sha256 and its overrides. A later staging removes an entry the runtime no
+# longer lists -- the file only while it is still byte-for-byte what we staged (never one the user or
+# an app replaced), and its overrides unless something Neutron writes still wants that key.
+NATIVES_RECORD = "neutron-natives-staged.json"
+# Natives an older CLI staged before the record existed: (path under drive_c/windows, the runtime
+# whose natives.json gives the checksum it staged). Without a record a file is removed only when it
+# matches that checksum exactly, which only that runtime's own build does; when that runtime is no
+# longer installed, the file is left alone.
+NATIVES_UNRECORDED = (("system32/amfrt64.dll", "11.10-128"),)
+
+
+def _natives_entry(e):
+    """A validated record entry {"path", "sha256", "override"}, or None. The path must stay inside
+    drive_c/windows: the record is a file in the prefix, and cleanup deletes what it names."""
+    if not isinstance(e, dict):
+        return None
+    path, sha, ovr = e.get("path"), e.get("sha256"), e.get("override")
+    if (not isinstance(path, str) or not path or path.startswith("/") or "\\" in path
+            or ".." in path.split("/") or not isinstance(sha, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha) or not isinstance(ovr, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in ovr.items())):
+        return None
+    return {"path": path, "sha256": sha, "override": dict(ovr)}
+
+
+def read_natives_record(prefix):
+    """{path: entry} of what Neutron staged into `prefix`, or None when the prefix has no record
+    (provisioned by CLI 1.0.0-beta.13 or older, or never)."""
+    try:
+        with open(os.path.join(prefix, NATIVES_RECORD)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    out = {}
+    for e in (data.get("files") if isinstance(data, dict) else None) or []:
+        e = _natives_entry(e)
+        if e:
+            out[e["path"]] = e
+    return out
+
+
+def _write_natives_record(prefix, runtime, entries):
+    path = os.path.join(prefix, NATIVES_RECORD)
+    data = {"format": 1, "runtime": runtime, "files": [entries[k] for k in sorted(entries)]}
+    try:
+        with open(path + ".part", "w") as f:
+            json.dump(data, f, indent=1)
+            f.write("\n")
+        os.replace(path + ".part", path)
+    except OSError as e:
+        log(f"could not write {path}: {e}")
+
+
+def _unrecorded_natives(skip):
+    """Entries for NATIVES_UNRECORDED whose paths are not in `skip`, with the checksum and overrides
+    from the natives.json of the runtime that staged them, when that runtime is installed."""
+    out = {}
+    for path, ver in NATIVES_UNRECORDED:
+        if path in skip:
+            continue
+        try:
+            with open(os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{ver}", "share", "neutron",
+                                   "natives.json")) as f:
+                rows = json.load(f).get("files", [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        for row in rows:
+            try:
+                if f'{row["prefix_dir"]}/{row["dll"]}.dll' != path:
+                    continue
+                e = _natives_entry({"path": path, "sha256": row["sha256"], "override": row["override"]})
+            except (KeyError, TypeError):
+                continue
+            if e:
+                out[path] = e
+            break
+    return out
+
+
 def stage_natives(wine, prefix):
     """Copy the runtime's own DLLs (DXVK, vkd3d-proton, dxvk-nvapi, the NVIDIA wrappers, the
-    ucrtbase shim) into the prefix and write their overrides, from
+    ucrtbase shim, amfrt64) into the prefix and write their overrides, from
     <runtime>/share/neutron/natives.json. Copies only files whose sha256 differs, so it is cheap
-    to run on every provision and heals a prefix whose DLLs were replaced."""
+    to run on every provision and heals a prefix whose DLLs were replaced. Removes what an earlier
+    runtime staged and this one no longer lists (NATIVES_RECORD)."""
     rt = runtime_root(wine)
     try:
         with open(os.path.join(rt, "share", "neutron", "natives.json")) as f:
@@ -4921,35 +5007,87 @@ def stage_natives(wine, prefix):
                           "share/neutron/natives.json), so the prefix keeps the DLLs it has; "
                           "`neutron update` installs a current runtime"}
     win = os.path.join(prefix, "drive_c", "windows")
+    rows = natives.get("files", [])
+    previous = read_natives_record(prefix) or {}
+    record = {}
     staged, unchanged, waiting, broken = [], 0, [], []
     overrides = dict(PROVISION_DLL_OVERRIDES)
-    for row in natives.get("files", []):
+    for row in rows:
         name = f'{row["prefix_dir"]}/{row["dll"]}.dll'
         req = row.get("requires")
         if req and _sha256_file(os.path.join(win, row["prefix_dir"], req["file"])) != req["sha256"]:
             # The shim without its exact Microsoft UCRT would break everything that links the CRT.
             waiting.append(f'{name} (needs Microsoft\'s {req["file"]})')
+            if name in previous:
+                record[name] = previous[name]     # still listed and left as it is
             continue
         dst = os.path.join(win, row["prefix_dir"], row["dll"] + ".dll")
         if _sha256_file(dst) == row["sha256"]:
             unchanged += 1
         elif _sha256_file(os.path.join(rt, row["file"])) != row["sha256"]:
             broken.append(name)
+            if name in previous:
+                record[name] = previous[name]
             continue
         else:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(os.path.join(rt, row["file"]), dst)
             staged.append(name)
         overrides.update(row["override"])
-    reg_import(wine, prefix, {r"HKEY_CURRENT_USER\Software\Wine\DllOverrides": overrides},
-               tag="neutron-natives")
+        record[name] = {"path": name, "sha256": row["sha256"], "override": dict(row["override"])}
+
+    # What this runtime no longer lists. An override key that anything Neutron writes still wants
+    # (any row of this runtime, staged or not; the provision pins; Microsoft's) is never removed.
+    listed = {f'{r["prefix_dir"]}/{r["dll"]}.dll' for r in rows}
+    wanted = {k.lower() for r in rows for k in r["override"]}
+    wanted |= {k.lower() for k in (*PROVISION_DLL_OVERRIDES, *MS_OVERRIDES, *MS_OVERRIDES_VC2013)}
+    stale = {p: e for p, e in previous.items() if p not in listed}
+    unrecorded = _unrecorded_natives(set(previous) | listed)
+    removed, kept, gone, kept_keys = [], [], [], set()
+    for path in sorted({**unrecorded, **stale}):
+        e = stale.get(path) or unrecorded[path]
+        f = os.path.join(win, path)
+        have = _sha256_file(f)
+        if path not in stale and have != e["sha256"]:
+            continue                              # no record and not that exact build: not ours to touch
+        if have is not None and have != e["sha256"]:
+            # Replaced since we staged it, by the user or an app: theirs now, and so is its override.
+            kept.append(path)
+            kept_keys |= {k.lower() for k in e["override"]}
+            continue
+        if have is not None:
+            try:
+                os.remove(f)
+            except OSError as err:
+                log(f"could not remove {f}: {err}")
+                record[path] = e                  # try again next time
+                kept_keys |= {k.lower() for k in e["override"]}
+                continue
+            removed.append(path)
+        gone.append(e)
+    drop = sorted({k for e in gone for k in e["override"]
+                   if k.lower() not in wanted and k.lower() not in kept_keys}, key=str.lower)
+    reg_ok = reg_import(wine, prefix, {r"HKEY_CURRENT_USER\Software\Wine\DllOverrides":
+                                       {**overrides, **{k: None for k in drop}}},
+                        tag="neutron-natives")
+    if drop and not reg_ok:
+        for e in gone:                            # the overrides are still there: try again next time
+            record.setdefault(e["path"], e)
+    _write_natives_record(prefix, os.path.basename(rt), record)
     step = {"step": "natives", "ok": not waiting and not broken, "staged": staged,
-            "unchanged": unchanged, "overrides": len(overrides)}
+            "unchanged": unchanged, "overrides": len(overrides), "removed": removed,
+            "overrides_removed": drop if reg_ok else []}
+    details = []
     if waiting:
-        step["detail"] = "not staged: " + ", ".join(waiting)
+        details.append("not staged: " + ", ".join(waiting))
     if broken:
-        step["detail"] = (f"{os.path.basename(rt)} is damaged ({', '.join(broken)} does not match "
-                          "its checksum); reinstall it with `neutron update`")
+        details = [f"{os.path.basename(rt)} is damaged ({', '.join(broken)} does not match "
+                   "its checksum); reinstall it with `neutron update`"]
+    if kept:
+        step["kept"] = kept
+        details.append("left in place because it changed after Neutron staged it: " + ", ".join(kept))
+    if details:
+        step["detail"] = "; ".join(details)
     return step
 
 
@@ -8529,7 +8667,7 @@ def cmd_setup(args, updating=False):
 
     out = {"ok": all(s["ok"] for s in steps), "steps": steps, "warnings": warnings}
     if updating:
-        out["prefixes_on_older_runtimes"] = _prefixes_behind()
+        out["prefixes_on_older_runtimes"] = _prefixes_behind(inst.get("neutron_wine"))
     if args.json:
         emit(out, True, streaming=getattr(args, "progress", False))
     else:
@@ -8541,7 +8679,7 @@ def cmd_setup(args, updating=False):
             print("[neutron] " + setup_rerun_hint(updating))
         for p in out.get("prefixes_on_older_runtimes", []):
             print(f"[neutron]   {p['prefix']} still runs neutron-wine {p['runtime']}; move it to "
-                  f"{p['latest']} with: neutron prefix provision {p['prefix']}")
+                  f"{p['latest']} with: {p['command']}")
         if out["ok"] and not updating:
             print("[neutron] Done. Open Neutron Collider from your application menu to install "
                   "the Adobe apps.")
@@ -8586,18 +8724,31 @@ def _reprovision_prefixes(version, as_json):
     return step
 
 
-def _prefixes_behind():
-    """Discovered prefixes whose stamp belongs to an older runtime than the newest installed."""
-    latest = _default_wine_version()
+def _prefixes_behind(version=None):
+    """Discovered prefixes whose stamp is not that of `version`: the runtime `neutron update` just
+    installed and moved the prefixes to (the release GitHub marks Latest, or --runtime-version).
+    Default, or when that runtime is not installed: the CLI's default runtime.
+
+    ⛔ Not simply the newest runtime on disk. After going back from a pre-release (a tester's
+    11.10-128, then plain `neutron update` to the Latest 11.10-127), the pre-release is still
+    installed and newer, and this used to tell the user to move every prefix the update had just
+    moved back onto it again. `command` pins the version whenever a plain `neutron prefix
+    provision` would pick a different runtime (it takes the newest installed)."""
+    latest = version
+    if not latest or not os.path.isfile(os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{latest}",
+                                                     "bin", "wine")):
+        latest = _default_wine_version()
     if not latest:
         return []
     newest = os.path.join(NEUTRON_RUNTIMES_DIR, f"neutron-wine-{latest}", "bin", "wine")
+    installed = _installed_runtime_versions()
+    pin = "" if installed[:1] == [latest] else f"NEUTRON_WINE_VERSION={latest} "
     out = []
     for p in neutron_prefixes():
         mm = stamp_mismatch(p, newest)
         if mm:
             out.append({"prefix": p, "runtime": ", ".join(mm["prefix_runtimes"]) or "older",
-                        "latest": latest})
+                        "latest": latest, "command": f"{pin}neutron prefix provision {p}"})
     return out
 
 
