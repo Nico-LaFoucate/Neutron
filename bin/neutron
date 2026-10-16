@@ -7917,6 +7917,184 @@ def gfx_override_check(gpus, prefix, env=None):
     return None
 
 
+# --- doctor: AMD hardware encoding (amfrt64.dll, neutron-wine 11.10-128 and later) ------------------
+# Our amfrt64.dll answers the AMF calls Premiere, Media Encoder and After Effects make on an AMD GPU and
+# encodes H.264/HEVC through Mesa (Vulkan Video on RADV, or VA-API). When one of those apps loads it, it
+# writes what it found to <prefix>/neutron-amf.json (format 1):
+#   {"format": 1, "time": "<UTC ISO 8601>", "gpu": {"vendor": "0x1002", "device": "0x73df", "name": ...},
+#    "codecs": {"h264": {"available": true, "backend": "vulkan|vaapi|none", "max_width": 4096,
+#                        "max_height": 2304, "tenbit": false, "reason": ""}, "hevc": {...}}}
+# Doctor only reads that file. Without H.264 the apps export with Software Encoding, as on Windows
+# without a hardware encoder: a warning with the fix, never a failure.
+AMF_REPORT = "neutron-amf.json"
+AMF_APPS = ("premiere", "mediaencoder", "aftereffects")
+AMF_BACKENDS = {"vulkan": "Vulkan Video", "vaapi": "VA-API"}
+# Premiere offers Hardware Encoding only while its GPU acceleration is on, which on AMD is ROCm's OpenCL.
+AMF_GPU_ACCEL_CHECKS = ("amd-rocm-opencl", "opencl-loader", "amd-gfx-override")
+# Fedora strips H.264/HEVC from Mesa; RPM Fusion's freeworld builds put them back
+# (https://rpmfusion.org/Howto/Multimedia, "Hardware codecs with AMD (mesa)", read 2026-10-16).
+RPMFUSION_FREE_ENABLE = ("sudo dnf install https://mirrors.rpmfusion.org/free/fedora/"
+                         "rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm")
+RPMFUSION_MESA = ("sudo dnf install mesa-va-drivers-freeworld",
+                  "sudo dnf swap mesa-vulkan-drivers mesa-vulkan-drivers-freeworld")
+
+
+def os_release(root="/"):
+    """/etc/os-release (or /usr/lib/os-release) as a dict, {} when neither is readable."""
+    for rel in ("etc/os-release", "usr/lib/os-release"):
+        text = _read_text(os.path.join(root, rel))
+        if text is not None:
+            out = {}
+            for ln in text.splitlines():
+                k, sep, v = ln.partition("=")
+                if sep and k.strip() and not k.lstrip().startswith("#"):
+                    out[k.strip()] = v.strip().strip('"').strip("'")
+            return out
+    return {}
+
+
+def _distro_family(osr):
+    """'fedora', 'opensuse', 'arch', 'debian' or None, from ID and ID_LIKE."""
+    ids = [osr.get("ID", "").lower()] + osr.get("ID_LIKE", "").lower().split()
+    for fam, names in (("fedora", ("fedora",)), ("opensuse", ("opensuse", "suse")),
+                       ("arch", ("arch",)), ("debian", ("debian", "ubuntu"))):
+        if any(i in names or (fam == "opensuse" and i.startswith("opensuse")) for i in ids):
+            return fam
+    return None
+
+
+def _system_update_command(osr, root="/"):
+    """The command that updates the whole system (and with it Mesa and linux-firmware), or None."""
+    fam = _distro_family(osr)
+    if fam == "fedora":
+        return "rpm-ostree upgrade" if os.path.exists(os.path.join(root, "run/ostree-booted")) \
+            else "sudo dnf upgrade --refresh"
+    if fam == "opensuse":
+        return "sudo zypper update" if "leap" in osr.get("ID", "").lower() else "sudo zypper dup"
+    return {"arch": "sudo pacman -Syu", "debian": "sudo apt update && sudo apt full-upgrade"}.get(fam)
+
+
+def _amf_reason_kind(reason):
+    """What an amfrt64 reason sentence comes down to: 'codecs' (Mesa built without H.264/HEVC),
+    'firmware' (the encoder is hidden: VCN firmware or Mesa too old), 'vulkan-loader',
+    'vulkan-driver', 'update' (a component too old), or None."""
+    r = (reason or "").lower()
+    if re.search(r"without (h\.?264|hevc|h\.?265)|no (h\.?264|hevc|h\.?265) encoder|all_free|patent", r):
+        return "codecs"
+    if "firmware" in r or "does not offer video encoding" in r:
+        return "firmware"
+    if "libvulkan" in r or "vulkan is not installed" in r:
+        return "vulkan-loader"
+    if "too old" in r:
+        return "update"
+    if re.search(r"no vulkan( 1\.3)? driver|no gpu with a working vulkan driver|no amd gpu", r):
+        return "vulkan-driver"
+    return None
+
+
+def _amf_fix(kind, osr, root="/"):
+    """The one fix for a reason kind, as a sentence without its final period, or None."""
+    upd = _system_update_command(osr, root)
+    update = "update your system (%s)" % upd if upd else "update your system"
+    if kind == "codecs":
+        fam = _distro_family(osr)
+        if fam == "fedora" and os.path.exists(os.path.join(root, "run/ostree-booted")):
+            return ("This system's Mesa is built without H.264 and HEVC. On an image-based Fedora, layer "
+                    "RPM Fusion's mesa-va-drivers-freeworld and mesa-vulkan-drivers-freeworld "
+                    "(rpmfusion.org/Howto/Multimedia), then restart the computer")
+        if fam == "fedora":
+            cmds = list(RPMFUSION_MESA)
+            if not glob.glob(os.path.join(root, "etc/yum.repos.d/rpmfusion-free*.repo")):
+                cmds.insert(0, RPMFUSION_FREE_ENABLE)
+            return ("This system's Mesa is built without H.264 and HEVC. Install RPM Fusion's full "
+                    "build: %s, then restart the app" % ", then ".join(cmds))
+        if fam == "opensuse":
+            cmds = ["opi codecs"]
+            if not any(os.path.exists(os.path.join(root, d, "opi")) for d in ("usr/bin", "bin")):
+                cmds.insert(0, "sudo zypper install opi")
+            return ("This system's Mesa is built without H.264 and HEVC. Install Packman's full build: "
+                    "%s, then restart the app" % ", then ".join(cmds))
+        return ("This system's Mesa is built without H.264 and HEVC: install your distribution's Mesa "
+                "build that includes them")
+    if kind == "firmware":
+        return ("The GPU's video encoder needs a newer linux-firmware and Mesa: %s, then restart the "
+                "computer" % update)
+    if kind == "update":
+        return update[0].upper() + update[1:] + ", then restart the app"
+    if kind == "vulkan-loader":
+        return "Install the Vulkan loader: " + VULKAN_LOADER_HINT
+    if kind == "vulkan-driver":
+        return "Install AMD's Vulkan driver: " + VULKAN_DRIVER_HINT[AMD_PCI_VENDOR]
+    return None
+
+
+def amd_hw_encode_check(gpus, prefix, checks=(), root="/"):
+    """`amd-hw-encode`: whether Premiere, Media Encoder and After Effects can encode H.264/HEVC on the
+    AMD GPU, from what amfrt64.dll recorded in <prefix>/neutron-amf.json. `checks` are the doctor checks
+    so far (the GPU-acceleration ones are cited when they warn). A check dict, or None when it does not
+    apply: no AMD GPU, an NVIDIA GPU present (those apps encode with NVENC there), a runtime without
+    amfrt64.dll, or no app that uses it and nothing recorded yet."""
+    amd = [g for g in gpus if g["vendor_id"] == AMD_PCI_VENDOR]
+    if not amd or any(g["vendor_id"] == NVIDIA_PCI_VENDOR for g in gpus):
+        return None
+    if not os.path.isfile(os.path.join(prefix, "drive_c", "windows", "system32", "amfrt64.dll")):
+        return None
+    name = "amd-hw-encode"
+    apps = "Premiere Pro, Media Encoder or After Effects"
+    path = os.path.join(prefix, AMF_REPORT)
+    if not os.path.exists(path):
+        if not any(os.path.isfile(_resolve_app_exe(prefix, APP_PROFILES[a]["exe"])) for a in AMF_APPS):
+            return None
+        return {"name": name, "ok": True, "pending": True,
+                "detail": "pending — start %s once, and it records whether AMD hardware encoding works" % apps}
+    try:
+        with open(path, encoding="utf-8") as f:
+            rep = json.load(f)
+        if not isinstance(rep, dict) or rep.get("format") != 1 or not isinstance(rep.get("codecs"), dict):
+            raise ValueError("not a format-1 report")
+    except (OSError, ValueError) as e:
+        return {"name": name, "ok": True, "warning": True,
+                "detail": "could not read %s (%s): start %s again to write it anew" % (path, e, apps)}
+
+    def codec(key):
+        c = rep["codecs"].get(key)
+        return c if isinstance(c, dict) else {}
+
+    def size(c):
+        w, h = c.get("max_width"), c.get("max_height")
+        return ", up to %sx%s" % (w, h) if isinstance(w, int) and isinstance(h, int) and w and h else ""
+
+    def reason(c):
+        return (c.get("reason") or "no reason given").strip().rstrip(".")
+
+    gpu = rep.get("gpu") if isinstance(rep.get("gpu"), dict) else {}
+    on = (" on " + gpu["name"]) if gpu.get("name") else ""
+    when = ("checked %s UTC; " % str(rep["time"])[:16].replace("T", " ")) if rep.get("time") else ""
+    h264, hevc = codec("h264"), codec("hevc")
+    if h264.get("available") is not True:
+        fix = _amf_fix(_amf_reason_kind(h264.get("reason")), os_release(root), root)
+        return {"name": name, "ok": True, "warning": True,
+                "detail": "no H.264 hardware encoding%s: %s.%s Until then %s export with Software "
+                          "Encoding (%sstart one of them again after the fix to check again)"
+                          % (on, reason(h264), (" %s." % fix) if fix else "",
+                             apps.replace(" or ", " and "), when)}
+    parts = []
+    for label, c in (("H.264", h264), ("HEVC", hevc)):
+        if c.get("available") is True:
+            parts.append("%s (%s, %s%s)" % (label, AMF_BACKENDS.get(c.get("backend"), c.get("backend") or "?"),
+                                            "10-bit" if c.get("tenbit") else "8-bit", size(c)))
+        else:
+            parts.append("%s not available (%s)" % (label, reason(c)))
+    c = {"name": name, "ok": True, "detail": "hardware encoding%s: %s" % (on, ", ".join(parts))}
+    accel = [x["name"] for x in checks if x.get("name") in AMF_GPU_ACCEL_CHECKS and x.get("warning")]
+    if accel:
+        c["warning"] = True
+        c["detail"] += (" -- but Premiere offers Hardware Encoding only while its GPU acceleration is on, "
+                        "and that needs AMD's ROCm OpenCL: fix the %s warning%s first"
+                        % (" and ".join(accel), "s" if len(accel) > 1 else ""))
+    return c
+
+
 def cmd_doctor(args):
     """Health check. Powers Collider's prefix-health status surface.
 
@@ -8037,6 +8215,15 @@ def cmd_doctor(args):
                         "detail": "could not check %s: %s" % (HSA_OVERRIDE_VAR, e)}
             if _ovr:
                 checks.append(_ovr)
+            # AMD hardware encoding, from what amfrt64.dll recorded when Premiere, Media Encoder or
+            # After Effects loaded it. AMD machines with no NVIDIA GPU only.
+            try:
+                _amf = amd_hw_encode_check(_gpus, prefix, checks)
+            except Exception as e:
+                _amf = {"name": "amd-hw-encode", "ok": True, "warning": True,
+                        "detail": "could not check AMD hardware encoding: %s" % e}
+            if _amf:
+                checks.append(_amf)
             # Adobe's CC-desktop IPC broker -- a PHOTOSHOP prerequisite, not a suite-wide one.
             # Only the `photoshop` profile declares `daemons` (ADOBE_DAEMONS); Premiere, LrC,
             # Animate, AME, AE and Illustrator all launch without the broker running, which is why
