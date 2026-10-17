@@ -582,16 +582,19 @@ def _resolve_app_exe(prefix, exe_rel):
     """Resolve a profile's (version-locked) exe subpath to an absolute path,
     version-agnostically. Adobe bumps the folder year each release (…2025 → 2026 …)
     but the per-app fixes are the same, so a profile shouldn't need editing per
-    version. Try the literal path first (fast; keeps a pinned path working);
-    otherwise replace a 4-digit year in the 'Adobe <App> <year>' segment with a
-    glob and return the highest-versioned match that exists. Falls back to the
-    literal path if nothing globs, so callers still get a sensible path to report."""
+    version. Replace the 4-digit year in the 'Adobe <App> <year>' segment with a glob and
+    return the highest year installed; the literal path is only the answer when the profile's
+    path has no year or nothing globs (so callers still get a sensible path to report).
+
+    ⭐ NEWEST YEAR FIRST (2026-10-16, Adobe yearly updates). This used to return the literal
+    path whenever it existed, and the profiles are pinned to the year they were written
+    (Photoshop 2025, Animate 2024): after Mud Hut installed Photoshop 2026 (or 2027) beside an
+    older year, the menu entry and Collider's card kept starting the OLD one. A prefix holding
+    one year per app is unaffected; one holding two years of an app now starts the newer."""
     import re
     if not prefix:
         return ""
     literal = os.path.join(prefix, exe_rel)
-    if os.path.isfile(literal):
-        return literal
     pat_rel = re.sub(r'(?<!\d)(?:19|20)\d{2}(?!\d)', '*', exe_rel, count=1)
     if pat_rel == exe_rel:
         return literal  # no version segment to generalize
@@ -599,9 +602,11 @@ def _resolve_app_exe(prefix, exe_rel):
     if not hits:
         return literal
     def _year(h):
-        yrs = re.findall(r'(?:19|20)\d{2}', h)
+        # The year of the APP FOLDER, read from the path below the prefix: a prefix named like
+        # `~/Neutron-Prefixes/Adobe2026` must not make every hit look like 2026.
+        yrs = re.findall(r'(?<!\d)(?:19|20)\d{2}(?!\d)', os.path.relpath(h, prefix))
         return max((int(y) for y in yrs), default=0)
-    return max(hits, key=_year)
+    return max(sorted(hits), key=_year)
 
 def _resolve_app_dxvk_conf(prefix, profile):
     """Absolute path to this app's DXVK config, version-agnostically.
@@ -1340,6 +1345,82 @@ def neutron_prefixes():
             seen.add(r)
             out.append(r)
     return out
+
+
+def mudhut_busy(prefix):
+    """Mud Hut is installing, updating or rolling back Adobe apps in this prefix: its
+    `in_progress` record ({pid, command, apps, stage, ...}), else None.
+
+    The authority is the flock on `<prefix>/.mudhut/lock`, held by the running Mud Hut for the
+    whole job and dropped by the kernel when it exits, so a crash never leaves a stale lock.
+    Opened read-only and never created: a prefix Mud Hut never touched has no `.mudhut`."""
+    import fcntl
+    path = os.path.join(prefix, ".mudhut", "lock")
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            info = {}
+            try:
+                with open(os.path.join(prefix, ".mudhut", "state.json")) as f:
+                    info = json.load(f).get("in_progress") or {}
+            except (OSError, ValueError, AttributeError):
+                pass
+            return info or {"command": "update"}
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
+def _mudhut_busy_sentence(info):
+    """'Adobe apps in this prefix are being updated (Photoshop). ...' for launch's refusal."""
+    names = [APP_PROFILES.get(a, {}).get("name", a) for a in (info.get("apps") or [])]
+    what = {"install": "installed", "rollback": "put back to an earlier version"}.get(info.get("command"), "updated")
+    return ("Adobe apps in this prefix are being %s%s. Wait for that to finish, then open the app again."
+            % (what, " (%s)" % ", ".join(names) if names else ""))
+
+
+def cmd_prefix_list(args):
+    """`neutron --json prefix list`: Neutron's own prefixes (the ones `prefix provision` recorded,
+    plus any prefix a Neutron menu entry launches), the one list `update` acts on. Mud Hut's
+    `check-updates --all-prefixes` reads this, so there is one authority for the prefix list."""
+    out, seen = [], set()
+    recorded = set(os.path.realpath(p) for p in _recorded_prefixes())
+    cands = list(_recorded_prefixes())
+    menu = {}
+    for entry in sorted(glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop"))):
+        try:
+            with open(entry, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Exec="):
+                        toks = line.split()
+                        for i, t in enumerate(toks[:-1]):
+                            if t == "--prefix":
+                                cands.append(toks[i + 1])
+                                r = os.path.realpath(toks[i + 1])
+                                menu[r] = menu.get(r, 0) + 1
+        except OSError:
+            continue
+    for p in cands:
+        r = os.path.realpath(p)
+        if r in seen:
+            continue
+        seen.add(r)
+        busy = mudhut_busy(r) if os.path.isdir(r) else None
+        out.append({"path": r, "valid": os.path.isdir(os.path.join(r, "drive_c")),
+                    "recorded": r in recorded, "menu_entries": menu.get(r, 0),
+                    "mudhut_busy": busy is not None})
+    if args.json:
+        emit({"ok": True, "prefixes": out}, True)
+    else:
+        for e in out:
+            print("%s%s" % (e["path"], "" if e["valid"] else "  (missing)"))
+    return EX_OK
 
 
 def default_prefix():
@@ -3888,12 +3969,25 @@ def _app_procs(prefix, app_id):
 
 
 def _running_app_ids(prefix):
-    """Which APP_PROFILES apps still have live processes in this prefix."""
+    """Which APP_PROFILES apps still have live processes in this prefix.
+
+    Every installed YEAR of an app counts (`Adobe Photoshop 2025` beside `2026`): the token of
+    the year `launch` would pick is not enough once two are installed, and this answer decides
+    whether `update` may re-provision the prefix."""
     exes = {pid: _proc_win_exe(pid) for pid, _c, is_app in _prefix_procs(prefix) if is_app}
     out = []
     for app_id in APP_PROFILES:
-        token = _app_dir_token(app_id, prefix)
-        if token and any(("/" + token + "/") in e for e in exes.values()):
+        tokens = {_app_dir_token(app_id, prefix)}
+        prof = APP_PROFILES[app_id]
+        for exe in _app_exe_variants(prefix, prof["exe"]):
+            parts = exe.replace("\\", "/").split("/")
+            if "Adobe" in parts:
+                try:
+                    tokens.add(parts[len(parts) - parts[::-1].index("Adobe")])
+                except (ValueError, IndexError):
+                    pass
+        tokens.discard(None)
+        if any(("/" + t + "/") in e for t in tokens for e in exes.values()):
             out.append(app_id)
     return out
 
@@ -5876,6 +5970,14 @@ def cmd_launch(args):
                        + (", ".join(_tried) or "<none>")
                        + ". Pass --prefix, or select one in Collider."},
             EX_BADPREFIX, args.json)
+
+    # 🔒 Mud Hut is installing, updating or rolling back Adobe apps here: refuse. Starting an app
+    # now would run beside Adobe's installer rewriting it, and the update refuses to start (or
+    # its rollback cannot finish) while an app is open.
+    _mh = mudhut_busy(prefix)
+    if _mh is not None:
+        die({"launched": False, "app": args.app, "reason": _mudhut_busy_sentence(_mh),
+             "update_in_progress": _mh}, EX_RUNNING, args.json)
 
     gpu_mode = "gpu"
     if args.software:
@@ -8571,6 +8673,11 @@ def _reprovision_prefixes(version, as_json):
         if running:
             skipped.append({"prefix": p, "running": running})
             continue
+        # Mud Hut is updating Adobe apps in it: provisioning would boot wine beside the installer.
+        _mh = mudhut_busy(p)
+        if _mh is not None:
+            skipped.append({"prefix": p, "running": ["Mud Hut " + (_mh.get("command") or "update")]})
+            continue
         if not as_json:
             log(f"moving {p} to neutron-wine {version}")
         r = subprocess.run([sys.executable, os.path.realpath(__file__), "--json", "prefix",
@@ -8721,6 +8828,10 @@ def build_parser():
     # prefix
     pp = sub.add_parser("prefix", help="prefix inspection / provisioning")
     psub = pp.add_subparsers(dest="subcmd", required=True)
+
+    pls = psub.add_parser("list", help="Neutron's prefixes (recorded by provision, or named by "
+                                       "a Neutron menu entry); what `update` acts on")
+    pls.set_defaults(func=cmd_prefix_list)
 
     pi = psub.add_parser("info", help="report paths Collider needs")
     pi.add_argument("path", nargs="?", default=None)
