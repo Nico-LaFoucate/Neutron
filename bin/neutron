@@ -1379,7 +1379,7 @@ def mudhut_busy(prefix):
 
 def _mudhut_busy_sentence(info):
     """'Adobe apps in this prefix are being updated (Photoshop). ...' for launch's refusal."""
-    names = [APP_PROFILES.get(a, {}).get("name", a) for a in (info.get("apps") or [])]
+    names = [APP_PROFILES.get(a, {}).get("name", a).replace(" (experimental)", "") for a in (info.get("apps") or [])]
     what = {"install": "installed", "rollback": "put back to an earlier version"}.get(info.get("command"), "updated")
     return ("Adobe apps in this prefix are being %s%s. Wait for that to finish, then open the app again."
             % (what, " (%s)" % ", ".join(names) if names else ""))
