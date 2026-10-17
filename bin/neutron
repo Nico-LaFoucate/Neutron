@@ -5743,6 +5743,18 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-123 (Neutron#15): Import listed a card under Files, not Devices. "
                "Turn it off if a USB drive is suddenly treated as removable.",
     },
+    "shell-thumbonly-fail": {
+        "env": "NEUTRON_SHELL_THUMBONLY_FAIL", "default": True,
+        "what": "say \"no thumbnail\" when an app asks Windows for a thumbnail Wine cannot make",
+        "why": "runtime 11.10-134 (Neutron#26): Lightroom Classic's Import showed white squares for a "
+               "memory card under Devices. Turn it off if an app shows icons where it showed blanks before.",
+    },
+    "hang-report": {
+        "env": "NEUTRON_HANG_REPORT", "default": True,
+        "what": "when an app freezes, write every thread's location into the session log",
+        "why": "added for Neutron#27: a frozen app's log said that it was stuck, never where. It only "
+               "runs once a lock has been waited on for 5 seconds. Turn it off if a log gets very long.",
+    },
     "follow-output": {
         "env": "NEUTRON_FOLLOW_OUTPUT", "default": True,
         "what": "move a maximized window onto the monitor KDE/GNOME actually shows it on",
