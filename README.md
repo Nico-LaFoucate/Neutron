@@ -33,8 +33,8 @@ Premiere Pro · After Effects · Photoshop · Lightroom Classic · Illustrator �
 > - Users also run Neutron on Ubuntu, Bazzite, Nobara and Arch, under GNOME and Hyprland as well
 >   as KDE.
 > - **AMD GPUs:** Photoshop 2026 and Premiere Pro 2026 use the GPU, and Illustrator 2026 runs.
->   Premiere needs AMD's ROCm OpenCL installed. Hardware video encoding is NVIDIA-only for now.
->   After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet.
+>   Premiere needs AMD's ROCm OpenCL installed. Hardware video encoding on AMD is new in runtime
+>   11.10-133 and testers haven't confirmed it yet ([#22](https://github.com/Nico-LaFoucate/Neutron/issues/22)). After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet.
 > - **Intel GPUs** haven't been tested.
 
 ---
@@ -111,7 +111,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Pen / tablet input** | 🟢 `Beta` | Pressure, tilt and eraser via WinTab, at the tablet's native resolution. The first-stroke stray is fixed — Wine's WinTab context declared `lcOutExt` in tablet units where a real Wacom declares screen pixels, a factor-of-UPP error in the mapping Photoshop uses before it calibrates. |
 | **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin into an application. |
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
-| **AMD GPUs** | 🟡 `Partial` | Photoshop 2026 and Premiere Pro 2026 use the GPU (Premiere through AMD's ROCm OpenCL), and Illustrator 2026 runs. Hardware video encoding is NVIDIA-only for now. After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet. |
+| **AMD GPUs** | 🟡 `Partial` | Photoshop 2026 and Premiere Pro 2026 use the GPU (Premiere through AMD's ROCm OpenCL), and Illustrator 2026 runs. Hardware video encoding on AMD is new in runtime 11.10-133 and testers haven't confirmed it yet ([#22](https://github.com/Nico-LaFoucate/Neutron/issues/22)). After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet. |
 | **Intel GPUs** | ⚪ `Untested` | Not tried yet. |
 | **Third-party plugins** | 🟢 `Beta` | In daily use: Captioneer and other third-party panels in Premiere Pro, and VST3 audio plugins in Premiere Pro. The aescripts + aeplugins manager runs; installing plugins through it hasn't been tested yet. |
 
@@ -174,8 +174,9 @@ patched Wine runtime.
 - 64-bit Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, current Arch / CachyOS /
   Manjaro, openSUSE Tumbleweed) and a **Wayland** session.
 - An **NVIDIA** or **AMD GPU**. On AMD, Premiere Pro needs AMD's ROCm OpenCL for GPU acceleration
-  (`neutron doctor` checks for it), and hardware video encoding is NVIDIA-only for now. Intel GPUs
-  haven't been tested yet.
+  (`neutron doctor` checks for it). AMD hardware video encoding (new in 11.10-133) uses Mesa;
+  Fedora's and openSUSE's Mesa leave out H.264 and HEVC (RPM Fusion and Packman provide the full
+  version). Intel GPUs haven't been tested yet.
 - **32-bit (multilib) system and graphics libraries**: Adobe's apps start 32-bit helper processes.
 - **Python 3** and **cabextract**.
 
