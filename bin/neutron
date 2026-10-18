@@ -5671,6 +5671,14 @@ NEUTRON_GATES = {
                "plugin-panel docks and a File dialog opened/dismissed, no freeze. Turn it OFF "
                "first when triaging a stacking, repaint-after-reshow or dock-drag problem.",
     },
+    "owner-hint-strict": {
+        "env": "NEUTRON_OWNER_HINT_STRICT", "default": True,
+        "what": "never attach an app's main window to whatever window covers its corner",
+        "why": "Neutron#28: Photoshop 2025's window was drawn inside its own Open dialog and vanished "
+               "when the dialog closed. Only tool windows with no owner (like Premiere's Button "
+               "Editor) still borrow the window under them. Turn it off if such a panel drifts away "
+               "from the window it sits on.",
+    },
     "owned-subsurface-modal": {
         "env": "NEUTRON_OWNED_SUBSURFACE_MODAL", "default": False,
         "what": "also promote owned windows carrying WS_EX_DLGMODALFRAME",
