@@ -52,7 +52,7 @@ NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 # The CLI's own version. Each piece versions independently (CLI, neutron-wine, Mud Hut,
 # Collider); `neutron --version` prints all of them for bug reports.
-CLI_VERSION = "1.0.0-beta.14"
+CLI_VERSION = "1.0.0-beta.15"
 NEUTRON_DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
     "neutron")
@@ -5692,7 +5692,7 @@ NEUTRON_GATES = {
     "owner-hint-strict": {
         "env": "NEUTRON_OWNER_HINT_STRICT", "default": True,
         "what": "never attach an app's main window to whatever window covers its corner",
-        "why": "Neutron#28: Photoshop 2025's window was drawn inside its own Open dialog and vanished "
+        "why": "runtime 11.10-136 (Neutron#28): Photoshop 2025's window was drawn inside its own Open dialog and vanished "
                "when the dialog closed. Only tool windows with no owner (like Premiere's Button "
                "Editor) still borrow the window under them. Turn it off if such a panel drifts away "
                "from the window it sits on.",
