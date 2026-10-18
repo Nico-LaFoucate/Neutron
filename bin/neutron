@@ -3992,6 +3992,44 @@ def _running_app_ids(prefix):
     return out
 
 
+def _post_wm_close(wine, env, images):
+    """`wine taskkill /im NAME` (no /F) for each image: post WM_CLOSE to every top-level window of every process of that
+    name, so an app runs its own shutdown and writes its preferences. Returns the images that were SENT a WM_CLOSE.
+
+    Wine's taskkill returns 0 when every matched process had a window to post to, and 128 when one had none (or none
+    matched) -- Windows' "can only be terminated forcefully". A process that was sent nothing cannot answer, so the
+    grace wait must not wait for it. It used to: Lightroom's Crash Processor and dynamiclinkmanager, then
+    AdobeIPCBroker, are windowless, and each teardown sat out two full 25 s grace periods for them after Lightroom had
+    already closed -- Collider's card said "Quitting…" for 51 s (lab, 2026-10-18; Neutron#27's reporter relaunched in
+    that window). A taskkill that times out or fails to start counts as sent: unknown keeps the old, waiting behavior."""
+    sent = set()
+    for im in images:
+        # ⚠️ No stamp guard here, and that is deliberate -- audited 2026-08-26 after the
+        # build tester flagged teardown as an unguarded `wine` spawn. It cannot clobber:
+        # we only reach this line when app processes exist, which means a wine session is
+        # up, which means `__wineboot_event` exists, which makes `run_wineboot()` skip
+        # launching wineboot entirely. See stamp_mismatch() for the full chain out of
+        # wine's source. ⛔ Do NOT "fix" this by refusing a teardown -- if teardown can be
+        # blocked, a stuck prefix cannot be recovered.
+        try:
+            r = subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                sent.add(im)
+        except Exception:
+            sent.add(im)
+    return sent
+
+
+def _proc_image(pid):
+    """The Windows image name (`Lightroom.exe`) from /proc/<pid>/cmdline[0], as the full teardown names it."""
+    try:
+        cl = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf8", "replace")
+        return cl.split("\0")[0].replace("\\", "/").rsplit("/", 1)[-1]
+    except Exception:
+        return ""
+
+
 def _teardown_app(args, prefix, wine, env):
     """Close ONE app, leaving every other app in the prefix running.
 
@@ -4031,23 +4069,13 @@ def _teardown_app(args, prefix, wine, env):
             exe = _proc_win_exe(pid).rsplit("/", 1)[-1]
             if exe.lower().endswith(".exe") and exe not in images:
                 images.append(exe)
-        for im in images:
-            # ⚠️ No stamp guard here, and that is deliberate -- audited 2026-08-26 after the
-            # build tester flagged teardown as an unguarded `wine` spawn. It cannot clobber:
-            # we only reach this line when app processes exist, which means a wine session is
-            # up, which means `__wineboot_event` exists, which makes `run_wineboot()` skip
-            # launching wineboot entirely. See stamp_mismatch() for the full chain out of
-            # wine's source. ⛔ Do NOT "fix" this by refusing a teardown -- if teardown can be
-            # blocked, a stuck prefix cannot be recovered.
-            try:
-                subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+        sent = _post_wm_close(wine, env, images)
         if images:
             log(f"teardown[{app_id}]: asked to close: {', '.join(images)}")
+        if set(images) - sent:
+            log(f"teardown[{app_id}]: no window to close, not waited for: {', '.join(sorted(set(images) - sent))}")
         for _ in range(args.grace):
-            if not _app_procs(prefix, app_id):
+            if not [p for p in _app_procs(prefix, app_id) if _proc_win_exe(p[0]).rsplit("/", 1)[-1] in sent]:
                 break
             _t.sleep(1)
 
@@ -4138,23 +4166,13 @@ def cmd_teardown(args, _emitted=False):
                     images.append(exe)
             except Exception:
                 pass
-        for im in images:
-            # ⚠️ No stamp guard here, and that is deliberate -- audited 2026-08-26 after the
-            # build tester flagged teardown as an unguarded `wine` spawn. It cannot clobber:
-            # we only reach this line when app processes exist, which means a wine session is
-            # up, which means `__wineboot_event` exists, which makes `run_wineboot()` skip
-            # launching wineboot entirely. See stamp_mismatch() for the full chain out of
-            # wine's source. ⛔ Do NOT "fix" this by refusing a teardown -- if teardown can be
-            # blocked, a stuck prefix cannot be recovered.
-            try:
-                subprocess.run([wine, "taskkill", "/im", im], env=env, timeout=25,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+        sent = _post_wm_close(wine, env, images)
         if images:
             log(f"teardown: asked {len(images)} app(s) to close: {', '.join(images)}")
+        if set(images) - sent:
+            log(f"teardown: no window to close, not waited for: {', '.join(sorted(set(images) - sent))}")
         for _ in range(args.grace):
-            if not [p for p in _prefix_procs(prefix) if p[2]]:
+            if not [p for p in _prefix_procs(prefix) if p[2] and _proc_image(p[0]) in sent]:
                 break
             _t.sleep(1)
 
