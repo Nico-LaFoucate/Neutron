@@ -5303,6 +5303,15 @@ def cmd_prefix_provision(args):
             "Version", "REG_SZ", "win10")
     steps.append({"step": "ps_caption_win10", "ok": True})
 
+    # 2b'. InDesign's Type > Font menu: on build >= 22000 (Windows 11) its owner-drawn menu paints
+    # the hovered row's rounded highlight BEFORE applying its own UI scale, from the row's
+    # unscaled frame, and skips clearing its reused row bitmap. At any UI scale above 100% the bar
+    # is the row divided by that scale and the previously drawn row shows through (unchanged since
+    # InDesign 2025). The Windows 10 branch fills the whole row. App-scoped like Photoshop above.
+    reg_set(wine, prefix, r"HKCU\Software\Wine\AppDefaults\InDesign.exe",
+            "Version", "REG_SZ", "win10")
+    steps.append({"step": "indesign_menu_win10", "ok": True})
+
     event(args, event="progress", stage="lrc", pct=70, msg="registering the Lightroom → Photoshop detector key")
     # 2c. Lightroom Classic's "Edit in Photoshop" detector: register the dot-free
     # PHSP<major> Uninstall key so LrC's whole-string regex_match finds PS (see
