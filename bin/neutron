@@ -43,6 +43,16 @@ EX_DEP = 4
 # dir) so a version bump or a different prefix doesn't break the contract.
 
 HOME = os.path.expanduser("~")
+
+
+def _xdg_dir(var, *default):
+    """$var when it holds an absolute path, else HOME/<default>. The XDG Base Directory spec: unset
+    OR EMPTY means the default, and a relative value is invalid and ignored. An empty
+    XDG_DATA_HOME used to be joined as-is, so `neutron setup` installed into the current directory
+    (found in the 11.10-138 fresh-HOME test, 2026-10-19)."""
+    value = os.environ.get(var, "")
+    return value if os.path.isabs(value) else os.path.join(HOME, *default)
+
 # ⛔ NO DEFAULT PREFIX PATH. Resolution is default_prefix(): $WINEPREFIX -> Collider's selection
 # -> unambiguous discovery. A hardcoded name is one machine's layout and has repeatedly broken the
 # build tester; see default_prefix() for the history.
@@ -54,8 +64,7 @@ NEUTRON_REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 # Collider); `neutron --version` prints all of them for bug reports.
 CLI_VERSION = "1.0.0-beta.17"
 NEUTRON_DATA_DIR = os.path.join(
-    os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")),
-    "neutron")
+    _xdg_dir("XDG_DATA_HOME", ".local", "share"), "neutron")
 # What `neutron setup` installed (component -> version); read by --version.
 NEUTRON_INSTALLED_JSON = os.path.join(NEUTRON_DATA_DIR, "installed.json")
 
@@ -82,8 +91,7 @@ WINEDLLOVERRIDES = "ucrtbase=n,b;dwrite=b"
 #   NEUTRON_WINE_VERSION at its root) and is resolved ahead of any dev build tree.
 NEUTRON_WINE_REPO = os.environ.get("NEUTRON_WINE_REPO", "Nico-LaFoucate/neutron-wine")
 NEUTRON_RUNTIMES_DIR = os.path.join(
-    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
-    "neutron", "runtimes")
+    _xdg_dir("XDG_DATA_HOME", ".local", "share"), "neutron", "runtimes")
 
 
 def _installed_runtime_versions():
@@ -137,8 +145,7 @@ NEUTRON_WINE_VERSION = _default_wine_version()
 # Where `neutron launch --json` writes each app's wine log. Sibling of runtimes so
 # it follows XDG_DATA_HOME and a fake-HOME clean-room test the same way.
 NEUTRON_LOGS_DIR = os.path.join(
-    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
-    "neutron", "logs")
+    _xdg_dir("XDG_DATA_HOME", ".local", "share"), "neutron", "logs")
 
 # A dev build is selected with $NEUTRON_WINE; there are no hardcoded home-dir fallbacks.
 NEUTRON_WINE_CANDIDATES = [
@@ -8648,8 +8655,7 @@ GITHUB_OWNER = os.environ.get("NEUTRON_GITHUB_OWNER", "Nico-LaFoucate")
 NEUTRON_BIN_DIR = os.path.join(NEUTRON_DATA_DIR, "bin")          # the installed CLI + mudhut
 NEUTRON_COLLIDER_DIR = os.path.join(NEUTRON_DATA_DIR, "collider")
 LOCAL_BIN = os.path.join(HOME, ".local", "bin")
-APPS_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")),
-                        "applications")
+APPS_DIR = os.path.join(_xdg_dir("XDG_DATA_HOME", ".local", "share"), "applications")
 # piece -> (GitHub repo, how to recognize its release asset)
 RELEASE_PIECES = {
     "cli": ("neutron", lambda n: n == "neutron"),
@@ -9114,10 +9120,8 @@ def cmd_uninstall(args):
               "prefs-check", "superseded-desktop-entries")]
     owned.append(NEUTRON_INSTALLED_JSON)
     owned.append(NEUTRON_PREFIXES_JSON)
-    owned.append(os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")),
-                              "neutron"))
-    owned.append(os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
-                              "collider"))                                   # Collider's settings
+    owned.append(os.path.join(_xdg_dir("XDG_CACHE_HOME", ".cache"), "neutron"))
+    owned.append(os.path.join(_xdg_dir("XDG_CONFIG_HOME", ".config"), "collider"))  # Collider's settings
     owned.append(os.path.join(os.path.dirname(APPS_DIR), "kwin", "scripts", KWIN_SCRIPT_ID))
     # Only Neutron's own prefixes are offered for deletion (see neutron_prefixes); but never delete
     # a directory that holds ANY prefix, whatever it is called.
