@@ -1094,12 +1094,17 @@ APP_PROFILES = {
                                "NEUTRON_WL_ORPHAN_TOPLEVEL": "1"},
         "accent": "#9999ff", "export": True,   # Render Queue outputs video (native muxing)
     },
+    # Illustrator and InDesign report the real NVIDIA GPU (nvapi): their GPU sniffer (AISniffer.exe, a
+    # child that inherits this env) matches the DXGI adapter against WMI's Win32_VideoController. With
+    # DXVK presenting an NVIDIA card as AMD the match fails, every D3D capability reads "No", and
+    # Illustrator reports "Compatible GPU not available" (2026-10-19, lab-tested with runtime 138's
+    # AdapterRAM fix). Windows reports the real GPU there, as it does for Photoshop and Lightroom.
     "illustrator": {
         "name": "Illustrator",
         "exe": _adobe("Adobe Illustrator 2025", "Support Files", "Contents", "Windows", "Illustrator.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
-        "nvapi": False, "env": {},
+        "nvapi": True, "env": {},
         "accent": "#ff9a00", "export": False,
     },
     # EXPERIMENTAL: Audition and InDesign are not supported yet (Neutron discussion #8). These
@@ -1124,7 +1129,7 @@ APP_PROFILES = {
         "exe": _adobe("Adobe InDesign 2026", "InDesign.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
-        "nvapi": False, "env": {},
+        "nvapi": True, "env": {},
         "accent": "#ff3366", "export": False,
     },
 }
