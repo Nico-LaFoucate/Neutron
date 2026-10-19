@@ -1715,6 +1715,64 @@ def _prefix_stamp(prefix):
         return None
 
 
+def _prefix_file_problems(prefix):
+    """What is wrong with the files Wine keeps at the top of a prefix, as sentences; [] when nothing.
+
+    GitHub Neutron#29: system.reg, user.reg and .update-timestamp could not be read while drive_c
+    read fine, and `doctor` said healthy -- every check that reads those files took OSError as
+    "cannot tell" and passed. Wine cannot run such a prefix, Collider could not resolve it and Mud
+    Hut said its runtime was "not installed". This names each file, who owns it, and the fix.
+    A missing .update-timestamp counts too: Neutron's provision always writes it, so a prefix
+    without one never finished booting and `prefix provision` is the fix."""
+    import pwd
+
+    def owner(uid):
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return "user id %d" % uid
+
+    me = os.getuid()
+    out, foreign, perms, missing = [], set(), False, False
+    try:
+        st = os.stat(prefix)
+        if st.st_uid != me:
+            foreign.add(owner(st.st_uid))
+            out.append("the prefix folder belongs to %s, and Wine refuses to run in a prefix that "
+                       "is not yours" % owner(st.st_uid))
+    except OSError as e:
+        out.append("the prefix folder cannot be checked (%s)" % e.strerror)
+    for name in ("system.reg", "user.reg", ".update-timestamp"):
+        path = os.path.join(prefix, name)
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            missing = True
+            out.append("%s is missing" % name)
+            continue
+        except OSError as e:
+            out.append("%s cannot be checked (%s)" % (name, e.strerror))
+            continue
+        cannot = ("" if os.access(path, os.R_OK | os.W_OK) else
+                  "write" if os.access(path, os.R_OK) else "read")
+        if st.st_uid != me:
+            foreign.add(owner(st.st_uid))
+            out.append("%s belongs to %s" % (name, owner(st.st_uid))
+                       + (", and you can't %s it" % cannot if cannot else ""))
+        elif cannot:
+            perms = True
+            out.append("%s: its permissions don't let you %s it" % (name, cannot))
+    if foreign:
+        out.append("files owned by %s usually come from running a Neutron step with sudo. Give the "
+                   "prefix back to yourself with `sudo chown -R %s: %s`, and run Neutron without sudo"
+                   % (" and ".join(sorted(foreign)), owner(me), prefix))
+    if perms:
+        out.append("`chmod u+rw` on those files makes them readable and writable for you again")
+    if missing:
+        out.append("`neutron prefix provision %s` recreates what is missing" % prefix)
+    return out
+
+
 def _runtime_stamp(wine_path):
     """The stamp a given wine would impose on a prefix (its wine.inf mtime), or None."""
     if not wine_path:
@@ -8341,6 +8399,9 @@ def cmd_doctor(args):
         else:
             user = prefix_user(prefix)
             check("prefix", True, prefix)
+            _pf = _prefix_file_problems(prefix)
+            check("prefix-files", not _pf,
+                  "; ".join(_pf) if _pf else "system.reg, user.reg and .update-timestamp are yours")
             # Would launching this prefix on the runtime we just resolved re-stamp it? Same test
             # `launch` refuses on, surfaced here so Collider shows it BEFORE someone clicks
             # Launch. Silent when the prefix has never been booted.
