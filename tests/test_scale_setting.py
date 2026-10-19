@@ -34,12 +34,16 @@ DESKTOP = {"scale": 1.25, "source": "gnome", "output": "DP-1", "dpi": 120, "wind
 class ScaleSetting(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="neutron-scale-")
-        self._home, self._detect = N.HOME, N.detect_scale_info
+        # HOME and the XDG bases derived from it at import: patching HOME alone would read the real
+        # ~/.config/collider.
+        self._saved = {n: getattr(N, n) for n in ("HOME", "CONFIG_HOME", "detect_scale_info")}
         N.HOME = self.home
+        N.CONFIG_HOME = os.path.join(self.home, ".config")
         N.detect_scale_info = lambda: dict(DESKTOP)
 
     def tearDown(self):
-        N.HOME, N.detect_scale_info = self._home, self._detect
+        for n, v in self._saved.items():
+            setattr(N, n, v)
         shutil.rmtree(self.home, ignore_errors=True)
 
     def collider(self, text):

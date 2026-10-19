@@ -145,6 +145,26 @@ class PruneAppLogs(unittest.TestCase):
                              ["premiere-premiere2025-%03d.log" % i for i in range(11, 30)])
 
 
+_XDG_NAMES = ("HOME", "DATA_HOME", "CONFIG_HOME", "CACHE_HOME", "APPS_DIR")
+
+
+def _point_xdg_at(home):
+    """Point HOME AND every XDG base derived from it at `home` (the bases are computed at import, so
+    patching HOME alone would leave them on the real ~/.config and ~/.local/share). Returns what to restore."""
+    saved = {n: getattr(N, n) for n in _XDG_NAMES}
+    N.HOME = home
+    N.DATA_HOME = os.path.join(home, ".local", "share")
+    N.CONFIG_HOME = os.path.join(home, ".config")
+    N.CACHE_HOME = os.path.join(home, ".cache")
+    N.APPS_DIR = os.path.join(N.DATA_HOME, "applications")
+    return saved
+
+
+def _restore(saved):
+    for n, v in saved.items():
+        setattr(N, n, v)
+
+
 class RepairMimeDefaults(unittest.TestCase):
     """A dangling `mudhut-<app>.desktop` claim is re-pointed at the app's new entry, for ANY
     type -- but a live claim is never stolen."""
@@ -183,14 +203,13 @@ class RepairMimeDefaults(unittest.TestCase):
             home, apps = self._home(tmp, ["neutron-premiere-premiere2025.desktop",
                                           "neutron-photoshop-premiere2025.desktop",
                                           "neutron-premiere-adobe2026.desktop"])
-            old_home = N.HOME
-            N.HOME = home
+            saved = _point_xdg_at(home)
             try:
                 claimed = N.repair_mime_defaults(apps, [
                     {"app": "premiere", "mime": ["application/x-neutron-prproj"],
                      "file": "neutron-premiere-adobe2026.desktop"}])
             finally:
-                N.HOME = old_home
+                _restore(saved)
             d = self._defaults(home)
             self.assertEqual(d["application/vnd.adobe.premiere-project"],
                              "neutron-premiere-adobe2026.desktop",
@@ -210,14 +229,13 @@ class RepairMimeDefaults(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home, apps = self._home(tmp, ["neutron-premiere-adobe2026.desktop",
                                           "mudhut-premiere.desktop"])
-            old_home = N.HOME
-            N.HOME = home
+            saved = _point_xdg_at(home)
             try:
                 N.repair_mime_defaults(apps, [
                     {"app": "premiere", "mime": ["application/x-neutron-prproj"],
                      "file": "neutron-premiere-adobe2026.desktop"}])
             finally:
-                N.HOME = old_home
+                _restore(saved)
             d = self._defaults(home)
             self.assertEqual(d["application/vnd.adobe.premiere-project"],
                              "mudhut-premiere.desktop")
