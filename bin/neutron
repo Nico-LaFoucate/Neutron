@@ -4604,6 +4604,49 @@ def _win_path(prefix, abspath):
     return "C:\\" + ap[len(dc):].replace("/", "\\")
 
 
+# Photoshop reads a pen through WinTab only when its PSUserConfig.txt says `UseSystemStylus 0`. Without that line it
+# uses Windows Ink, and under Wine Windows Ink delivers the pen as a plain mouse: no pressure, no tilt. The runtime's
+# WinTab bridge supplies pressure, tilt and the eraser. Measured 2026-10-20 on a Cintiq 22HD (GitHub neutron-wine#1):
+# with no file Photoshop 2026 never loaded WinTab32.dll and drew without pressure; with the line it opened a WinTab
+# context and pressure worked. The July pen work had that line written by hand into its test prefix, so no
+# Neutron-made prefix ever had it. An existing UseSystemStylus line is the user's choice and is left alone.
+PS_USERCONFIG = "PSUserConfig.txt"
+PS_WINTAB_LINE = "UseSystemStylus 0"
+
+
+def ensure_photoshop_wintab(prefix):
+    """Make every installed Photoshop in `prefix` read the pen through WinTab (see PS_WINTAB_LINE).
+
+    Returns [(install dir name, "added" | "kept")]; nothing for a prefix without Photoshop.
+    """
+    user = prefix_user(prefix)
+    if not user:
+        return []
+    appsdir = os.path.join(prefix, "drive_c", "Program Files", "Adobe")
+    roaming = os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming", "Adobe")
+    done = []
+    for inst in sorted(glob.glob(os.path.join(appsdir, "Adobe Photoshop *"))):
+        if not os.path.isfile(os.path.join(inst, "Photoshop.exe")):
+            continue
+        name = os.path.basename(inst)                       # "Adobe Photoshop 2026"
+        settings = os.path.join(roaming, name, name + " Settings")
+        path = os.path.join(settings, PS_USERCONFIG)
+        text = ""
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="replace", newline="") as f:
+                text = f.read()
+        if re.search(r"(?im)^\s*UseSystemStylus\b", text):
+            done.append((name, "kept"))
+            continue
+        os.makedirs(settings, exist_ok=True)
+        add = "" if not text or text.endswith("\n") else "\r\n"
+        add += "# Neutron: read the pen through WinTab (pressure, tilt, eraser)\r\n" + PS_WINTAB_LINE + "\r\n"
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            f.write(add)
+        done.append((name, "added"))
+    return done
+
+
 def provision_photoshop_detection(wine, prefix):
     """Register the Uninstall key Lightroom Classic's PS detector requires.
 
@@ -5401,6 +5444,14 @@ def cmd_prefix_provision(args):
     reg_set(wine, prefix, r"HKCU\Software\Wine\AppDefaults\InDesign.exe",
             "Version", "REG_SZ", "win10")
     steps.append({"step": "indesign_menu_win10", "ok": True})
+
+    # 2b''. Photoshop pen pressure: WinTab instead of Windows Ink (see PS_WINTAB_LINE). Launches repeat it for a
+    # Photoshop installed after this.
+    try:
+        steps.append({"step": "ps_pen_wintab", "ok": True,
+                      "photoshops": [{"app": n, "action": a} for n, a in ensure_photoshop_wintab(prefix)]})
+    except OSError as e:
+        steps.append({"step": "ps_pen_wintab", "ok": False, "error": str(e)})
 
     event(args, event="progress", stage="lrc", pct=70, msg="registering the Lightroom → Photoshop detector key")
     # 2c. Lightroom Classic's "Edit in Photoshop" detector: register the dot-free
@@ -6502,6 +6553,15 @@ def cmd_launch(args):
     # The display fix (DS.DisableDirectXDisplay) for Premiere, After Effects and Media Encoder,
     # applied before every launch exactly as Collider does. Best-effort; never blocks.
     _display_fix_before_launch(prefix)
+
+    # Photoshop's pen through WinTab (PS_WINTAB_LINE), also for a Photoshop installed after provisioning or started
+    # by another app (Edit in Photoshop). Best-effort; never blocks.
+    try:
+        for name, action in ensure_photoshop_wintab(prefix):
+            if action == "added":
+                log("%s: pen set to WinTab (%s)" % (name, PS_WINTAB_LINE))
+    except OSError as e:
+        log("Photoshop pen setting not written (%s)" % e)
 
     # Each installed app's own settings, for when THIS app starts another one (Dynamic Link, Edit in
     # Photoshop). Best-effort: without the file a started app inherits this one's settings, as before.
