@@ -5968,6 +5968,24 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-124: one remembered height for every monitor left maximized windows "
                "short on a monitor without a panel. Off = the single value of earlier runtimes.",
     },
+    "dpi-changed": {
+        "env": "NEUTRON_DPI_34", "default": True,
+        "what": "tell an app its monitor's scale changed when one of its windows moves to another monitor",
+        "why": "runtime 11.10-139, as Windows does: Photoshop on a 100% screen next to a 175% one drew its "
+               "floating options bar at 175%. Turn it off if windows resize wrongly when moved between monitors.",
+    },
+    "surface-target-dpi": {
+        "env": "NEUTRON_SURFACE_TARGET_DPI", "default": True,
+        "what": "draw a menu or window at the scale of the monitor it opens on",
+        "why": "runtime 11.10-139: Photoshop's menus on a 100% screen next to a 175% one were drawn at 57% "
+               "of their box, too small to read.",
+    },
+    "point-monitor-dpi": {
+        "env": "NEUTRON_POINT_MONITOR_DPI", "default": True,
+        "what": "find the window under the mouse at the scale of the monitor the mouse is on",
+        "why": "runtime 11.10-139: on a 100% screen next to a 175% one, Photoshop's tool icons did not "
+               "highlight on hover and an open menu did not follow the cursor along the menu bar.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
