@@ -35,7 +35,9 @@ Premiere Pro · After Effects · Photoshop · Lightroom Classic · Illustrator �
 > - **AMD GPUs:** Photoshop 2026 and Premiere Pro 2026 use the GPU, and Illustrator 2026 runs.
 >   Premiere needs AMD's ROCm OpenCL installed. Hardware video encoding on AMD is new in runtime
 >   11.10-133 and testers haven't confirmed it yet ([#22](https://github.com/Nico-LaFoucate/Neutron/issues/22)). After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet.
-> - **Intel GPUs** haven't been tested.
+> - **Intel GPUs:** a user reports Premiere Pro 2026 running very well and Photoshop 2026 working on an 11th-gen Iris Xe laptop
+>   (Fedora 44), with Intel's OpenCL runtime and media driver installed ([Discussion #32](https://github.com/Nico-LaFoucate/Neutron/discussions/32)).
+>   The other apps haven't been tried on Intel yet.
 
 ---
 
@@ -112,7 +114,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Drag and drop from the file manager** | 🟢 `Beta` | Dropping files from Dolphin into an application. |
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
 | **AMD GPUs** | 🟡 `Partial` | Photoshop 2026 and Premiere Pro 2026 use the GPU (Premiere through AMD's ROCm OpenCL), and Illustrator 2026 runs. Hardware video encoding on AMD is new in runtime 11.10-133 and testers haven't confirmed it yet ([#22](https://github.com/Nico-LaFoucate/Neutron/issues/22)). After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet. |
-| **Intel GPUs** | ⚪ `Untested` | Not tried yet. |
+| **Intel GPUs** | 🟡 `Partial` | A user reports Premiere Pro 2026 and Photoshop 2026 working on an 11th-gen Iris Xe (Fedora 44) with Intel's OpenCL runtime and media driver (`intel-opencl intel-compute-runtime intel-media-driver` on Fedora) ([#32](https://github.com/Nico-LaFoucate/Neutron/discussions/32)). The other apps haven't been tried on Intel yet. |
 | **Third-party plugins** | 🟢 `Beta` | In daily use: Captioneer and other third-party panels in Premiere Pro, and VST3 audio plugins in Premiere Pro. The aescripts + aeplugins manager runs; installing plugins through it hasn't been tested yet. |
 
 ### Creative Cloud 2026
@@ -176,7 +178,8 @@ patched Wine runtime.
 - An **NVIDIA** or **AMD GPU**. On AMD, Premiere Pro needs AMD's ROCm OpenCL for GPU acceleration
   (`neutron doctor` checks for it). AMD hardware video encoding (new in 11.10-133) uses Mesa;
   Fedora's and openSUSE's Mesa leave out H.264 and HEVC (RPM Fusion and Packman provide the full
-  version). Intel GPUs haven't been tested yet.
+  version). On Intel, a user reports Premiere Pro and Photoshop working with Intel's OpenCL runtime and media
+  driver installed.
 - **32-bit (multilib) system and graphics libraries**: Adobe's apps start 32-bit helper processes.
 - **Python 3** and **cabextract**.
 
