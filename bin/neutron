@@ -5438,6 +5438,9 @@ def cmd_prefix_provision(args):
     # This suppression is ONLY for this controlled boot, NEVER for the launch path.
     sysreg = os.path.join(prefix, "system.reg")
     fresh = not os.path.isfile(sysreg)
+    wineboot_rc = None
+    wineboot_error = None
+    wineboot_log = None
     try:
         env = dict(os.environ)
         env["WINEPREFIX"] = prefix
@@ -5451,13 +5454,43 @@ def cmd_prefix_provision(args):
         # communicate with Creative Cloud desktop"). -r skips only those; the forced update
         # and RunOnce are unchanged. App launches never run them: a cold prefix boots with
         # --init. Release test, 2026-10-07.
-        subprocess.run([wine, "wineboot", "-u", "-r"], env=env,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240)
+        # Wine's output goes to a FILE, never a pipe: wineboot's children (wineserver, services) inherit the
+        # descriptor and outlive it, so a pipe would hold run() open until the timeout.
+        os.makedirs(NEUTRON_LOGS_DIR, exist_ok=True)
+        wineboot_log = os.path.join(NEUTRON_LOGS_DIR, "wineboot-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
+        with open(wineboot_log, "wb") as wl:
+            wineboot_rc = subprocess.run([wine, "wineboot", "-u", "-r"], env=env,
+                                         stdout=wl, stderr=wl, timeout=240).returncode
         wineserver_wait(wine, prefix)   # wineboot detaches; wait so system.reg lands
     except Exception as e:
-        log(f"wineboot failed (non-fatal to reporting): {e}")
+        wineboot_error = str(e)
+        log(f"wineboot failed: {e}")
     steps.append({"step": "init", "skipped": False, "fresh": fresh,
                   "ok": os.path.isfile(sysreg)})
+    # GitHub Neutron#29: when Wine cannot start, wineboot writes no registry, and every later step still ran
+    # (Microsoft's DLLs, fonts, WebView2, desktop entries, DXVK configs), so provision reported ok into a prefix
+    # with no system.reg, user.reg or .update-timestamp. Mud Hut and Collider then took it for a working prefix
+    # and the user only learned at launch, from a message about a missing runtime stamp. Stop here and say why,
+    # with Wine's own last words.
+    if not os.path.isfile(sysreg) and wineboot_error:
+        # a slow first boot that ran past the timeout may still be writing: let the wineserver finish first
+        wineserver_wait(wine, prefix)
+        steps[-1]["ok"] = os.path.isfile(sysreg)
+    if not os.path.isfile(sysreg):
+        tail = []
+        try:
+            with open(wineboot_log, "rb") as wl:
+                tail = [l for l in wl.read()[-8192:].decode("utf-8", "replace").splitlines() if l.strip()][-15:]
+        except (OSError, TypeError):
+            pass
+        how = (wineboot_error if wineboot_error else
+               "it exited with %s" % wineboot_rc if wineboot_rc is not None else "it did not run")
+        die({"ok": False, "prefix": prefix, "steps": steps,
+             "reason": "Wine could not set up this prefix: `wineboot` wrote no registry (%s), so Wine is not "
+                       "starting here. Nothing else was installed into the prefix." % how,
+             "wine_output": tail, "log": wineboot_log if tail or wineboot_rc is not None else None,
+             "fix": "Run `WINEPREFIX=%s %s wineboot --init` to see Wine's full output." % (prefix, wine)},
+            EX_FAIL, args.json)
 
     # Microsoft's components BEFORE our DLLs: the ucrtbase shim forwards to ucrtbase_orig.dll.
     event(args, event="progress", stage="microsoft", pct=40,
