@@ -4647,6 +4647,38 @@ def ensure_photoshop_wintab(prefix):
     return done
 
 
+# Lightroom Classic takes its UI scale once, at launch, from the screen its window was last on, and ignores the message
+# Windows sends when a window moves to a screen of another scale. Measured 2026-10-21 on a 100% Cintiq beside a 175%
+# screen: a +message trace shows WM_DPICHANGED going straight to DefWindowProc, and the only scale query in a whole
+# run is substrate.dll's GetDpiForMonitor at launch. On Wayland the compositor, not the app, picks the screen a window
+# opens on, so Lightroom came up at 100% on the 175% screen (and the reverse) and kept the wrong scale when moved.
+# Windows gives such an app the right size on every screen with its "System" high-DPI override: the app draws at the
+# main screen's scale and the system scales its window for each screen. This is the same setting, in the place Windows
+# keeps it. With it, GetDpiForMonitor returns the main screen's dpi for every screen, and runtime 11.10-141 scales the
+# window per screen. On a single screen nothing changes. A Layers value the user already has for Lightroom is kept.
+LRC_LAYERS_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+LRC_LAYERS_NAME = "lightroom.exe"
+LRC_LAYERS_FLAGS = "~ HIGHDPIAWARE"
+
+
+def ensure_lightroom_system_dpi(wine, prefix):
+    """Give Lightroom Classic in `prefix` Windows' "System" high-DPI override (see LRC_LAYERS_FLAGS).
+
+    Returns "added", "kept" (a Layers value for lightroom.exe exists) or None (no Lightroom Classic, or user.reg
+    unreadable). Reads user.reg on disk; writes through the runtime's reg.exe (reg_set), which only new processes see.
+    """
+    if not os.path.isfile(os.path.join(prefix, "drive_c", "Program Files", "Adobe", "Adobe Lightroom Classic",
+                                       "Lightroom.exe")):
+        return None
+    values = _reg_section_values(os.path.join(prefix, "user.reg"), LRC_LAYERS_KEY)
+    if values is None:
+        return None
+    if any(name.lower() == LRC_LAYERS_NAME for name in values):   # Wine looks the exe up by file name only
+        return "kept"
+    reg_set(wine, prefix, "HKCU\\" + LRC_LAYERS_KEY, LRC_LAYERS_NAME, "REG_SZ", LRC_LAYERS_FLAGS)
+    return "added"
+
+
 def provision_photoshop_detection(wine, prefix):
     """Register the Uninstall key Lightroom Classic's PS detector requires.
 
@@ -5453,6 +5485,10 @@ def cmd_prefix_provision(args):
     except OSError as e:
         steps.append({"step": "ps_pen_wintab", "ok": False, "error": str(e)})
 
+    # 2b'''. Lightroom Classic: Windows' "System" high-DPI override, so it has the right size on every screen (see
+    # LRC_LAYERS_FLAGS). Launches repeat it for a Lightroom installed after this.
+    steps.append({"step": "lrc_system_dpi", "ok": True, "action": ensure_lightroom_system_dpi(wine, prefix)})
+
     event(args, event="progress", stage="lrc", pct=70, msg="registering the Lightroom → Photoshop detector key")
     # 2c. Lightroom Classic's "Edit in Photoshop" detector: register the dot-free
     # PHSP<major> Uninstall key so LrC's whole-string regex_match finds PS (see
@@ -5985,6 +6021,48 @@ NEUTRON_GATES = {
         "what": "find the window under the mouse at the scale of the monitor the mouse is on",
         "why": "runtime 11.10-139: on a 100% screen next to a 175% one, Photoshop's tool icons did not "
                "highlight on hover and an open menu did not follow the cursor along the menu bar.",
+    },
+    "create-target-dpi": {
+        "env": "NEUTRON_CREATE_TARGET_DPI", "default": True,
+        "what": "create a window at the scale of the monitor it is created on",
+        "why": "runtime 11.10-140: on a 100% screen next to a 175% one, Lightroom Classic's Export dialog was "
+               "placed past the edge of the desktop and never appeared.",
+    },
+    "dpichg-skip-unplaced": {
+        "env": "NEUTRON_DPICHG_SKIP_UNPLACED", "default": True,
+        "what": "do not report a scale change for a window's first placement",
+        "why": "runtime 11.10-140, as Windows does: a window that had never been sized was told its scale "
+               "changed as it was first placed.",
+    },
+    "normal-follows-monitor": {
+        "env": "NEUTRON_NORMAL_FOLLOWS_MONITOR", "default": True,
+        "what": "keep a maximized window's restore position on the monitor it was moved to",
+        "why": "runtime 11.10-141, as Windows does: a window maximized on a second screen restored onto the "
+               "first one.",
+    },
+    "surface-crop-dpi": {
+        "env": "NEUTRON_SURFACE_CROP_DPI", "default": True,
+        "what": "size a window's picture at the app's own scale on a screen of another scale",
+        "why": "runtime 11.10-141: Lightroom Classic on a 100% screen next to a 175% one was drawn as a "
+               "narrow strip of its window.",
+    },
+    "raw-window-monitor": {
+        "env": "NEUTRON_RAW_WINDOW_MONITOR", "default": True,
+        "what": "convert a window's size at the scale of the monitor it is mostly on",
+        "why": "runtime 11.10-141: a window maximized on a second screen of another scale could not be moved "
+               "to the other screen, and some never appeared.",
+    },
+    "attach-dest": {
+        "env": "NEUTRON_ATTACH_DEST", "default": True,
+        "what": "show a window at its full size as soon as its picture changes size",
+        "why": "runtime 11.10-141: a maximized window moved from a 100% screen back to a 175% one showed at "
+               "about 60% of its size until it was redrawn.",
+    },
+    "workarea-guard": {
+        "env": "NEUTRON_WORKAREA_GUARD", "default": True,
+        "what": "remember a screen's maximized height only from that screen's own windows",
+        "why": "runtime 11.10-141: moving a maximized window between screens saved the other screen's height, "
+               "so later maximized windows came out too short.",
     },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
@@ -6580,6 +6658,14 @@ def cmd_launch(args):
                 log("%s: pen set to WinTab (%s)" % (name, PS_WINTAB_LINE))
     except OSError as e:
         log("Photoshop pen setting not written (%s)" % e)
+
+    # Lightroom Classic's "System" high-DPI override (LRC_LAYERS_FLAGS), also for a Lightroom installed after
+    # provisioning. Best-effort; never blocks.
+    try:
+        if ensure_lightroom_system_dpi(wine, prefix) == "added":
+            log("Lightroom Classic: System high-DPI scaling set (%s)" % LRC_LAYERS_FLAGS)
+    except Exception as e:
+        log("Lightroom Classic scaling setting not written (%s)" % e)
 
     # Each installed app's own settings, for when THIS app starts another one (Dynamic Link, Edit in
     # Photoshop). Best-effort: without the file a started app inherits this one's settings, as before.
