@@ -8593,6 +8593,10 @@ def cmd_doctor(args):
         for c in _runtime_integrity_checks(_wine):
             check(c[0], c[1], c[2])
 
+    # The 32-bit C library: without it Wine does not start at all (GitHub Neutron#29, see LIB32_LOADER).
+    _lib32 = lib32_problem()
+    check("lib32", not _lib32, _lib32 or "the 32-bit C library is installed (/%s)" % LIB32_LOADER)
+
     # ntsync: speed, not correctness -- reported, never a failure.
     _nts = ntsync_status()
     check("ntsync", True, NTSYNC_DETAIL[_nts])
@@ -9188,6 +9192,43 @@ def _enable_ntsync(as_json, assume_yes):
     return ntsync_status()
 
 
+# GitHub Neutron#29: Wine cannot start without the 32-bit C library. Its 32-bit side needs the 32-bit program loader,
+# and without it `wine wineboot` stops at once with "/lib/ld-linux.so.2: could not open" and no prefix is made (measured
+# 2026-10-21 with the 32-bit libraries hidden: exit 1, no prefix; with only Arch's lib32-glibc: a complete prefix). The
+# requirements list "32-bit (multilib) system and graphics libraries", but nothing checked, and a VM without them got a
+# prefix that could never launch. This is the path the kernel asks for (Debian's multiarch, Fedora's i686 and Arch's
+# lib32 packages all provide it).
+LIB32_LOADER = "lib/ld-linux.so.2"
+
+
+def lib32_install_command(root="/"):
+    """The command that installs the 32-bit C library on this distribution, as text for a message, or None."""
+    osr = os_release(root)
+    fam = _distro_family(osr)
+    if fam == "arch":
+        conf = _read_text(os.path.join(root, "etc/pacman.conf")) or ""
+        if not re.search(r"(?m)^\s*\[multilib\]", conf):
+            return "enable the [multilib] repository in /etc/pacman.conf, then run `sudo pacman -Sy lib32-glibc`"
+        return "`sudo pacman -S lib32-glibc`"
+    if fam == "fedora":
+        return ("`rpm-ostree install glibc.i686`" if os.path.exists(os.path.join(root, "run/ostree-booted"))
+                else "`sudo dnf install glibc.i686`")
+    if fam == "opensuse":
+        return "`sudo zypper install glibc-32bit`"
+    if fam == "debian":
+        return "`sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386`"
+    return None
+
+
+def lib32_problem(root="/"):
+    """None when the 32-bit C library is there, else the sentence that says what to install."""
+    if os.path.exists(os.path.join(root, LIB32_LOADER)):
+        return None
+    how = lib32_install_command(root) or "your distribution's 32-bit glibc package (multilib)"
+    return ("the 32-bit C library is missing (/%s), so Wine cannot start: Adobe's apps start 32-bit helper "
+            "processes. Install it: %s" % (LIB32_LOADER, how))
+
+
 def _setup_checks():
     """Problems that stop setup, and warnings that don't."""
     problems, warnings = [], []
@@ -9200,6 +9241,9 @@ def _setup_checks():
                             "(Ubuntu 24.04, Fedora 40, current Arch, or newer)")
     except (ValueError, OSError, IndexError):
         pass
+    _lib32 = lib32_problem()
+    if _lib32:
+        problems.append(_lib32)
     if not have("cabextract"):
         problems.append("cabextract is missing (it unpacks Microsoft's installers). Install it: "
                         "`sudo pacman -S cabextract`, `sudo apt install cabextract`, "
