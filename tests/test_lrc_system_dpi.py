@@ -37,6 +37,8 @@ LAYERS = "[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\AppCompatFla
 class LightroomSystemDpi(unittest.TestCase):
     def setUp(self):
         self.prefix = tempfile.mkdtemp(prefix="neutron-lrcdpi-")
+        self.runtimes = tempfile.mkdtemp(prefix="neutron-lrcdpi-rt-")
+        self.wine = self.runtime("11.10-141")
         self.writes = []
         self.patch = mock.patch.object(N, "reg_set", lambda wine, prefix, key, name, vtype, data:
                                        self.writes.append((prefix, key, name, vtype, data)))
@@ -45,6 +47,16 @@ class LightroomSystemDpi(unittest.TestCase):
     def tearDown(self):
         self.patch.stop()
         shutil.rmtree(self.prefix)
+        shutil.rmtree(self.runtimes)
+
+    def runtime(self, version, stamp=True):
+        root = os.path.join(self.runtimes, "neutron-wine-" + version)
+        os.makedirs(os.path.join(root, "bin"))
+        open(os.path.join(root, "bin", "wine"), "w").close()
+        if stamp:
+            with open(os.path.join(root, "NEUTRON_WINE_VERSION"), "w") as f:
+                f.write(version + "\n")
+        return os.path.join(root, "bin", "wine")
 
     def install(self):
         d = os.path.join(self.prefix, "drive_c", "Program Files", "Adobe", "Adobe Lightroom Classic")
@@ -57,13 +69,13 @@ class LightroomSystemDpi(unittest.TestCase):
 
     def test_no_lightroom_writes_nothing(self):
         self.user_reg()
-        self.assertIsNone(N.ensure_lightroom_system_dpi("/wine", self.prefix))
+        self.assertIsNone(N.ensure_lightroom_system_dpi(self.wine, self.prefix))
         self.assertEqual(self.writes, [])
 
     def test_lightroom_gets_the_value(self):
         self.install()
         self.user_reg()
-        self.assertEqual(N.ensure_lightroom_system_dpi("/wine", self.prefix), "added")
+        self.assertEqual(N.ensure_lightroom_system_dpi(self.wine, self.prefix), "added")
         self.assertEqual(self.writes, [(self.prefix,
                                         "HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers",
                                         "lightroom.exe", "REG_SZ", "~ HIGHDPIAWARE")])
@@ -71,25 +83,47 @@ class LightroomSystemDpi(unittest.TestCase):
     def test_other_apps_layers_do_not_count(self):
         self.install()
         self.user_reg(LAYERS + '"photoshop.exe"="~ RUNASADMIN"\n\n')
-        self.assertEqual(N.ensure_lightroom_system_dpi("/wine", self.prefix), "added")
+        self.assertEqual(N.ensure_lightroom_system_dpi(self.wine, self.prefix), "added")
         self.assertEqual(len(self.writes), 1)
 
     def test_users_own_value_is_kept(self):
         self.install()
         self.user_reg(LAYERS + '"Lightroom.exe"="~ DPIUNAWARE"\n\n')
-        self.assertEqual(N.ensure_lightroom_system_dpi("/wine", self.prefix), "kept")
+        self.assertEqual(N.ensure_lightroom_system_dpi(self.wine, self.prefix), "kept")
         self.assertEqual(self.writes, [])
 
     def test_already_set_is_not_rewritten(self):
         self.install()
         self.user_reg(LAYERS + '"lightroom.exe"="~ HIGHDPIAWARE"\n\n')
-        self.assertEqual(N.ensure_lightroom_system_dpi("/wine", self.prefix), "kept")
+        self.assertEqual(N.ensure_lightroom_system_dpi(self.wine, self.prefix), "kept")
         self.assertEqual(self.writes, [])
 
     def test_unreadable_user_reg_writes_nothing(self):
         self.install()
-        self.assertIsNone(N.ensure_lightroom_system_dpi("/wine", self.prefix))
+        self.assertIsNone(N.ensure_lightroom_system_dpi(self.wine, self.prefix))
         self.assertEqual(self.writes, [])
+
+    def test_older_runtime_writes_nothing(self):
+        # runtimes before 11.10-141 drew a System-scaled window on a screen of another scale as a strip, or never
+        # showed it: the setting must wait for the prefix to run 141
+        self.install()
+        self.user_reg()
+        for version in ("11.10-136", "11.10-140"):
+            self.assertEqual(N.ensure_lightroom_system_dpi(self.runtime(version), self.prefix), "old-runtime")
+        self.assertEqual(self.writes, [])
+
+    def test_unknown_runtime_writes_nothing(self):
+        self.install()
+        self.user_reg()
+        dev = os.path.join(self.runtimes, "build-tree", "bin")
+        os.makedirs(dev)
+        open(os.path.join(dev, "wine"), "w").close()
+        self.assertEqual(N.ensure_lightroom_system_dpi(os.path.join(dev, "wine"), self.prefix), "old-runtime")
+        self.assertEqual(self.writes, [])
+
+    def test_runtime_version_from_directory_name(self):
+        self.assertEqual(N.runtime_version_of(self.runtime("11.10-142", stamp=False)), (11, 10, 142))
+        self.assertEqual(N.runtime_version_of(self.wine), (11, 10, 141))
 
     def test_launch_and_provision_both_apply_it(self):
         with open(_CLI) as f:

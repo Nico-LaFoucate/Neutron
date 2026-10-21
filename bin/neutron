@@ -4656,20 +4656,41 @@ def ensure_photoshop_wintab(prefix):
 # main screen's scale and the system scales its window for each screen. This is the same setting, in the place Windows
 # keeps it. With it, GetDpiForMonitor returns the main screen's dpi for every screen, and runtime 11.10-141 scales the
 # window per screen. On a single screen nothing changes. A Layers value the user already has for Lightroom is kept.
+# ⛔ Only with runtime 11.10-141 or newer: older runtimes drew such a window on a screen of another scale as a strip of
+# itself, or never showed it (runtime 141's mixed-dpi patch), so the setting would break Lightroom on two screens there.
 LRC_LAYERS_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
 LRC_LAYERS_NAME = "lightroom.exe"
 LRC_LAYERS_FLAGS = "~ HIGHDPIAWARE"
+LRC_LAYERS_MIN_RUNTIME = (11, 10, 141)
+
+
+def runtime_version_of(wine):
+    """(major, minor, build) of the Neutron runtime `wine` belongs to, from its NEUTRON_WINE_VERSION stamp, else its
+    directory name (neutron-wine-11.10-141); None for anything else (a dev tree, system wine)."""
+    root = os.path.dirname(os.path.dirname(os.path.realpath(wine)))
+    try:
+        with open(os.path.join(root, "NEUTRON_WINE_VERSION"), encoding="utf-8") as f:
+            ver = f.read().strip()
+    except OSError:
+        name = os.path.basename(root)
+        ver = name[len("neutron-wine-"):] if name.startswith("neutron-wine-") else ""
+    m = re.match(r"^(\d+)\.(\d+)-(\d+)$", ver)
+    return tuple(int(g) for g in m.groups()) if m else None
 
 
 def ensure_lightroom_system_dpi(wine, prefix):
     """Give Lightroom Classic in `prefix` Windows' "System" high-DPI override (see LRC_LAYERS_FLAGS).
 
-    Returns "added", "kept" (a Layers value for lightroom.exe exists) or None (no Lightroom Classic, or user.reg
-    unreadable). Reads user.reg on disk; writes through the runtime's reg.exe (reg_set), which only new processes see.
+    Returns "added", "kept" (a Layers value for lightroom.exe exists), "old-runtime" (`wine` is older than
+    LRC_LAYERS_MIN_RUNTIME or not a numbered release) or None (no Lightroom Classic, or user.reg unreadable). Reads
+    user.reg on disk; writes through the runtime's reg.exe (reg_set), which only new processes see.
     """
     if not os.path.isfile(os.path.join(prefix, "drive_c", "Program Files", "Adobe", "Adobe Lightroom Classic",
                                        "Lightroom.exe")):
         return None
+    version = runtime_version_of(wine)
+    if not version or version < LRC_LAYERS_MIN_RUNTIME:
+        return "old-runtime"
     values = _reg_section_values(os.path.join(prefix, "user.reg"), LRC_LAYERS_KEY)
     if values is None:
         return None
