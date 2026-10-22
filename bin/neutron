@@ -6118,6 +6118,31 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-141: moving a maximized window between screens saved the other screen's height, "
                "so later maximized windows came out too short.",
     },
+    "pen-buttons": {
+        "env": "NEUTRON_PEN_BUTTONS", "default": True,
+        "what": "send a pen's side buttons to the app as right and middle clicks",
+        "why": "runtime 11.10-142 (neutron-wine#2): Photoshop never saw a pen's side buttons, so they could not "
+               "open the brush picker. Turn it off if a pen button clicks when it should not.",
+    },
+    "smooth-scroll": {
+        "env": "NEUTRON_SMOOTH_SCROLL", "default": True,
+        "what": "turn touchpad and TrackPoint scrolling into mouse-wheel scrolling",
+        "why": "runtime 11.10-143 (Neutron#31): scrolling with a touchpad or a TrackPoint did nothing in "
+               "Premiere and Photoshop; only a mouse wheel worked. Turn it off if scrolling jumps or doubles.",
+    },
+    "msxml-embedded-xmldecl": {
+        "env": "NEUTRON_MSXML_EMBEDDED_XMLDECL", "default": True,
+        "what": "treat an <?xml?> declaration later in an XML document the way Microsoft's msxml3 does",
+        "why": "runtime 11.10-144: Wine rejected it in every kind of document; Microsoft.XMLDOM keeps it. Also "
+               "makes Msxml2.FreeThreadedDOMDocument behave like Msxml2.DOMDocument. No app symptom is known; "
+               "turn it off if an app's XML stops loading.",
+    },
+    "big-endian-pcm": {
+        "env": "NEUTRON_BIG_ENDIAN_PCM", "default": True,
+        "what": "open video whose sound is big-endian PCM (Sony XAVC S, many .mov files) as ordinary PCM",
+        "why": "runtime 11.10-144: such files failed to open through Windows' media playback APIs, picture "
+               "included. Turn it off if a clip's sound comes out as noise.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
