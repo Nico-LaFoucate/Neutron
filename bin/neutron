@@ -6143,6 +6143,54 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-144: such files failed to open through Windows' media playback APIs, picture "
                "included. Turn it off if a clip's sound comes out as noise.",
     },
+    "caption-settext": {
+        "env": "NEUTRON_CAPTION_BUFFERED", "default": True,
+        "what": "repaint only the title bar when an app changes its window title",
+        "why": "runtime 11.10-145: Premiere's title bar flashed blank each time an in or out point was set. "
+               "Turn it off if a title bar shows an old title or draws over the app.",
+    },
+    "copybits-skip-gpu": {
+        "env": "NEUTRON_COPY_SKIP_GPU", "default": True,
+        "what": "don't copy old pixels along when a window the GPU draws moves",
+        "why": "runtime 11.10-146: in Premiere's media bin, another thumbnail's picture flickered at the "
+               "wrong place on hover. Turn it off if a panel leaves a trail when it moves.",
+    },
+    "alt-repeat": {
+        "env": "NEUTRON_ALT_REPEAT", "default": True,
+        "what": "count a held Alt key as one press, as Windows does",
+        "why": "runtime 11.10-147 (Neutron#35): whether releasing Alt opened the menu bar depended on how "
+               "long it was held. Turn it off if Alt stops opening the menu bar.",
+    },
+    "capture-keymenu": {
+        "env": "NEUTRON_CAPTURE_KEYMENU", "default": True,
+        "what": "don't open the menu bar from the keyboard while the app holds the mouse, as Windows does",
+        "why": "runtime 11.10-147 (Neutron#35): Alt+wheel zoom in Premiere opened the menu bar. Turn it off "
+               "if Alt, F10 or Alt+Space stops opening a menu.",
+    },
+    "caption-clip": {
+        "env": "NEUTRON_CAPTION_CLIP", "default": True,
+        "what": "keep the title-bar repaint out of an app's own title area",
+        "why": "runtime 11.10-147: on 145 and 146, Photoshop 2026's menu bar disappeared under the document "
+               "title after each new document or zoom step. Only meaningful with caption-settext on.",
+    },
+    "hwheel-coords": {
+        "env": "NEUTRON_HWHEEL_COORDS", "default": True,
+        "what": "give sideways scrolling the pointer's screen position, as vertical scrolling has",
+        "why": "runtime 11.10-148 (Neutron#31): sideways touchpad scrolling in Premiere was slow and uneven. "
+               "Turn it off if sideways scrolling reaches the wrong panel.",
+    },
+    "hwheel-merge": {
+        "env": "NEUTRON_HWHEEL_MERGE", "default": True,
+        "what": "combine waiting sideways scroll steps when an app falls behind, as Windows does",
+        "why": "runtime 11.10-149 (Neutron#31): fast sideways swipes piled up in Premiere and played back "
+               "after the swipe. Read when the prefix's Wine starts, so close every app in the prefix first.",
+    },
+    "d2d-flush-hold": {
+        "env": "NEUTRON_D2D_FLUSH_HOLD", "default": True,
+        "what": "show everything a panel draws when it finishes drawing, not part of it midway",
+        "why": "runtime 11.10-150: a maximized After Effects panel showed a black strip under its tab row. "
+               "Turn it off if a panel updates later than it used to.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
