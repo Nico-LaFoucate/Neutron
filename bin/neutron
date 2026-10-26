@@ -9242,9 +9242,11 @@ def report_desktop():
         name = _run_text(["sway", "--version"]) or "sway"
     else:
         name = raw or "unknown desktop"
-    session = "Wayland" if session_is_wayland() else (os.environ.get("XDG_SESSION_TYPE")
-                                                      or "no graphical session")
-    return "%s on %s" % (name, session.capitalize() if session.islower() else session)
+    if session_is_wayland():
+        return name + " on Wayland"
+    t = os.environ.get("XDG_SESSION_TYPE")
+    return "%s, %s" % (name, {"x11": "on X11", "tty": "in a text console"}.get(t, "session type " + t)
+                       if t else "no graphical session found")
 
 
 def report_gpu(gpus=None):
