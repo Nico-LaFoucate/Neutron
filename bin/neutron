@@ -5446,6 +5446,10 @@ def cmd_prefix_provision(args):
         env["WINEPREFIX"] = prefix
         env.setdefault("DISPLAY", ":0")
         env["WINEDLLOVERRIDES"] = "mscoree,mshtml="   # suppress the Mono/Gecko prompt
+        # No "The Wine configuration in ... is being updated" window: `-u` forces the update, so Wine showed
+        # it on EVERY provision (Mud Hut provisions after each install and update). Runtime 11.10-152+
+        # honors this (patch 74, Proton's variable); older runtimes ignore it.
+        env["WINEBOOT_HIDE_DIALOG"] = "1"
         # -r: without it wineboot also runs the Windows "Run" keys and Startup folder
         # (wineboot.c: `if (!init && !restart) ProcessRunKeys(... L"Run" ...)`), i.e. every
         # program set to start at login. Adobe's add-ons register CCXProcess there; it starts
