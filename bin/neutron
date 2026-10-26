@@ -9464,8 +9464,8 @@ def _install_zxp(prefix, path):
     if st is not None and (st[0] or st[1]):
         shutil.rmtree(tmp, ignore_errors=True)
         return {"ok": False, "id": bid, "signature": "damaged",
-                "reason": "the package's signed files do not match (%d missing, %d changed); nothing "
-                          "was changed" % (len(st[0]), len(st[1]))}
+                "reason": "the package is damaged (%d of its signed files missing, %d changed), so nothing "
+                          "was changed. Download it again." % (len(st[0]), len(st[1]))}
     out["replaced"] = os.path.lexists(final)
     if out["replaced"]:
         old = os.path.join(dest_root, ".neutron-old-" + bid)
@@ -9678,7 +9678,7 @@ def cmd_plugins_list(args):
         print("  %s%s" % (e["name"], " %s" % e["version"] if e.get("version") else ""))
     print("Shared plugins (After Effects, Premiere Pro, Media Encoder): %s" % (", ".join(inv["shared"]) or "(none)"))
     print("VST3 audio plugins: %s" % (", ".join(inv["vst3"]) or "(none)"))
-    print("Programs installed by vendor installers:")
+    print("Other programs in this prefix:")
     for p in inv["programs"] or [{"name": "(none)"}]:
         print("  %s%s" % (p["name"], " %s" % p["version"] if p.get("version") else ""))
     return EX_OK
