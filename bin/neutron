@@ -6426,7 +6426,8 @@ def cmd_runtime_prune(args):
                      for r in rs if r["used_by"]]}
     if not unused:
         emit({"ok": True, "removed": [], "freed_bytes": 0, **plan}, args.json) if args.json else \
-            print("[neutron] Every installed runtime is in use; nothing to remove.")
+            print("[neutron] Every installed runtime is in use; nothing to remove." if rs else
+                  "[neutron] No runtimes installed in %s." % NEUTRON_RUNTIMES_DIR)
         return EX_OK
     if not args.yes:
         if args.json or not sys.stdin.isatty():
