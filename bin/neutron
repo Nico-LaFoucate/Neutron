@@ -6297,6 +6297,169 @@ def cmd_gates(args):
     return EX_OK
 
 
+def _gb(n):
+    return "%.1f GB" % (n / 1e9) if n >= 1e8 else "%d MB" % round(n / 1e6)
+
+
+def _tree_bytes(path):
+    """Disk space a directory tree takes (allocated blocks, so sparse files count as stored)."""
+    total = 0
+    for root, dirs, files in os.walk(path):
+        for n in dirs + files:
+            try:
+                total += os.lstat(os.path.join(root, n)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def _processes_under(root):
+    """Pids whose executable lives under `root` (wine, wineserver and every app run from it)."""
+    root = os.path.realpath(root) + os.sep
+    pids = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                if os.path.realpath("/proc/%s/exe" % d).startswith(root):
+                    pids.append(int(d))
+            except OSError:
+                pass
+    return pids
+
+
+def runtime_usage():
+    """Every installed runtime and what still needs it: {version, path, bytes, used_by, running}.
+
+    A runtime is kept when it is the newest installed (what a launch uses when nothing pins one),
+    when $NEUTRON_WINE_VERSION names it, when a Neutron menu entry pins it, when it is the newest
+    runtime a prefix's stamp matches (what Mud Hut and `prefix provision` pick for that prefix), or
+    while anything runs from it. Folders that are not a numeric release (dev builds) are listed and
+    never removed."""
+    versions = _installed_runtime_versions()
+    menu, stamped = {}, {}
+    seen = set()
+    for p in neutron_prefixes() + discover_prefixes():
+        p = os.path.realpath(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        for v in _menu_pins(p):
+            menu.setdefault(v, []).append(p)
+        stamp = _prefix_stamp(p)
+        matching = [v for v in versions if stamp is not None and v in _runtimes_matching_stamp(stamp)]
+        if matching and p not in menu.get(matching[0], []):
+            stamped.setdefault(matching[0], []).append(p)
+    home = lambda p: "~" + p[len(HOME):] if p.startswith(HOME + os.sep) else p
+    keep = {}
+    if versions:
+        keep.setdefault(versions[0], []).append("newest")
+    env = os.environ.get("NEUTRON_WINE_VERSION")
+    if env:
+        keep.setdefault(env, []).append("$NEUTRON_WINE_VERSION")
+    for v, ps in menu.items():
+        keep.setdefault(v, []).append("menu entries for " + ", ".join(map(home, ps)))
+    for v, ps in stamped.items():
+        keep.setdefault(v, []).append("prefix%s %s" % ("es" if len(ps) > 1 else "", ", ".join(map(home, ps))))
+    out = []
+    try:
+        names = sorted(os.listdir(NEUTRON_RUNTIMES_DIR))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(NEUTRON_RUNTIMES_DIR, name)
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
+        ver = name[len("neutron-wine-"):] if name.startswith("neutron-wine-") else None
+        r = {"version": ver, "name": name, "path": path, "bytes": _tree_bytes(path),
+             "used_by": list(keep.get(ver, [])), "running": bool(_processes_under(path))}
+        if name.startswith(".dl-"):
+            r["leftover_download"] = True       # an install that never finished (cmd_runtime_install)
+            r["version"] = None
+            if time.time() - os.path.getmtime(path) < 86400:
+                r["used_by"].append("a download from the last 24 hours, maybe still running")
+        elif not (ver and ver in versions):
+            r["used_by"].append("not a released build; left alone")
+        if r["running"]:
+            r["used_by"].append("running now")
+        out.append(r)
+    out.sort(key=lambda r: [int(x) for x in re.findall(r"\d+", r["version"] or "")] or [-1], reverse=True)
+    return out
+
+
+def _runtime_line(r, width=12):
+    why = "; ".join(r["used_by"]) if r["used_by"] else "not used"
+    return "  %-*s %8s  %s" % (width, r["version"] or r["name"], _gb(r["bytes"]), why)
+
+
+def _runtime_width(rs):
+    return max([len(r["version"] or r["name"]) for r in rs] + [8])
+
+
+def cmd_runtime_list(args):
+    """`neutron runtime list`: the installed runtimes, their size, and what still needs each."""
+    rs = runtime_usage()
+    unused = [r for r in rs if not r["used_by"]]
+    out = {"ok": True, "runtimes_dir": NEUTRON_RUNTIMES_DIR, "runtimes": rs,
+           "unused_bytes": sum(r["bytes"] for r in unused)}
+    if args.json:
+        emit(out, True)
+        return EX_OK
+    if not rs:
+        print("No runtimes installed in %s." % NEUTRON_RUNTIMES_DIR)
+        return EX_OK
+    print("Runtimes in %s:" % NEUTRON_RUNTIMES_DIR)
+    w = _runtime_width(rs)
+    for r in rs:
+        print(_runtime_line(r, w))
+    print("Total %s." % _gb(sum(r["bytes"] for r in rs)) + (
+        " `neutron runtime prune` removes the %d not used (%s)." % (len(unused), _gb(out["unused_bytes"]))
+        if unused else " All of them are in use."))
+    return EX_OK
+
+
+def cmd_runtime_prune(args):
+    """`neutron runtime prune`: remove the runtimes nothing uses (see runtime_usage)."""
+    rs = runtime_usage()
+    unused = [r for r in rs if not r["used_by"]]
+    plan = {"remove": [r["path"] for r in unused], "bytes": sum(r["bytes"] for r in unused),
+            "kept": [{"version": r["version"] or r["name"], "used_by": r["used_by"]}
+                     for r in rs if r["used_by"]]}
+    if not unused:
+        emit({"ok": True, "removed": [], "freed_bytes": 0, **plan}, args.json) if args.json else \
+            print("[neutron] Every installed runtime is in use; nothing to remove.")
+        return EX_OK
+    if not args.yes:
+        if args.json or not sys.stdin.isatty():
+            die({"ok": False, "reason": "pass --yes to remove these runtimes", **plan}, EX_FAIL, args.json)
+        print("[neutron] Not used by any prefix, menu entry or running app:")
+        for r in unused:
+            print(_runtime_line(r, _runtime_width(unused)))
+        if input("[neutron] Remove them and free %s? [y/N] " % _gb(plan["bytes"])).strip().lower() \
+                not in ("y", "yes"):
+            return EX_FAIL
+    removed, failed, freed = [], [], 0
+    for r in unused:
+        if _processes_under(r["path"]):          # started since we looked
+            failed.append("%s: in use" % r["path"])
+            continue
+        try:
+            shutil.rmtree(r["path"])
+            removed.append(r["path"])
+            freed += r["bytes"]
+        except OSError as e:
+            failed.append("%s: %s" % (r["path"], e))
+    out = {"ok": not failed, "removed": removed, "failed": failed, "freed_bytes": freed,
+           "kept": plan["kept"]}
+    if args.json:
+        emit(out, True)
+    else:
+        print("[neutron] Removed %d runtime%s, freed %s." % (len(removed), "" if len(removed) == 1 else "s",
+                                                           _gb(freed)))
+        for f in failed:
+            print("[neutron] Could not remove " + f)
+    return EX_OK if not failed else EX_FAIL
+
+
 def cmd_runtime_which(args):
     """The wine this CLI would use, and the version tag that goes with it.
 
@@ -9983,16 +10146,25 @@ def cmd_uninstall(args):
     the `neutron`/`mudhut` commands. Prefixes -- the Adobe apps and their settings -- only when
     asked (a separate question; default keep). ntsync stays enabled."""
     owned = [os.path.join(NEUTRON_DATA_DIR, d) for d in
-             ("runtimes", "microsoft", "bin", "collider", "accc", "logs", "icon-stamps",
+             ("runtimes", "microsoft", "bin", "collider", "accc", "mudhut-tools", "logs", "icon-stamps",
               "prefs-check", "superseded-desktop-entries")]
     owned.append(NEUTRON_INSTALLED_JSON)
     owned.append(NEUTRON_PREFIXES_JSON)
     owned.append(os.path.join(CACHE_HOME, "neutron"))
+    # Mud Hut's downloads (one folder per app version, several GB each), feed and tested-list
+    # caches. C17 lists them; uninstall used to leave them behind.
+    owned.append(os.path.join(CACHE_HOME, "mudhut"))
     owned.append(collider_config_dir())                                    # Collider's settings
     owned.append(os.path.join(os.path.dirname(APPS_DIR), "kwin", "scripts", KWIN_SCRIPT_ID))
     # Only Neutron's own prefixes are offered for deletion (see neutron_prefixes); but never delete
     # a directory that holds ANY prefix, whatever it is called.
     prefixes = neutron_prefixes()
+    # Not under a running install or update: its downloads and its tools are about to go.
+    busy = [(p, mudhut_busy(p)) for p in prefixes]
+    busy = [(p, b) for p, b in busy if b]
+    if busy:
+        die({"ok": False, "reason": "Mud Hut is working in %s. Wait for it to finish, then uninstall."
+             % ", ".join(p for p, _ in busy), "mudhut": [b for _, b in busy]}, EX_RUNNING, args.json)
     keep = [d for d in owned if any(os.path.realpath(p).startswith(os.path.realpath(d) + os.sep)
                                     for p in discover_prefixes() + prefixes)]
     remove = [d for d in owned if d not in keep and os.path.lexists(d)]
@@ -10265,6 +10437,13 @@ def build_parser():
     ri.add_argument("--force", action="store_true",
                     help="reinstall even if this version is already present")
     ri.set_defaults(func=cmd_runtime_install)
+
+    rl = rsub.add_parser("list", help="the installed runtimes, their size, and what still needs each")
+    rl.set_defaults(func=cmd_runtime_list)
+
+    rp = rsub.add_parser("prune", help="remove the runtimes no prefix, menu entry or running app uses")
+    rp.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    rp.set_defaults(func=cmd_runtime_prune)
 
     rw = rsub.add_parser("which",
                          help="the wine this CLI would use (so other tools can agree with it)")
