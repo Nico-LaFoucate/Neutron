@@ -41,40 +41,11 @@ body:
       description: What you did, what you expected, and what happened instead. For anything visual, a screenshot or screen recording helps.
     validations:
       required: true
-  - type: input
-    id: distro
-    attributes:
-      label: Distribution
-      placeholder: e.g. CachyOS, Ubuntu 24.04, Fedora 40
-    validations:
-      required: true
-  - type: input
-    id: desktop
-    attributes:
-      label: Desktop and session
-      placeholder: e.g. KDE Plasma on Wayland
-    validations:
-      required: true
-  - type: input
-    id: gpu
-    attributes:
-      label: GPU and driver
-      placeholder: e.g. NVIDIA RTX 3080, nvidia-open
-    validations:
-      required: true
   - type: textarea
-    id: neutron-version
+    id: neutron-report
     attributes:
-      label: neutron --version
-      description: Run `neutron --version` and paste everything it prints.
-      render: text
-    validations:
-      required: true
-  - type: textarea
-    id: neutron-doctor
-    attributes:
-      label: neutron doctor
-      description: Run `neutron doctor --prefix <your prefix>` and paste everything it prints. Your prefix is the folder that contains `drive_c`; Collider shows it under Prefixes. You can replace your user name in any paths.
+      label: neutron report
+      description: Run `neutron report` and paste everything it prints. If the problem is in one app, run `neutron report --app <app>` instead (for example `--app premiere`), so the log at the end is that app's. It replaces your user name, home folder and sign-in details with placeholders; read it before you post. On a Neutron older than 1.0.0-beta.27, paste what `neutron --version` and `neutron doctor --prefix <your prefix>` print instead.
       render: text
     validations:
       required: true

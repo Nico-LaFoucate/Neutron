@@ -260,7 +260,7 @@ Documentation, known issues and guides live on the wiki at
 
 Report problems with launching and running the apps, and with the `neutron` CLI, on this
 repository's [Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose). The form asks for
-your `neutron --version` and `neutron doctor` output. Collider, Mud Hut and neutron-wine each have
+the output of `neutron report`. Collider, Mud Hut and neutron-wine each have
 their own Issues for problems with that piece. Questions go to
 [Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions). Report security problems
 privately: see [`SECURITY.md`](SECURITY.md).
