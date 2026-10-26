@@ -128,6 +128,18 @@ class Plugins(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(mc, "Effect.aex")))
         self.assertTrue(os.path.isfile(os.path.join(mc, "VendorFX", "sub", "Fx.aex")))
 
+    def test_vst3_file_and_bundle_go_to_common_vst3(self):
+        single = self.file("Single.vst3")
+        bundle = os.path.join(self.files, "Pro-Q.vst3")
+        os.makedirs(os.path.join(bundle, "Contents", "x86_64-win"))
+        open(os.path.join(bundle, "Contents", "x86_64-win", "Pro-Q.vst3"), "w").close()
+        rc, out = self.install(single, bundle)
+        self.assertEqual(rc, 0, out)
+        vst3 = self.drive("Program Files", "Common Files", "VST3")
+        self.assertTrue(os.path.isfile(os.path.join(vst3, "Single.vst3")))
+        self.assertTrue(os.path.isfile(os.path.join(vst3, "Pro-Q.vst3", "Contents", "x86_64-win", "Pro-Q.vst3")))
+        self.assertEqual(self.cli.plugins_inventory(self.prefix)["vst3"], ["Pro-Q.vst3", "Single.vst3"])
+
     def test_replacing_keeps_the_old_file_for_a_running_app(self):
         aex = self.file("Effect.aex", "new")
         mc = self.drive("Program Files", "Adobe", "Common", "Plug-ins", "7.0", "MediaCore")
