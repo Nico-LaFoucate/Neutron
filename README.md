@@ -214,6 +214,7 @@ put `--json` before the command: `neutron --json doctor --prefix <path>`.
 | `neutron prefix info <path>` | Report the paths and state Collider needs. |
 | `neutron apps --prefix <path>` | List apps and install status in a prefix. |
 | `neutron doctor --prefix <path>` | Health-check the prefix and stack. |
+| `neutron report` | Print everything a bug report needs: distribution, desktop, GPU, versions, `doctor` for each prefix, the display scale and the end of the newest app log. Your user name, home folder, computer name, email addresses and sign-in tokens are replaced with placeholders. |
 | `neutron teardown [--app <id>]` | Close one app, or the whole prefix, cleanly — apps save their preferences, and Adobe's orphaned daemons are swept so they can't wedge the next launch. |
 | `neutron display` | Show the display scale Neutron will use, and whether it is one Adobe's UI lays out cleanly. A scale set in Collider's Preferences applies to every launch, including the app menu and desktop icons. |
 | `neutron runtime install --version <v>` | Install a specific [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) version (e.g. a pre-release), verified against its sha256. |

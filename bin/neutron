@@ -26,6 +26,7 @@ import subprocess
 import sys
 import glob
 import re
+import shlex
 import signal
 import struct
 import time
@@ -1352,6 +1353,71 @@ def _recorded_prefixes():
         return []
 
 
+# The Desktop Entry Specification's Exec quoting. An argument holding a reserved character (a space
+# among them) goes in double quotes, with `"`, `` ` ``, `$` and `\` escaped by a backslash; `%` is a
+# field code and is written `%%`. Exec is also a string value, so each backslash is written twice in
+# the file. A prefix path with a space used to be written bare: the menu ran `--prefix /home/a` and
+# opened `b` as a file.
+_DESKTOP_EXEC_RESERVED = set(" \t\n\"'\\><~|&;$*?#()`")
+
+
+def _sh(path):
+    """A path as a command a user can paste into their shell (bash, zsh or fish)."""
+    return shlex.quote(path)
+
+
+def desktop_exec_arg(s):
+    """One Exec argument, quoted when the spec requires it."""
+    s = s.replace("%", "%%")
+    if any(c in _DESKTOP_EXEC_RESERVED for c in s):
+        s = '"' + re.sub(r'(["`$\\])', r"\\\1", s) + '"'
+    return s.replace("\\", "\\\\")
+
+
+def desktop_exec_args(value):
+    """The arguments of an Exec value (the text after `Exec=`), unquoted as a desktop would.
+    Not shlex: inside double quotes it leaves `\\$` and `` \\` `` escaped, and the spec does not."""
+    value = re.sub(r"\\(.)", lambda m: {"s": " ", "n": "\n", "t": "\t", "r": "\r"}.get(
+        m.group(1), m.group(1) if m.group(1) == "\\" else "\\" + m.group(1)), value.rstrip("\n"))
+    toks, cur, quoted, started, i = [], [], False, False, 0
+    while i < len(value):
+        c = value[i]
+        if quoted:
+            if c == "\\" and value[i + 1:i + 2] in ('"', "`", "$", "\\"):
+                cur.append(value[i + 1])
+                i += 1
+            elif c == '"':
+                quoted = False
+            else:
+                cur.append(c)
+        elif c == '"':
+            quoted = started = True
+        elif c in " \t\n":
+            if cur or started:
+                toks.append("".join(cur))
+            cur, started = [], False
+        else:
+            cur.append(c)
+        i += 1
+    if cur or started:
+        toks.append("".join(cur))
+    return [t.replace("%%", "%") for t in toks]
+
+
+def _exec_prefixes(entry_path):
+    """The `--prefix` values a .desktop file's Exec lines name."""
+    out = []
+    try:
+        with open(entry_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("Exec="):
+                    toks = desktop_exec_args(line[len("Exec="):])
+                    out += [toks[i + 1] for i, t in enumerate(toks[:-1]) if t == "--prefix"]
+    except OSError:
+        pass
+    return out
+
+
 def neutron_prefixes():
     """Neutron's own prefixes: the ones `prefix provision` recorded, plus any prefix a Neutron menu
     entry launches (prefixes provisioned before the record existed).
@@ -1363,14 +1429,7 @@ def neutron_prefixes():
     out, seen = [], set()
     cands = list(_recorded_prefixes())
     for entry in sorted(glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop"))):
-        try:
-            with open(entry, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if line.startswith("Exec="):
-                        toks = line.split()
-                        cands += [toks[i + 1] for i, t in enumerate(toks[:-1]) if t == "--prefix"]
-        except OSError:
-            continue
+        cands += _exec_prefixes(entry)
     for p in cands:
         r = os.path.realpath(p)
         if r not in seen and os.path.isdir(os.path.join(r, "drive_c")):
@@ -1426,18 +1485,10 @@ def cmd_prefix_list(args):
     cands = list(_recorded_prefixes())
     menu = {}
     for entry in sorted(glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop"))):
-        try:
-            with open(entry, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if line.startswith("Exec="):
-                        toks = line.split()
-                        for i, t in enumerate(toks[:-1]):
-                            if t == "--prefix":
-                                cands.append(toks[i + 1])
-                                r = os.path.realpath(toks[i + 1])
-                                menu[r] = menu.get(r, 0) + 1
-        except OSError:
-            continue
+        for p in _exec_prefixes(entry):
+            cands.append(p)
+            r = os.path.realpath(p)
+            menu[r] = menu.get(r, 0) + 1
     for p in cands:
         r = os.path.realpath(p)
         if r in seen:
@@ -1769,7 +1820,7 @@ def _prefix_file_problems(prefix):
     if perms:
         out.append("`chmod u+rw` on those files makes them readable and writable for you again")
     if missing:
-        out.append("`neutron prefix provision %s` recreates what is missing" % prefix)
+        out.append("`neutron prefix provision %s` recreates what is missing" % _sh(prefix))
     return out
 
 
@@ -3565,7 +3616,7 @@ def cmd_fonts_check(args):
         _print_fonts_verdict(v)
         if v["repair"]:
             print("repair would: " + "; ".join(v["repair"]))
-            print(f"run: neutron fonts repair --prefix {prefix}")
+            print(f"run: neutron fonts repair --prefix {_sh(prefix)}")
     return EX_OK if v["status"] != "bad" else EX_FAIL
 
 
@@ -3589,7 +3640,7 @@ def cmd_fonts_repair(args):
              "reason": "this runtime would RE-STAMP the prefix and revert its patched natives; "
                        "refusing to repair fonts through it",
              "hint": "run it with the runtime this prefix is stamped for: "
-                     "NEUTRON_WINE_VERSION=<ver> neutron fonts repair --prefix %s" % prefix,
+                     "NEUTRON_WINE_VERSION=<ver> neutron fonts repair --prefix %s" % _sh(prefix),
              **mismatch}, EX_FAIL, args.json)
     # Adobe reads fonts and writes CoolType's cache during startup; a repair under a running app
     # can neither take effect nor be verified until the app restarts, and the app could write
@@ -5510,8 +5561,11 @@ def cmd_prefix_provision(args):
 
     event(args, event="progress", stage="registry", pct=62, msg="writing registry provisioning (graphics driver, app compat)")
     # 2. Registry provisioning (only affects newly-started processes; shared-safe).
-    reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ",
-            "wayland" if session_is_wayland() else "x11")
+    # ⛔ Always the Wayland driver, session or not. This wrote `x11` whenever provision ran without a
+    # Wayland session (over SSH, from cron, from a shell started before the compositor), and the
+    # prefix stayed that way until its next desktop launch set it back. `launch` refuses X11 unless
+    # NEUTRON_ALLOW_X11=1 and sets the driver itself; provision has no reason to choose one.
+    reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "wayland")
     steps.append({"step": "graphics", "ok": True})
 
     # 2b. Photoshop 2026 caption buttons: on a prefix reporting Windows 11 the
@@ -5665,7 +5719,7 @@ def cmd_prefix_provision(args):
                   "detail": ("%d/6 present" % len(_present)) if not _missing else
                             ("%d/6 present, missing %s -- Premiere, After Effects and Media Encoder "
                              "will not start; run `neutron fonts repair --prefix %s` when online"
-                             % (len(_present), ", ".join(_missing), prefix))})
+                             % (len(_present), ", ".join(_missing), _sh(prefix)))})
     # 🚨 UNCONDITIONALLY, even when nothing was repaired. CoolType's cache is
     # keyed on FILENAME, so any font work that overwrites a file in place --
     # ours above, or a font the user copied in -- leaves
@@ -5701,11 +5755,11 @@ def cmd_prefix_provision(args):
                             ("" if genuine else
                              "  — NO genuine Roman face; After Effects WILL fail at startup. "
                              "Run `neutron fonts repair --prefix %s` to install the Microsoft "
-                             "core fonts." % prefix)})
+                             "core fonts." % _sh(prefix))})
     if not genuine:
         log("⚠️  no genuine Roman default font (times/arial/cour are all Wine "
             "substitutes) — After Effects will fail at startup. Run "
-            "`neutron fonts repair --prefix %s`." % prefix)
+            "`neutron fonts repair --prefix %s`." % _sh(prefix))
 
     # Desktop identity: a .desktop + extracted icon per installed app. Gives each app its own
     # dock icon (StartupWMClass = Wine's app_id) instead of inheriting Collider's, and puts the
@@ -6577,7 +6631,7 @@ def cmd_launch(args):
              # DXVK / vkd3d-proton / NVIDIA DLLs. `neutron update` does this for every Neutron prefix.
              "fix": "Run `neutron update` (or `neutron prefix provision %s`): it moves the "
                     "prefix to this runtime and restages Neutron's DLLs. Or pass --allow-restamp "
-                    "to launch anyway." % prefix,
+                    "to launch anyway." % _sh(prefix),
              "prefix_is_stamped_for": (", ".join(also) if also
                                        else "no installed runtime (stamp %d)"
                                             % mismatch["prefix_stamp"]),
@@ -6585,7 +6639,7 @@ def cmd_launch(args):
     if mismatch:
         log("WARNING: --allow-restamp: launching on a different-stamp runtime. wine will run "
             "`wineboot -u` and REVERT the prefix's patched natives (dwrite/dcomp/dxcore). "
-            "Run `neutron prefix provision %s` afterwards to restore them." % prefix)
+            "Run `neutron prefix provision %s` afterwards to restore them." % _sh(prefix))
 
     dxvk_conf = _resolve_app_dxvk_conf(prefix, profile)
     env = dict(os.environ)
@@ -7590,7 +7644,7 @@ def register_app_desktop_entries(prefix):
                 for line in body.splitlines():
                     if not line.startswith("Exec="):
                         continue
-                    toks = line.split()
+                    toks = desktop_exec_args(line[len("Exec="):])
                     for i, t in enumerate(toks):
                         if t == "--prefix" and i + 1 < len(toks) and toks[i + 1] == want:
                             return True
@@ -7627,7 +7681,7 @@ def register_app_desktop_entries(prefix):
             # unpinned for a few hours, the user launched from the menu, and the prefix was
             # re-stamped from 11.10-62 back to the CLI default 11.10-59 with dwrite/dcomp/dxcore
             # all reverted to builtins.
-            "Exec=env PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin NEUTRON_WINE_VERSION=%s NEUTRON_WAYLAND_APP_ID=%s neutron launch %s --prefix %s%s\n"
+            "Exec=env %s %s %s neutron launch %s --prefix %s%s\n"
             "Icon=%s\n"
             "Terminal=false\n"
             # One MAIN category only. `Graphics;AudioVideo;` is two, which makes a menu list the
@@ -7637,7 +7691,11 @@ def register_app_desktop_entries(prefix):
             # ⭐ THE LINE THAT FIXES THE DOCK ICON. Wine's app_id, verbatim.
             "StartupWMClass=%s\n"
             "StartupNotify=false\n"
-            % (disp_name, p["name"], HOME, pinned_version, wm_class, app_id, prefix, exec_arg,
+            % (disp_name, p["name"],
+               desktop_exec_arg("PATH=%s/.local/bin:/usr/local/bin:/usr/bin:/bin" % HOME),
+               desktop_exec_arg("NEUTRON_WINE_VERSION=%s" % pinned_version),
+               desktop_exec_arg("NEUTRON_WAYLAND_APP_ID=%s" % wm_class), app_id,
+               desktop_exec_arg(prefix), exec_arg,
                icon_name if have_icon else "collider",
                APP_CATEGORIES.get(app_id, "Graphics;"),
                ("MimeType=%s\n" % "".join(m + ";" for m in mimes)) if mimes else "",
@@ -8635,11 +8693,9 @@ def amd_hw_encode_check(gpus, prefix, checks=(), root="/"):
     return c
 
 
-def cmd_doctor(args):
-    """Health check. Powers Collider's prefix-health status surface.
-
-    NOTE: schema PROVISIONAL (v0-unstable), same ordering caveat as prefix info.
-    """
+def doctor_checks(prefix_arg=None):
+    """Every doctor check, as {name, ok, detail?, pending?, warning?} dicts: the machine's, then the
+    prefix's when one is given. `neutron doctor` and `neutron report` both print these."""
     checks = []
 
     # Doctor checks ONLY what can affect launching and running the apps. A step that simply has
@@ -8698,8 +8754,8 @@ def cmd_doctor(args):
         check("gpu", True, "could not read the GPUs: %s" % e)
         checks[-1]["warning"] = True
 
-    if args.prefix:
-        prefix = resolve_prefix(args.prefix)
+    if prefix_arg:
+        prefix = resolve_prefix(prefix_arg)
         if not prefix:
             check("prefix", False, "drive_c not found")
         else:
@@ -8742,7 +8798,7 @@ def cmd_doctor(args):
                       "would run `wineboot -u` and REVERT the patched natives. Run "
                       "`neutron prefix provision %s`."
                       % (", ".join(_also) if _also else "stamp %d (no installed runtime)"
-                         % _mm["prefix_stamp"], os.path.basename(_mm["runtime"]), prefix))
+                         % _mm["prefix_stamp"], os.path.basename(_mm["runtime"]), _sh(prefix)))
             elif _prefix_stamp(prefix) is not None:
                 check("runtime-prefix-stamp", True,
                       "prefix and runtime agree (stamp %d)" % _prefix_stamp(prefix))
@@ -8945,10 +9001,46 @@ def cmd_doctor(args):
                           "Premiere has run but the display fix is missing — run "
                           "`neutron prefix apply-display-fix <prefix>`")
 
-    healthy = all(c["ok"] for c in checks
-                  if c["name"] not in ("exiftool",))  # exiftool is optional
-    emit({"ok": True, "healthy": healthy, "checks": checks,
-          "_schema": "provisional-v0"}, args.json)
+    return checks
+
+
+DOCTOR_OPTIONAL = ("exiftool",)
+
+
+def doctor_healthy(checks):
+    return all(c["ok"] for c in checks if c["name"] not in DOCTOR_OPTIONAL)
+
+
+def doctor_text(checks):
+    """doctor's checks as lines a person reads: a verdict, then one line per check."""
+    def state(c):
+        if not c["ok"]:
+            return "optional" if c["name"] in DOCTOR_OPTIONAL else "PROBLEM"
+        return "pending" if c.get("pending") else "warning" if c.get("warning") else "ok"
+    rows = [(state(c), c["name"], c.get("detail") or "") for c in checks]
+    problems = [n for st, n, _ in rows if st == "PROBLEM"]
+    warnings = sum(st == "warning" for st, _, _ in rows)
+    verdict = ("%d problem%s: %s" % (len(problems), "" if len(problems) == 1 else "s",
+                                     ", ".join(problems)) if problems else "healthy")
+    if warnings:
+        verdict += " (%d warning%s)" % (warnings, "" if warnings == 1 else "s")
+    w = max([len(n) for _, n, _ in rows] or [0])
+    return "\n".join(["Neutron doctor: " + verdict]
+                     + [("  %-8s %-*s  %s" % (st, w, n, d)).rstrip() for st, n, d in rows])
+
+
+def cmd_doctor(args):
+    """Health check. Powers Collider's prefix-health status surface.
+
+    NOTE: schema PROVISIONAL (v0-unstable), same ordering caveat as prefix info.
+    """
+    checks = doctor_checks(args.prefix)
+    healthy = doctor_healthy(checks)
+    if args.json:
+        emit({"ok": True, "healthy": healthy, "checks": checks,
+              "_schema": "provisional-v0"}, True)
+    else:
+        print(doctor_text(checks))
     return EX_OK if healthy else EX_FAIL
 
 
@@ -8960,7 +9052,7 @@ def _runtime_version_of(wine):
     return root[len("neutron-wine-"):] if root.startswith("neutron-wine-") else None
 
 
-def cmd_display(args):
+def display_info():
     """The display scale Neutron will use for Adobe apps, where it came from, and every output."""
     info = detect_scale_info()
     # `scale`/`dpi`/`source` stay the DESKTOP's scale (Collider's "Auto" readout shows them);
@@ -8972,26 +9064,39 @@ def cmd_display(args):
     if not info:
         out["reason"] = ("could not detect the display scale; pass --scale to `neutron launch` "
                          "or set it in Collider")
+    return out
+
+
+def display_text(out):
+    lines = []
+    if out["ok"]:
+        lines.append("scale %s%%  (%d dpi)  on %s  via %s" % (round(out["scale"] * 100, 2),
+                     out["dpi"], out.get("output") or "?", out["source"]))
+    else:
+        lines.append(out["reason"])
+    setting = out.get("collider_scale")
+    if setting:
+        lines.append("launches use %s%% (%d dpi): set in Collider's Preferences" %
+                     (round(setting * 100, 2), round(96 * setting)))
+    for o in out["outputs"]:
+        lines.append("  output %-12s %-10s %s%%  at %s" % (o["output"], "%dx%d" % tuple(o["size"]),
+                                                           round(o["scale"] * 100, 2), o["pos"]))
+    if out["warning"]:
+        lines.append("⚠️  " + out["warning"])
+    return "\n".join(lines)
+
+
+def cmd_display(args):
+    """The display scale Neutron will use for Adobe apps, where it came from, and every output."""
+    out = display_info()
     if args.json:
         emit(out, True)
     else:
-        if info:
-            print("scale %s%%  (%d dpi)  on %s  via %s" % (round(info["scale"] * 100, 2),
-                  info["dpi"], info.get("output") or "?", info["source"]))
-        else:
-            print(out["reason"])
-        if setting:
-            print("launches use %s%% (%d dpi): set in Collider's Preferences" %
-                  (round(setting * 100, 2), round(96 * setting)))
-        for o in out["outputs"]:
-            print("  output %-12s %-10s %s%%  at %s" % (o["output"], "%dx%d" % tuple(o["size"]),
-                                                       round(o["scale"] * 100, 2), o["pos"]))
-        if out["warning"]:
-            print("⚠️  " + out["warning"])
-    return EX_OK if info else EX_FAIL
+        print(display_text(out))
+    return EX_OK if out["ok"] else EX_FAIL
 
 
-def cmd_version(args):
+def version_info():
     """Every piece's version in one place, for bug reports."""
     cli = CLI_VERSION
     try:
@@ -9020,15 +9125,329 @@ def cmd_version(args):
            "neutron_wine_installed": _installed_runtime_versions(),
            "mudhut": mudhut or installed.get("mudhut"),
            "collider": installed.get("collider")}
+    return out
+
+
+def version_text(out):
+    return "\n".join([
+        "neutron CLI    " + out["cli"],
+        "neutron-wine   " + (out["neutron_wine"] or "not installed")
+        + ("   (%d versions installed)" % len(out["neutron_wine_installed"])
+           if len(out["neutron_wine_installed"]) > 1 else ""),
+        "Mud Hut        " + (out["mudhut"] or "not installed"),
+        "Collider       " + (out["collider"] or "unknown")])
+
+
+def cmd_version(args):
+    """Every piece's version in one place, for bug reports."""
+    out = version_info()
     if args.json:
         emit(out, True)
     else:
-        print("neutron CLI    " + out["cli"])
-        print("neutron-wine   " + (out["neutron_wine"] or "not installed")
-              + ("   (%d versions installed)" % len(out["neutron_wine_installed"])
-                 if len(out["neutron_wine_installed"]) > 1 else ""))
-        print("Mud Hut        " + (out["mudhut"] or "not installed"))
-        print("Collider       " + (out["collider"] or "unknown"))
+        print(version_text(out))
+    return EX_OK
+
+
+# --- report --------------------------------------------------------------------------------------
+# One paste for a bug report: the GitHub bug form's fields in its order, then what we otherwise ask
+# for in the thread -- every prefix's runtime and apps, the display scale and the end of the app's
+# log. Collecting those took two to four rounds in #12 and #18, and home paths were pasted in #19,
+# #27 and #29, so everything printed here goes through redact() first.
+
+def _report_identity():
+    """What redact() replaces: (home folders, user name, full-name words, computer name)."""
+    import pwd
+    homes = {h for h in (HOME, os.path.realpath(HOME)) if h and h != "/"}
+    try:
+        pw = pwd.getpwuid(os.getuid())
+        user, gecos = pw.pw_name, pw.pw_gecos.split(",")[0].strip()
+        homes.add(pw.pw_dir)
+    except (KeyError, OSError):
+        user, gecos = os.environ.get("USER", ""), ""
+    names = [gecos] + gecos.split() if gecos else []
+    return (sorted(homes, key=len, reverse=True), user,
+            [n for n in names if len(n) >= 3], os.uname().nodename)
+
+
+_SECRET_KEYS = (r"access_token|refresh_token|id_token|device_token|client_secret|authorization"
+                r"|password|passwd|api[_-]?key|session[_-]?id")
+
+
+def redact(text, ident=None):
+    """`text` with the user's home folder as ~, and their user name, full name, computer name, email
+    addresses, sign-in tokens and URL queries replaced by placeholders."""
+    homes, user, names, host = ident or _report_identity()
+    for h in homes:
+        text = text.replace(h, "~")
+    if user:
+        # Wherever the name is a path component: C:\users\<user>, Z:\home\<user>, /run/user/...
+        text = re.sub(r"(?<=[\\/])%s(?=[\\/\s\"'.:,;)\]]|$)" % re.escape(user), "<user>", text,
+                      flags=re.I | re.M)
+    for n in names:
+        text = re.sub(r"\b%s\b" % re.escape(n), "<name>", text, flags=re.I)
+    if len(host) >= 3:
+        text = re.sub(r"\b%s\b" % re.escape(host), "<computer>", text, flags=re.I)
+    text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "<email>", text)
+    text = re.sub(r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]*", "<token>", text)
+    text = re.sub(r"(?i)\bBearer\s+[\w.~+/=-]+", "Bearer <token>", text)
+    text = re.sub(r"(?i)(\"?(?:%s)\"?\s*[:=]\s*\"?)[^\"\s,&;]+" % _SECRET_KEYS, r"\1<redacted>", text)
+    text = re.sub(r"(https?://[^\s\"'<>?#]+)\?[^\s\"'<>]+", r"\1?<query removed>", text)
+    text = re.sub(r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b", "<mac>", text)
+    return text
+
+
+def _run_text(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _os_release(root="/"):
+    vals = {}
+    for path in ("etc/os-release", "usr/lib/os-release"):
+        try:
+            with open(os.path.join(root, path), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    k, _, v = line.strip().partition("=")
+                    if k and _:
+                        vals[k] = v.strip().strip('"')
+            break
+        except OSError:
+            continue
+    return vals
+
+
+def report_distro(root="/"):
+    rel = _os_release(root)
+    name = rel.get("PRETTY_NAME") or rel.get("NAME") or "unknown distribution"
+    if rel.get("VARIANT") and rel["VARIANT"] not in name:
+        name += " " + rel["VARIANT"]
+    return "%s (Linux %s)" % (name, os.uname().release)
+
+
+def report_desktop():
+    raw = os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("XDG_SESSION_DESKTOP") or ""
+    de = raw.lower()
+    if "kde" in de:
+        v = _run_text(["kwin_wayland", "--version"]).removeprefix("kwin ")
+        name = "KDE Plasma" + (" " + v if v else "")
+    elif "gnome" in de:
+        name = _run_text(["gnome-shell", "--version"]) or "GNOME"
+    elif "hyprland" in de:
+        v = re.search(r"Tag: (\S+)", _run_text(["hyprctl", "version"]))
+        name = "Hyprland" + (" " + v.group(1).rstrip(",") if v else "")
+    elif "sway" in de:
+        name = _run_text(["sway", "--version"]) or "sway"
+    else:
+        name = raw or "unknown desktop"
+    session = "Wayland" if session_is_wayland() else (os.environ.get("XDG_SESSION_TYPE")
+                                                      or "no graphical session")
+    return "%s on %s" % (name, session.capitalize() if session.islower() else session)
+
+
+def report_gpu(gpus=None):
+    """One line per GPU: doctor's (vendor, kernel driver, Vulkan driver), plus the Vulkan driver's
+    own version when vulkaninfo is there to ask."""
+    try:
+        gpus = host_gpus() if gpus is None else gpus
+        detail = next((c.get("detail") for c in gpu_checks(gpus) if c["name"] == "gpu"), "")
+    except Exception as e:
+        return "could not read the GPUs: %s" % e
+    vk = []
+    cur = {}
+    for line in _run_text(["vulkaninfo", "--summary"], timeout=10).splitlines():
+        k, _, v = line.strip().partition("=")
+        k, v = k.strip(), v.strip()
+        if k == "deviceName":
+            cur = {"name": v}
+            vk.append(cur)
+        elif k in ("driverName", "driverInfo") and cur:
+            cur[k] = v
+    if vk:
+        detail += "\nVulkan devices: " + "; ".join(
+            "%s (%s %s)" % (d["name"], d.get("driverName", "?"), d.get("driverInfo", ""))
+            for d in vk if "llvmpipe" not in d["name"].lower())
+    else:
+        nv = (_read_text("/sys/module/nvidia/version") or "").strip()
+        if nv:
+            detail += "\nNVIDIA driver " + nv
+    return detail or "no GPU found"
+
+
+def _pe_file_version(exe):
+    """The FileVersion from an exe's VS_FIXEDFILEINFO ("26.5.2.5"), reading only its headers and
+    resource section; None when there is none."""
+    def u16(b, o): return struct.unpack_from("<H", b, o)[0]
+    def u32(b, o): return struct.unpack_from("<I", b, o)[0]
+    try:
+        with open(exe, "rb") as f:
+            h = f.read(4096)
+            pe = u32(h, 0x3c)
+            if h[pe:pe + 4] != b"PE\0\0":
+                return None
+            nsec, optsz, opt = u16(h, pe + 6), u16(h, pe + 20), pe + 24
+            res_rva = u32(h, opt + (112 if u16(h, opt) == 0x20b else 96) + 2 * 8)
+            for i in range(nsec):
+                sh = opt + optsz + i * 40
+                va, vs, rawsz, raw = u32(h, sh + 12), u32(h, sh + 8), u32(h, sh + 16), u32(h, sh + 20)
+                if res_rva and va <= res_rva < va + max(vs, rawsz):
+                    f.seek(raw)
+                    d = f.read(rawsz)
+                    break
+            else:
+                return None
+    except (OSError, struct.error):
+        return None
+    i = d.find(b"\xbd\x04\xef\xfe")
+    if i < 0 or i + 16 > len(d):
+        return None
+    ms, ls = u32(d, i + 8), u32(d, i + 12)
+    return "%d.%d.%d.%d" % (ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff)
+
+
+def _menu_pins(prefix):
+    """The runtimes this prefix's menu entries launch it with (their NEUTRON_WINE_VERSION)."""
+    pins = set()
+    want = os.path.realpath(prefix)
+    for entry in glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop")):
+        if want not in (os.path.realpath(p) for p in _exec_prefixes(entry)):
+            continue
+        try:
+            with open(entry, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Exec="):
+                        pins.update(t.split("=", 1)[1] for t in desktop_exec_args(line[5:])
+                                    if t.startswith("NEUTRON_WINE_VERSION="))
+        except OSError:
+            pass
+    return sorted(pins)
+
+
+def report_prefix(prefix):
+    lines = [prefix]
+    apps = []
+    for app_id, p in APP_PROFILES.items():
+        exe = _resolve_app_exe(prefix, p["exe"])
+        if exe and os.path.isfile(exe):
+            apps.append("%s %s" % (p["name"], _pe_file_version(exe) or _app_version(exe)))
+    lines.append("  apps: " + (", ".join(apps) or "none installed"))
+    pins = _menu_pins(prefix)
+    lines.append("  menu entries launch it with: " + (", ".join(pins) if pins else "no menu entries"))
+    try:
+        with open(os.path.join(prefix, "user.reg"), encoding="utf-8", errors="replace") as f:
+            reg = f.read()
+    except OSError:
+        reg = ""
+    gfx = re.search(r'\[Software\\\\Wine\\\\Drivers\][^\[]*?"Graphics"="([^"]*)"', reg)
+    dpi = re.search(r'\[Control Panel\\\\Desktop\][^\[]*?"LogPixels"=dword:([0-9a-fA-F]+)', reg)
+    lines.append("  graphics driver: %s, LogPixels: %s" % (
+        gfx.group(1) if gfx else "not set", int(dpi.group(1), 16) if dpi else "not set"))
+    busy = mudhut_busy(prefix)
+    if busy:
+        lines.append("  Mud Hut is working in it: %s %s" % (busy.get("command", "update"),
+                                                           ", ".join(busy.get("apps") or [])))
+    return "\n".join(lines)
+
+
+def _newest_log(app=None, prefix=None):
+    """The newest session log `neutron launch` wrote, for `app` and/or `prefix` when given."""
+    slug = _prefix_slug(prefix) if prefix else None
+    best = None
+    for path in glob.glob(os.path.join(NEUTRON_LOGS_DIR, "*.log")):
+        name = os.path.basename(path)
+        if name.startswith("wineboot-"):
+            continue
+        if app and not name.startswith(app + "-"):
+            continue
+        if slug and ("-%s-" % slug) not in name:
+            continue
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            continue
+        if best is None or m > best[0]:
+            best = (m, path)
+    return best[1] if best else None
+
+
+def _tail_lines(path, n, width=500):
+    """The last `n` lines of a file without reading all of it (single logs reach 137 MB)."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        block, data = 64 * 1024, b""
+        while size > 0 and data.count(b"\n") <= n:
+            step = min(block, size)
+            size -= step
+            f.seek(size)
+            data = f.read(step) + data
+    lines = data.decode("utf-8", "replace").splitlines()[-n:]
+    return [l if len(l) <= width else l[:width] + " …" for l in lines]
+
+
+def cmd_report(args):
+    """`neutron report`: everything a bug report needs, ready to paste, with personal details
+    replaced."""
+    ident = _report_identity()
+    if args.prefix:
+        prefix = resolve_prefix(args.prefix)
+        if not prefix:
+            die({"ok": False, "reason": "no prefix at %s (it has no drive_c)" % args.prefix},
+                EX_BADPREFIX, args.json)
+        prefixes = [prefix]
+    else:
+        prefixes = neutron_prefixes()
+    if args.app and args.app not in APP_PROFILES:
+        die({"ok": False, "reason": "unknown app %r; one of: %s" % (args.app, ", ".join(APP_PROFILES))},
+            EX_FAIL, args.json)
+
+    sections = []
+
+    def section(title, body):
+        sections.append("== %s ==\n%s" % (title, body.rstrip() or "(nothing)"))
+
+    section("Distribution", report_distro())
+    section("Desktop and session", report_desktop())
+    section("GPU and driver", report_gpu())
+    section("neutron --version", version_text(version_info()))
+    machine = doctor_checks(None)
+    doc = [doctor_text(machine)]
+    for p in prefixes:
+        checks = doctor_checks(p)
+        doc.append("\n" + doctor_text(checks[len(machine):]).replace(
+            "Neutron doctor: ", "Prefix %s: " % p, 1))
+    if not prefixes:
+        doc.append("\nNo Neutron prefix found. Pass --prefix with the folder that holds drive_c.")
+    section("neutron doctor", "\n".join(doc))
+    section("Prefixes", "\n".join(report_prefix(p) for p in prefixes) or "none found")
+    section("Display", display_text(display_info()))
+    log = args.log or _newest_log(args.app, args.prefix and prefixes[0])
+    if log and os.path.isfile(log):
+        try:
+            tail = _tail_lines(log, args.lines)
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(log)))
+            section("Log: %s (%s, last %d lines)" % (os.path.basename(log), when, len(tail)),
+                    "\n".join(tail))
+        except OSError as e:
+            section("Log", "could not read %s: %s" % (log, e))
+    else:
+        section("Log", "no session log found in %s%s" % (
+            NEUTRON_LOGS_DIR, " for " + args.app if args.app else ""))
+
+    text = redact("\n\n".join(
+        ["Neutron report, %s" % time.strftime("%Y-%m-%d %H:%M"),
+         "Your user name, home folder, computer name, email addresses and sign-in tokens are "
+         "replaced with placeholders. Read it before you post it.\n"
+         "Bug report form: https://github.com/%s/Neutron/issues/new/choose" % GITHUB_OWNER]
+        + sections), ident) + "\n"
+    if args.json:
+        emit({"ok": True, "report": text}, True)
+    else:
+        sys.stdout.write(text)
+        if sys.stdout.isatty() and have("wl-copy"):
+            print("\n[neutron] To copy it: neutron report | wl-copy", file=sys.stderr)
     return EX_OK
 
 
@@ -9257,7 +9676,8 @@ def _collider_desktop_entry(appimage):
         f.write("[Desktop Entry]\nType=Application\nName=Neutron Collider\n"
                 "GenericName=Adobe Creative Cloud\n"
                 "Comment=Install and run Adobe Creative Cloud apps on Linux\n"
-                f"Exec=env PATH={path} {appimage}\nIcon={icon}\nTerminal=false\n"
+                f"Exec=env {desktop_exec_arg('PATH=' + path)} {desktop_exec_arg(appimage)}\n"
+                f"Icon={icon}\nTerminal=false\n"
                 "Categories=Graphics;Photography;AudioVideo;\n")
     refresh_desktop_caches(APPS_DIR)
     return "menu entry added"
@@ -9797,6 +10217,14 @@ def build_parser():
     pd = sub.add_parser("doctor", help="health check")
     pd.add_argument("--prefix", default=None)
     pd.set_defaults(func=cmd_doctor)
+
+    prp = sub.add_parser("report", help="everything a bug report needs, ready to paste, with your "
+                                        "user name, home folder and sign-in details replaced")
+    prp.add_argument("--prefix", default=None, help="only this prefix (default: every Neutron prefix)")
+    prp.add_argument("--app", default=None, help="take the log from this app's newest session")
+    prp.add_argument("--log", default=None, help="take the log from this file instead")
+    prp.add_argument("--lines", type=int, default=150, help="how many log lines (default 150)")
+    prp.set_defaults(func=cmd_report)
 
     # setup / update / uninstall
     for name, fn, hlp in (("setup", cmd_setup, "install everything Neutron needs: neutron-wine, "

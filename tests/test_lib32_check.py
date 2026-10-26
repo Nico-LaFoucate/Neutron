@@ -90,11 +90,11 @@ class Lib32Check(unittest.TestCase):
         self.assertIn("the 32-bit C library is missing", problems)
 
     def test_doctor_reports_it(self):
-        with open(_CLI) as f:
-            src = f.read()
-        doctor = src[src.index("def cmd_doctor("):]
-        doctor = doctor[:doctor.index("\ndef ")]
-        self.assertIn('check("lib32", not _lib32', doctor)
+        with mock.patch.object(N, "lib32_problem", return_value="the 32-bit C library is missing"):
+            checks = N.doctor_checks(None)
+        lib32 = [c for c in checks if c["name"] == "lib32"]
+        self.assertEqual(lib32, [{"name": "lib32", "ok": False, "detail": "the 32-bit C library is missing"}])
+        self.assertFalse(N.doctor_healthy(checks))
 
 
 if __name__ == "__main__":
