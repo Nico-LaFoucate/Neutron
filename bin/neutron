@@ -9312,6 +9312,383 @@ def cmd_version(args):
     return EX_OK
 
 
+# --- plugins -------------------------------------------------------------------------------------
+# `neutron plugins`: put third-party plugins where their Windows installers would, list what a prefix
+# holds, and name the folders to drop files into. A vendor installer is RUN in the prefix (it knows its
+# own product best); a bare plugin file is placed by type; a .zxp is unpacked into the CEP extensions
+# folder exactly as Adobe's Extension Manager does, signature and all, and checked like `doctor` does.
+
+PLUGIN_TYPES = {
+    # suffix: (what it is, where it goes; "shared" = the MediaCore folder After Effects, Premiere and
+    # Media Encoder all load)
+    ".aex": ("After Effects plugin", "shared"),
+    ".prm": ("Premiere Pro plugin", "shared"),
+    ".8bf": ("Photoshop filter", "photoshop"), ".8li": ("Photoshop plugin", "photoshop"),
+    ".8ba": ("Photoshop plugin", "photoshop"), ".8bi": ("Photoshop plugin", "photoshop"),
+    ".8be": ("Photoshop plugin", "photoshop"), ".8bx": ("Photoshop plugin", "photoshop"),
+    ".8by": ("Photoshop plugin", "photoshop"), ".8bs": ("Photoshop plugin", "photoshop"),
+    ".aip": ("Illustrator plugin", "illustrator"),
+    ".vst3": ("VST3 audio plugin", "vst3"),
+    ".jsx": ("script", "script"), ".jsxbin": ("script", "script"),
+    ".zxp": ("extension panel", "cep"),
+    ".exe": ("installer", "run"), ".msi": ("installer", "run"),
+    ".ccx": ("UXP plugin", "uxp"),
+}
+PLUGIN_SHARED_DIR = ("Program Files", "Adobe", "Common", "Plug-ins", "7.0", "MediaCore")
+PLUGIN_CEP_DIR = ("Program Files (x86)", "Common Files", "Adobe", "CEP", "extensions")
+PLUGIN_VST3_DIR = ("Program Files", "Common Files", "VST3")
+# Where each app keeps its own plugins and scripts, relative to its folder under Program Files\Adobe.
+PLUGIN_APP_DIRS = {
+    "photoshop": {"plugins": ("Plug-ins",), "scripts": ("Presets", "Scripts")},
+    "illustrator": {"plugins": ("Plug-ins",), "scripts": ("Presets", "*", "Scripts")},
+    "aftereffects": {"plugins": ("Support Files", "Plug-ins"),
+                     "scripts": ("Support Files", "Scripts", "ScriptUI Panels")},
+    "premiere": {"plugins": ("Plug-ins", "Common")},
+}
+
+
+def _app_root(prefix, app_id):
+    """The installed app's own folder (`...\\Program Files\\Adobe\\Adobe Photoshop 2026`), newest year;
+    None when the app is not in the prefix."""
+    exe = _resolve_app_exe(prefix, APP_PROFILES[app_id]["exe"])
+    if not (exe and os.path.isfile(exe)):
+        return None
+    adobe = os.path.join(prefix, "drive_c", "Program Files", "Adobe")
+    rel = os.path.relpath(exe, adobe).split(os.sep)
+    return os.path.join(adobe, rel[0]) if len(rel) > 1 and rel[0] != ".." else None
+
+
+def plugin_dir(prefix, kind, app_id=None):
+    """The folder a plugin of `kind` goes to, or None when the app it belongs to is not installed."""
+    drive = os.path.join(prefix, "drive_c")
+    if kind == "shared":
+        return os.path.join(drive, *PLUGIN_SHARED_DIR)
+    if kind == "cep":
+        return os.path.join(drive, *PLUGIN_CEP_DIR)
+    if kind == "vst3":
+        return os.path.join(drive, *PLUGIN_VST3_DIR)
+    if kind in ("photoshop", "illustrator"):
+        app_id, kind = kind, "plugins"
+    root = _app_root(prefix, app_id) if app_id else None
+    sub = PLUGIN_APP_DIRS.get(app_id, {}).get(kind)
+    if not (root and sub):
+        return None
+    if "*" in sub:
+        hits = sorted(glob.glob(os.path.join(root, *sub)))
+        return hits[0] if hits else None
+    return os.path.join(root, *sub)
+
+
+def _plugin_kind(path):
+    """(suffix, label, kind) for a file or folder; a folder is classified by the plugins inside it."""
+    p = path.rstrip("/")
+    suffix = os.path.splitext(p)[1].lower()
+    if suffix in PLUGIN_TYPES:
+        return (suffix,) + PLUGIN_TYPES[suffix]
+    if os.path.isdir(p):
+        found = []
+        for root, _dirs, files in os.walk(p):
+            found += [os.path.splitext(f)[1].lower() for f in files]
+        for s in (".aex", ".prm", ".8bf", ".8li", ".aip"):
+            if s in found:
+                return (s,) + PLUGIN_TYPES[s]
+    return (suffix, None, None)
+
+
+def _copy_into(src, dest_dir):
+    """Copy a file or folder into dest_dir, replacing what is there by RENAME, so an app that has the
+    old plugin loaded keeps its own copy (the old inode) and never reads a half-written one."""
+    os.makedirs(dest_dir, exist_ok=True)
+    name = os.path.basename(src.rstrip("/"))
+    final = os.path.join(dest_dir, name)
+    tmp = os.path.join(dest_dir, ".neutron-new-" + name)
+    if os.path.isdir(src):
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.copytree(src, tmp, symlinks=True)
+        old = os.path.join(dest_dir, ".neutron-old-" + name)
+        replaced = os.path.lexists(final)
+        if replaced:
+            shutil.rmtree(old, ignore_errors=True)
+            os.rename(final, old)
+        os.rename(tmp, final)
+        if replaced:
+            shutil.rmtree(old, ignore_errors=True)
+    else:
+        replaced = os.path.lexists(final)
+        shutil.copy2(src, tmp)
+        os.replace(tmp, final)
+    return final, replaced
+
+
+def _zxp_bundle_id(zf):
+    """(bundle id, version, name) from a .zxp's CSXS/manifest.xml."""
+    try:
+        text = zf.read("CSXS/manifest.xml").decode("utf-8", "replace")
+    except KeyError:
+        return None, None, None
+    bid = re.search(r'ExtensionBundleId\s*=\s*"([^"]+)"', text)
+    ver = re.search(r'ExtensionBundleVersion\s*=\s*"([^"]+)"', text)
+    name = re.search(r'ExtensionBundleName\s*=\s*"([^"]+)"', text)
+    return (bid.group(1) if bid else None, ver.group(1) if ver else None,
+            name.group(1) if name else None)
+
+
+def _install_zxp(prefix, path):
+    """Unpack a .zxp into the CEP extensions folder under its bundle id, as Adobe's Extension Manager
+    does, then check its signature the way CEP will."""
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as e:
+        return {"ok": False, "reason": "not a .zxp package (%s)" % e}
+    with zf:
+        bid, ver, name = _zxp_bundle_id(zf)
+        if not bid or not re.match(r"^[A-Za-z0-9._-]+$", bid):
+            return {"ok": False, "reason": "the package has no CSXS/manifest.xml with an ExtensionBundleId"}
+        for n in zf.namelist():
+            if n.startswith("/") or ".." in n.split("/"):
+                return {"ok": False, "reason": "the package contains an unsafe path: %s" % n}
+        dest_root = plugin_dir(prefix, "cep")
+        os.makedirs(dest_root, exist_ok=True)
+        tmp = os.path.join(dest_root, ".neutron-new-" + bid)
+        shutil.rmtree(tmp, ignore_errors=True)
+        zf.extractall(tmp)
+    # Checked BEFORE it replaces anything: a damaged package must leave an installed version alone.
+    st = cep_signature_status(tmp)
+    final = os.path.join(dest_root, bid)
+    out = {"ok": True, "to": final, "id": bid, "version": ver, "name": name}
+    if st is not None and (st[0] or st[1]):
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"ok": False, "id": bid, "signature": "damaged",
+                "reason": "the package's signed files do not match (%d missing, %d changed); nothing "
+                          "was changed" % (len(st[0]), len(st[1]))}
+    out["replaced"] = os.path.lexists(final)
+    if out["replaced"]:
+        old = os.path.join(dest_root, ".neutron-old-" + bid)
+        shutil.rmtree(old, ignore_errors=True)
+        os.rename(final, old)
+        os.rename(tmp, final)
+        shutil.rmtree(old, ignore_errors=True)
+    else:
+        os.rename(tmp, final)
+    if st is None:
+        out["signature"] = "unsigned"
+        out["note"] = ("This extension is not signed, so the Adobe apps refuse to load it unless "
+                       "PlayerDebugMode is on (its developer's instructions say how).")
+    else:
+        out["signature"] = "valid"
+    return out
+
+
+def _run_installer(args, prefix, path, wine):
+    """Run a vendor installer in the prefix and wait until it and everything it started has finished."""
+    if not session_is_wayland():
+        return {"ok": False, "reason": "no Wayland session: the installer needs a desktop to show its "
+                                       "window in. Run this from your desktop session."}
+    env = dict(os.environ)
+    env["WINEPREFIX"] = prefix
+    env.pop("DISPLAY", None)
+    # Wine's own menu entries call a bare `wine`, which can re-stamp this prefix; Neutron writes its own.
+    env["WINEDLLOVERRIDES"] = "winemenubuilder.exe=d"
+    env.setdefault("WINEDEBUG", "-all")
+    os.makedirs(NEUTRON_LOGS_DIR, exist_ok=True)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.splitext(os.path.basename(path))[0])[:60]
+    log_path = os.path.join(NEUTRON_LOGS_DIR, "plugin-install-%s-%s.log" % (stem, time.strftime("%Y%m%d-%H%M%S")))
+    cmd = [wine, "msiexec", "/i", path] if path.lower().endswith(".msi") else [wine, path]
+    if not args.json:
+        print("[neutron] Running %s. Follow the installer's window; this waits until it finishes."
+              % os.path.basename(path), file=sys.stderr)
+    with open(log_path, "wb") as logf:
+        rc = subprocess.run(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL).returncode
+    # Installers often hand the work to a child (msiexec, a bootstrapper's second stage) and exit.
+    wineserver_wait(wine, prefix, timeout=3600)
+    return {"ok": rc == 0, "exit_code": rc, "log": log_path,
+            **({} if rc == 0 else {"reason": "the installer exited with code %d (log: %s)" % (rc, log_path)})}
+
+
+def cmd_plugins_install(args):
+    """`neutron plugins install FILE...`: install plugins into a prefix (see the section comment)."""
+    prefix = resolve_prefix(args.prefix) or resolve_prefix(collider_selected_prefix())
+    if not prefix:
+        die({"ok": False, "reason": "no usable prefix (no drive_c). Pass --prefix, or select one in Collider."},
+            EX_BADPREFIX, args.json)
+    busy = mudhut_busy(prefix)
+    if busy is not None:
+        die({"ok": False, "reason": _mudhut_busy_sentence(busy)}, EX_RUNNING, args.json)
+    if args.app and args.app not in APP_PROFILES:
+        die({"ok": False, "reason": "unknown app %r; one of: %s" % (args.app, ", ".join(APP_PROFILES))},
+            EX_FAIL, args.json)
+
+    results = []
+    for path in args.files:
+        path = os.path.abspath(os.path.expanduser(path))
+        r = {"file": path}
+        suffix, label, kind = _plugin_kind(path)
+        r["type"] = label or "unknown"
+        if not os.path.exists(path):
+            r.update(ok=False, reason="no such file")
+        elif kind is None:
+            r.update(ok=False, reason="not a plugin type Neutron knows (%s). Supported: %s, or a folder "
+                     "holding .aex, .prm, .8bf or .aip files." % (
+                         suffix or "no extension",
+                         " ".join(sorted(k for k, v in PLUGIN_TYPES.items() if v[1] != "uxp"))))
+        elif kind == "uxp":
+            r.update(ok=False, reason="UXP plugins (.ccx) are installed by Adobe's plugin installer, which "
+                     "does not work in Neutron prefixes yet.")
+        elif kind == "run":
+            running = _running_app_ids(prefix)
+            if running:
+                r.update(ok=False, reason="close %s first: installers need the Adobe apps closed"
+                         % ", ".join(APP_PROFILES[a]["name"] for a in running))
+            else:
+                wine, _is_neutron = resolve_wine()
+                if not wine:
+                    die({"ok": False, "reason": NO_RUNTIME_MSG}, EX_DEP, args.json)
+                if stamp_mismatch(prefix, wine):
+                    r.update(ok=False, reason="this runtime would re-stamp the prefix; run "
+                             "`neutron prefix provision %s` first" % _sh(prefix))
+                else:
+                    r.update(_run_installer(args, prefix, path, wine))
+        elif kind == "cep":
+            r.update(_install_zxp(prefix, path))
+        else:
+            if kind == "script":
+                if args.app not in ("aftereffects", "photoshop", "illustrator"):
+                    r.update(ok=False, reason="say which app the script is for: --app aftereffects, "
+                             "--app photoshop or --app illustrator")
+                    results.append(r)
+                    continue
+                dest = plugin_dir(prefix, "scripts", args.app)
+            else:
+                dest = plugin_dir(prefix, kind)
+            if not dest:
+                need = {"photoshop": "Photoshop", "illustrator": "Illustrator"}.get(kind) or \
+                       (APP_PROFILES[args.app]["name"] if args.app else "the app")
+                r.update(ok=False, reason="%s is not installed in this prefix" % need)
+            else:
+                try:
+                    final, replaced = _copy_into(path, dest)
+                    r.update(ok=True, to=final, replaced=replaced)
+                except OSError as e:
+                    r.update(ok=False, reason=str(e))
+        results.append(r)
+
+    ok = all(r.get("ok") for r in results)
+    out = {"ok": ok, "prefix": prefix, "installed": results,
+           "note": "Restart the Adobe app to load what was installed."}
+    if args.json:
+        emit(out, True)
+    else:
+        for r in results:
+            name = os.path.basename(r["file"].rstrip("/"))
+            if r.get("ok"):
+                where = r.get("to")
+                print("[neutron] Installed %s (%s)%s%s." % (
+                    name, r["type"], (" into " + where) if where else "",
+                    ", replacing the one there" if r.get("replaced") else ""))
+                if r.get("note"):
+                    print("[neutron] " + r["note"])
+            else:
+                print("[neutron] Not installed: %s: %s" % (name, r.get("reason", "failed")))
+        if any(r.get("ok") for r in results):
+            print("[neutron] " + out["note"])
+    return EX_OK if ok else EX_FAIL
+
+
+def _installed_programs(prefix):
+    """Third-party programs the prefix's uninstall list names (what vendor installers registered)."""
+    try:
+        with open(os.path.join(prefix, "system.reg"), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    out = []
+    for m in re.finditer(r'\n\[Software\\\\(?:Wow6432Node\\\\)?Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall'
+                         r'\\\\[^\]]+\][^\n]*\n(.*?)(?=\n\[|\Z)', text, re.S):
+        body = m.group(1)
+        name = re.search(r'"DisplayName"="([^"]*)"', body)
+        pub = re.search(r'"Publisher"="([^"]*)"', body)
+        if not name:
+            continue
+        publisher = pub.group(1) if pub else ""
+        if re.search(r"adobe|microsoft|wine", publisher + " " + name.group(1), re.I):
+            continue
+        ver = re.search(r'"DisplayVersion"="([^"]*)"', body)
+        out.append({"name": name.group(1), "publisher": publisher, "version": ver.group(1) if ver else None})
+    return sorted({p["name"]: p for p in out}.values(), key=lambda p: p["name"].lower())
+
+
+def plugins_inventory(prefix):
+    """What third-party plugins the prefix holds, by place."""
+    inv = {"extensions": [], "shared": [], "vst3": [], "programs": _installed_programs(prefix), "apps": {}}
+    for ext_id, man in _cep_manifests(prefix):
+        if ext_id.startswith("com.adobe."):
+            continue
+        try:
+            with open(man, encoding="utf-8", errors="replace") as f:
+                ver = re.search(r'ExtensionBundleVersion\s*=\s*"([^"]+)"', f.read())
+        except OSError:
+            ver = None
+        inv["extensions"].append({"id": ext_id, "name": cep_extension_name(man),
+                                  "version": ver.group(1) if ver else None,
+                                  "path": os.path.dirname(os.path.dirname(man))})
+    for key, kind in (("shared", "shared"), ("vst3", "vst3")):
+        d = plugin_dir(prefix, kind)
+        try:
+            inv[key] = sorted(n for n in os.listdir(d) if not n.startswith(".") and n != "dummy.txt")
+        except OSError:
+            pass
+    for app_id in ("aftereffects", "photoshop", "illustrator"):
+        if _app_root(prefix, app_id):
+            inv["apps"][app_id] = {k: plugin_dir(prefix, k, app_id) for k in ("plugins", "scripts")}
+    return inv
+
+
+def cmd_plugins_list(args):
+    """`neutron plugins list`: the third-party plugins and programs in a prefix."""
+    prefix = resolve_prefix(args.prefix) or resolve_prefix(collider_selected_prefix())
+    if not prefix:
+        die({"ok": False, "reason": "no usable prefix (no drive_c). Pass --prefix, or select one in Collider."},
+            EX_BADPREFIX, args.json)
+    inv = plugins_inventory(prefix)
+    if args.json:
+        emit({"ok": True, "prefix": prefix, **inv}, True)
+        return EX_OK
+    print("Extension panels:")
+    for e in inv["extensions"] or [{"name": "(none)"}]:
+        print("  %s%s" % (e["name"], " %s" % e["version"] if e.get("version") else ""))
+    print("Shared plugins (After Effects, Premiere Pro, Media Encoder): %s" % (", ".join(inv["shared"]) or "(none)"))
+    print("VST3 audio plugins: %s" % (", ".join(inv["vst3"]) or "(none)"))
+    print("Programs installed by vendor installers:")
+    for p in inv["programs"] or [{"name": "(none)"}]:
+        print("  %s%s" % (p["name"], " %s" % p["version"] if p.get("version") else ""))
+    return EX_OK
+
+
+def cmd_plugins_folder(args):
+    """`neutron plugins folder`: the Linux paths to drop plugin files into."""
+    prefix = resolve_prefix(args.prefix) or resolve_prefix(collider_selected_prefix())
+    if not prefix:
+        die({"ok": False, "reason": "no usable prefix (no drive_c). Pass --prefix, or select one in Collider."},
+            EX_BADPREFIX, args.json)
+    folders = {"shared": plugin_dir(prefix, "shared"), "extensions": plugin_dir(prefix, "cep"),
+               "vst3": plugin_dir(prefix, "vst3")}
+    for app_id in ("aftereffects", "photoshop", "illustrator"):
+        for k in ("plugins", "scripts"):
+            d = plugin_dir(prefix, k, app_id)
+            if d:
+                folders["%s-%s" % (app_id, k)] = d
+    if args.app:
+        folders = {k: v for k, v in folders.items() if k.startswith(args.app + "-")} or folders
+    if args.json:
+        emit({"ok": True, "prefix": prefix, "folders": folders}, True)
+    else:
+        for k, v in folders.items():
+            print("%-22s %s" % (k, v))
+    return EX_OK
+
+
 # --- report --------------------------------------------------------------------------------------
 # One paste for a bug report: the GitHub bug form's fields in its order, then what we otherwise ask
 # for in the thread -- every prefix's runtime and apps, the display scale and the end of the app's
@@ -10392,6 +10769,23 @@ def build_parser():
     pd = sub.add_parser("doctor", help="health check")
     pd.add_argument("--prefix", default=None)
     pd.set_defaults(func=cmd_doctor)
+
+    ppl = sub.add_parser("plugins", help="install third-party plugins into a prefix, and list them")
+    plsub = ppl.add_subparsers(dest="subcmd", required=True)
+    pli = plsub.add_parser("install", help="install plugins: a vendor installer (.exe, .msi), an extension "
+                                           "panel (.zxp), or plugin files (.aex, .prm, .8bf, .aip, .vst3, "
+                                           "scripts)")
+    pli.add_argument("files", nargs="+", metavar="FILE")
+    pli.add_argument("--prefix", default=None)
+    pli.add_argument("--app", default=None, help="the app a script is for (aftereffects, photoshop, illustrator)")
+    pli.set_defaults(func=cmd_plugins_install)
+    pll = plsub.add_parser("list", help="the third-party plugins, panels and programs in a prefix")
+    pll.add_argument("--prefix", default=None)
+    pll.set_defaults(func=cmd_plugins_list)
+    plf = plsub.add_parser("folder", help="the folders to drop plugin files into")
+    plf.add_argument("--prefix", default=None)
+    plf.add_argument("--app", default=None)
+    plf.set_defaults(func=cmd_plugins_folder)
 
     prp = sub.add_parser("report", help="everything a bug report needs, ready to paste, with your "
                                         "user name, home folder and sign-in details replaced")
