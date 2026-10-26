@@ -216,12 +216,62 @@ class Plugins(unittest.TestCase):
         self.assertEqual(out["installed"][0]["signature"], "unsigned")
         self.assertIn("PlayerDebugMode", out["installed"][0]["note"])
 
-    def test_ccx_and_unknown_types_are_refused(self):
-        rc, out = self.install(self.file("p.ccx"), self.file("readme.txt"))
+    def ccx(self, name, pid="com.example.uxp", version="1.0.0", host="PS", extra=None):
+        """A .ccx: a zip with a UXP manifest.json at its root."""
+        path = os.path.join(self.files, name)
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("manifest.json", json.dumps({"id": pid, "name": "Example UXP", "version": version,
+                                                    "manifestVersion": 5, "host": {"app": host, "minVersion": "24.0"}}))
+            z.writestr("index.html", "<html></html>")
+            for n in extra or ():
+                z.writestr(n, "x")
+        return path
+
+    def uxp_dir(self):
+        return self.drive("Program Files", "Common Files", "Adobe", "UXP", "Plugins", "External")
+
+    def test_ccx_unpacks_into_the_uxp_fallback_folder(self):
+        self.app("photoshop")
+        rc, out = self.install(self.ccx("p.ccx"))
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.isfile(os.path.join(self.uxp_dir(), "com.example.uxp_1.0.0", "manifest.json")))
+        self.assertEqual(out["installed"][0]["apps"], ["photoshop"])
+        self.assertIn("Plugins menu", out["installed"][0]["note"])
+        self.assertEqual([(e["id"], e["version"]) for e in self.cli.plugins_inventory(self.prefix)["uxp"]],
+                         [("com.example.uxp", "1.0.0")])
+
+    def test_a_new_ccx_version_replaces_the_old(self):
+        self.app("photoshop")
+        self.install(self.ccx("a.ccx", version="1.0.0"))
+        rc, out = self.install(self.ccx("b.ccx", version="1.1.0"))
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["installed"][0]["replaced"])
+        self.assertEqual(sorted(os.listdir(self.uxp_dir())), ["com.example.uxp_1.1.0"])
+
+    def test_ccx_needs_its_app_and_safe_paths(self):
+        rc, out = self.install(self.ccx("p.ccx"))
         self.assertNotEqual(rc, 0)
-        self.assertIn("UXP", out["installed"][0]["reason"])
-        self.assertIn("not a plugin type", out["installed"][1]["reason"])
-        self.assertNotIn(".ccx", out["installed"][1]["reason"])
+        self.assertIn("Photoshop, which is not installed", out["installed"][0]["reason"])
+        self.app("photoshop")
+        rc, out = self.install(self.ccx("bad.ccx", extra=["../escape.js"]))
+        self.assertNotEqual(rc, 0)
+        self.assertIn("unsafe path", out["installed"][0]["reason"])
+        self.assertFalse(os.path.exists(self.uxp_dir()) and os.listdir(self.uxp_dir()))
+
+    def test_ccx_warns_when_adobes_registry_exists(self):
+        self.app("photoshop")
+        reg = self.drive("Program Files", "Common Files", "Adobe", "UXP", "PluginsInfo", "v1")
+        os.makedirs(reg)
+        open(os.path.join(reg, "PS.json"), "w").close()
+        rc, out = self.install(self.ccx("p.ccx"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PS.json", out["installed"][0]["note"])
+
+    def test_unknown_types_are_refused(self):
+        rc, out = self.install(self.file("readme.txt"))
+        self.assertNotEqual(rc, 0)
+        self.assertIn("not a plugin type", out["installed"][0]["reason"])
+        self.assertIn(".ccx", out["installed"][0]["reason"])
 
     def test_installers_wait_for_closed_apps(self):
         exe = self.file("setup.exe")

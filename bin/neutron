@@ -9339,6 +9339,14 @@ PLUGIN_TYPES = {
 VST_SCAN_NOTE = ("In Premiere Pro, choose Edit > Preferences > Audio > Manage Audio Plug-ins, then Scan for "
                  "Plug-Ins, to load it.")
 PLUGIN_SHARED_DIR = ("Program Files", "Adobe", "Common", "Plug-ins", "7.0", "MediaCore")
+# UXP plugins (.ccx). Adobe's UXP host reads its plugin registry (PluginsInfo\v1\<host>.json, written by Adobe's
+# installer agent through the Creative Cloud app) and, when there is none, loads every plugin in this folder (its
+# log: "Loading plugins from system fallback plugins folder"). Neutron runs no Creative Cloud app, so it places them
+# there, one folder per plugin named <id>_<version>.
+PLUGIN_UXP_DIR = ("Program Files", "Common Files", "Adobe", "UXP", "Plugins", "External")
+PLUGIN_UXP_INFO_DIR = ("Program Files", "Common Files", "Adobe", "UXP", "PluginsInfo", "v1")
+# A UXP manifest's host "app" -> the app it runs in.
+UXP_HOSTS = {"PS": "photoshop", "ID": "indesign", "indesign": "indesign", "premierepro": "premiere"}
 PLUGIN_CEP_DIR = ("Program Files (x86)", "Common Files", "Adobe", "CEP", "extensions")
 PLUGIN_VST3_DIR = ("Program Files", "Common Files", "VST3")
 # Where each app keeps its own plugins and scripts, relative to its folder under Program Files\Adobe.
@@ -9371,6 +9379,8 @@ def plugin_dir(prefix, kind, app_id=None):
         return os.path.join(drive, *PLUGIN_CEP_DIR)
     if kind == "vst3":
         return os.path.join(drive, *PLUGIN_VST3_DIR)
+    if kind == "uxp":
+        return os.path.join(drive, *PLUGIN_UXP_DIR)
     if kind in ("photoshop", "illustrator"):
         app_id, kind = kind, "plugins"
     root = _app_root(prefix, app_id) if app_id else None
@@ -9484,6 +9494,86 @@ def _install_zxp(prefix, path):
     return out
 
 
+def _uxp_manifest(zf_or_dir):
+    """A UXP plugin's manifest.json as a dict (from an open .ccx or an unpacked folder), or None."""
+    try:
+        if isinstance(zf_or_dir, str):
+            with open(os.path.join(zf_or_dir, "manifest.json"), encoding="utf-8-sig") as f:
+                m = json.load(f)
+        else:
+            m = json.loads(zf_or_dir.read("manifest.json").decode("utf-8-sig"))
+    except (OSError, KeyError, ValueError):
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def _uxp_hosts(manifest):
+    """The host app codes a UXP manifest names ("PS", "ID", "premierepro", ...)."""
+    host = manifest.get("host")
+    hosts = host if isinstance(host, list) else [host]
+    return [h.get("app") for h in hosts if isinstance(h, dict) and h.get("app")]
+
+
+def _uxp_registries(prefix):
+    """Adobe's UXP plugin registry files in the prefix; while one exists for an app, it loads only what it lists."""
+    found = glob.glob(os.path.join(prefix, "drive_c", *PLUGIN_UXP_INFO_DIR, "*.json"))
+    found += glob.glob(os.path.join(prefix, "drive_c", "users", "*", "AppData", "Roaming", "Adobe", "UXP",
+                                    "PluginsInfo", "v1", "*.json"))
+    return sorted(found)
+
+
+def _install_ccx(prefix, path):
+    """Unpack a UXP plugin (.ccx) into the folder Adobe's UXP host loads plugins from when no registry exists,
+    replacing any other version of the same plugin."""
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as e:
+        return {"ok": False, "reason": "not a .ccx package (%s)" % e}
+    with zf:
+        m = _uxp_manifest(zf)
+        pid, ver = (m or {}).get("id"), str((m or {}).get("version") or "")
+        if not (pid and re.match(r"^[A-Za-z0-9._-]+$", pid) and re.match(r"^[A-Za-z0-9._-]+$", ver)):
+            return {"ok": False, "reason": "the package has no manifest.json with a plugin id and version"}
+        for n in zf.namelist():
+            if n.startswith("/") or ".." in n.split("/"):
+                return {"ok": False, "reason": "the package contains an unsafe path: %s" % n}
+        hosts = _uxp_hosts(m)
+        apps = [UXP_HOSTS[h] for h in hosts if h in UXP_HOSTS]
+        installed = [a for a in apps if _app_root(prefix, a)]
+        if not installed:
+            names = ", ".join(APP_PROFILES[a]["name"] for a in apps) or ", ".join(hosts) or "no app"
+            return {"ok": False, "id": pid, "reason": "this plugin is for %s, which is not installed in this prefix"
+                    % names}
+        dest_root = plugin_dir(prefix, "uxp")
+        os.makedirs(dest_root, exist_ok=True)
+        folder = "%s_%s" % (pid, ver)
+        tmp = os.path.join(dest_root, ".neutron-new-" + folder)
+        shutil.rmtree(tmp, ignore_errors=True)
+        zf.extractall(tmp)
+    final = os.path.join(dest_root, folder)
+    # Two versions side by side would both load: the new one replaces every other version, by rename, so an app
+    # that has the old one open keeps its files.
+    replaced = False
+    for old in sorted(glob.glob(os.path.join(dest_root, glob.escape(pid) + "_*"))):
+        if _uxp_manifest(old) and _uxp_manifest(old).get("id") == pid:
+            gone = os.path.join(dest_root, ".neutron-old-" + os.path.basename(old))
+            shutil.rmtree(gone, ignore_errors=True)
+            os.rename(old, gone)
+            shutil.rmtree(gone, ignore_errors=True)
+            replaced = True
+    os.rename(tmp, final)
+    out = {"ok": True, "to": final, "id": pid, "version": ver, "name": m.get("name"), "apps": installed,
+           "replaced": replaced,
+           "note": "Restart %s; the plugin is in the Plugins menu." % " and ".join(
+               APP_PROFILES[a]["name"] for a in installed)}
+    reg = _uxp_registries(prefix)
+    if reg:
+        out["note"] = ("Adobe's plugin registry exists in this prefix (%s), and an app that has one loads only the "
+                       "plugins it lists, so this plugin may not appear." % ", ".join(os.path.basename(r) for r in reg))
+    return out
+
+
 def _run_installer(args, prefix, path, wine):
     """Run a vendor installer in the prefix and wait until it and everything it started has finished."""
     if not session_is_wayland():
@@ -9536,10 +9626,9 @@ def cmd_plugins_install(args):
             r.update(ok=False, reason="not a plugin type Neutron knows (%s). Supported: %s, or a folder "
                      "holding .aex, .prm, .8bf or .aip files." % (
                          suffix or "no extension",
-                         " ".join(sorted(k for k, v in PLUGIN_TYPES.items() if v[1] != "uxp"))))
+                         " ".join(sorted(PLUGIN_TYPES))))
         elif kind == "uxp":
-            r.update(ok=False, reason="UXP plugins (.ccx) are installed by Adobe's plugin installer, which "
-                     "does not work in Neutron prefixes yet.")
+            r.update(_install_ccx(prefix, path))
         elif kind == "run":
             running = _running_app_ids(prefix)
             if running:
@@ -9639,7 +9728,12 @@ def _listdir(d):
 
 def plugins_inventory(prefix):
     """What third-party plugins the prefix holds, by place."""
-    inv = {"extensions": [], "shared": [], "vst3": [], "programs": _installed_programs(prefix), "apps": {}}
+    inv = {"extensions": [], "uxp": [], "shared": [], "vst3": [], "programs": _installed_programs(prefix), "apps": {}}
+    for d in sorted(glob.glob(os.path.join(plugin_dir(prefix, "uxp"), "*"))):
+        m = _uxp_manifest(d)
+        if m and not os.path.basename(d).startswith("."):
+            inv["uxp"].append({"id": m.get("id"), "name": m.get("name") or m.get("id"),
+                               "version": str(m.get("version") or "") or None, "path": d})
     for ext_id, man in _cep_manifests(prefix):
         if ext_id.startswith("com.adobe."):
             continue
@@ -9676,6 +9770,9 @@ def cmd_plugins_list(args):
     print("Extension panels:")
     for e in inv["extensions"] or [{"name": "(none)"}]:
         print("  %s%s" % (e["name"], " %s" % e["version"] if e.get("version") else ""))
+    print("UXP plugins:")
+    for e in inv["uxp"] or [{"name": "(none)"}]:
+        print("  %s%s" % (e["name"], " %s" % e["version"] if e.get("version") else ""))
     print("Shared plugins (After Effects, Premiere Pro, Media Encoder): %s" % (", ".join(inv["shared"]) or "(none)"))
     print("VST3 audio plugins: %s" % (", ".join(inv["vst3"]) or "(none)"))
     print("Other programs in this prefix:")
@@ -9691,7 +9788,7 @@ def cmd_plugins_folder(args):
         die({"ok": False, "reason": "no usable prefix (no drive_c). Pass --prefix, or select one in Collider."},
             EX_BADPREFIX, args.json)
     folders = {"shared": plugin_dir(prefix, "shared"), "extensions": plugin_dir(prefix, "cep"),
-               "vst3": plugin_dir(prefix, "vst3")}
+               "uxp": plugin_dir(prefix, "uxp"), "vst3": plugin_dir(prefix, "vst3")}
     for app_id in ("aftereffects", "photoshop", "illustrator"):
         for k in ("plugins", "scripts"):
             d = plugin_dir(prefix, k, app_id)
@@ -10791,8 +10888,8 @@ def build_parser():
     ppl = sub.add_parser("plugins", help="install third-party plugins into a prefix, and list them")
     plsub = ppl.add_subparsers(dest="subcmd", required=True)
     pli = plsub.add_parser("install", help="install plugins: a vendor installer (.exe, .msi), an extension "
-                                           "panel (.zxp), or plugin files (.aex, .prm, .8bf, .aip, .vst3, "
-                                           "scripts)")
+                                           "panel (.zxp), a UXP plugin (.ccx), or plugin files (.aex, .prm, "
+                                           ".8bf, .aip, .vst3, scripts)")
     pli.add_argument("files", nargs="+", metavar="FILE")
     pli.add_argument("--prefix", default=None)
     pli.add_argument("--app", default=None, help="the app a script is for (aftereffects, photoshop, illustrator)")
