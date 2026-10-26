@@ -9334,6 +9334,10 @@ PLUGIN_TYPES = {
     ".exe": ("installer", "run"), ".msi": ("installer", "run"),
     ".ccx": ("UXP plugin", "uxp"),
 }
+# Premiere Pro scans audio plugins by itself only on its first launch; a VST installed later is loaded by
+# its Audio Plug-in Manager (Adobe's VST3 host checker validates it there).
+VST_SCAN_NOTE = ("In Premiere Pro, choose Edit > Preferences > Audio > Manage Audio Plug-ins, then Scan for "
+                 "Plug-Ins, to load it.")
 PLUGIN_SHARED_DIR = ("Program Files", "Adobe", "Common", "Plug-ins", "7.0", "MediaCore")
 PLUGIN_CEP_DIR = ("Program Files (x86)", "Common Files", "Adobe", "CEP", "extensions")
 PLUGIN_VST3_DIR = ("Program Files", "Common Files", "VST3")
@@ -9549,7 +9553,11 @@ def cmd_plugins_install(args):
                     r.update(ok=False, reason="this runtime would re-stamp the prefix; run "
                              "`neutron prefix provision %s` first" % _sh(prefix))
                 else:
+                    vst3_before = set(_listdir(plugin_dir(prefix, "vst3")))
                     r.update(_run_installer(args, prefix, path, wine))
+                    added = sorted(set(_listdir(plugin_dir(prefix, "vst3"))) - vst3_before)
+                    if r.get("ok") and added:
+                        r.update(vst3=added, note=VST_SCAN_NOTE)
         elif kind == "cep":
             r.update(_install_zxp(prefix, path))
         else:
@@ -9570,6 +9578,8 @@ def cmd_plugins_install(args):
                 try:
                     final, replaced = _copy_into(path, dest)
                     r.update(ok=True, to=final, replaced=replaced)
+                    if kind == "vst3":
+                        r["note"] = VST_SCAN_NOTE
                 except OSError as e:
                     r.update(ok=False, reason=str(e))
         results.append(r)
@@ -9617,6 +9627,14 @@ def _installed_programs(prefix):
         ver = re.search(r'"DisplayVersion"="([^"]*)"', body)
         out.append({"name": name.group(1), "publisher": publisher, "version": ver.group(1) if ver else None})
     return sorted({p["name"]: p for p in out}.values(), key=lambda p: p["name"].lower())
+
+
+def _listdir(d):
+    """A folder's visible entries, or none when it does not exist yet."""
+    try:
+        return [n for n in os.listdir(d) if not n.startswith(".")]
+    except OSError:
+        return []
 
 
 def plugins_inventory(prefix):

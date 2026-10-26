@@ -139,6 +139,24 @@ class Plugins(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(vst3, "Single.vst3")))
         self.assertTrue(os.path.isfile(os.path.join(vst3, "Pro-Q.vst3", "Contents", "x86_64-win", "Pro-Q.vst3")))
         self.assertEqual(self.cli.plugins_inventory(self.prefix)["vst3"], ["Pro-Q.vst3", "Single.vst3"])
+        self.assertIn("Scan for Plug-Ins", out["installed"][0]["note"])
+
+    def test_an_installer_that_adds_vst3_says_how_to_load_it(self):
+        exe = self.file("setup.exe")
+        vst3 = self.drive("Program Files", "Common Files", "VST3")
+
+        def fake_installer(args, prefix, path, wine):
+            os.makedirs(vst3, exist_ok=True)
+            open(os.path.join(vst3, "Vendor EQ.vst3"), "w").close()
+            return {"ok": True}
+        with mock.patch.object(self.cli, "_running_app_ids", return_value=[]), \
+             mock.patch.object(self.cli, "resolve_wine", return_value=("/x/wine", True)), \
+             mock.patch.object(self.cli, "stamp_mismatch", return_value=False), \
+             mock.patch.object(self.cli, "_run_installer", side_effect=fake_installer):
+            rc, out = self.install(exe)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["installed"][0]["vst3"], ["Vendor EQ.vst3"])
+        self.assertIn("Manage Audio Plug-ins", out["installed"][0]["note"])
 
     def test_replacing_keeps_the_old_file_for_a_running_app(self):
         aex = self.file("Effect.aex", "new")
