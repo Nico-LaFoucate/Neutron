@@ -6191,6 +6191,13 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-150: a maximized After Effects panel showed a black strip under its tab row. "
                "Turn it off if a panel updates later than it used to.",
     },
+    "vkd3d-list-keeps-allocator": {
+        "env": "NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR", "default": True,
+        "what": "keep a Direct3D 12 command list's memory until the list itself is gone, as Windows does",
+        "why": "runtime 11.10-151 (Neutron#36): Illustrator's Image Trace ended in a winevulkan "
+               "\"vkQueueSubmit2\" assertion. Turn it off if an app's memory keeps growing while it draws "
+               "with Direct3D 12.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
@@ -9056,6 +9063,22 @@ def _save_installed(data):
     os.replace(tmp, NEUTRON_INSTALLED_JSON)
 
 
+def _gh_rate_limited(e):
+    """The sentence for GitHub's rate limit when the HTTPError `e` is one, else None. Without a
+    sign-in GitHub allows 60 API requests an hour per network address, and says so with a 403 (or
+    429) whose X-RateLimit-Remaining is 0 and X-RateLimit-Reset is when the hour starts again."""
+    import time
+    if e.code not in (403, 429) or not e.headers or e.headers.get("X-RateLimit-Remaining") != "0":
+        return None
+    try:
+        minutes = max(1, -(-(int(e.headers.get("X-RateLimit-Reset")) - int(time.time())) // 60))
+        when = f"in {minutes} minute{'s' if minutes != 1 else ''}"
+    except (TypeError, ValueError):
+        when = "within the hour"
+    return (f"GitHub's limit on requests from this network is used up for now; try again {when}. "
+            "Without signing in, GitHub allows 60 requests an hour per network address.")
+
+
 def _gh_latest(repo):
     """The release GitHub marks Latest for <owner>/<repo> (pre-releases never are):
     {"version", "assets": {name: url}}. Raises RuntimeError with a readable reason."""
@@ -9069,6 +9092,9 @@ def _gh_latest(repo):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise RuntimeError(f"{GITHUB_OWNER}/{repo} has no published release yet")
+        limit = _gh_rate_limited(e)
+        if limit:
+            raise RuntimeError(limit)
         raise RuntimeError(f"GitHub answered {e.code} for {GITHUB_OWNER}/{repo}")
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise RuntimeError(f"could not reach GitHub ({e})")
