@@ -10368,7 +10368,10 @@ def _install_runtime(args, src_dir=None, version=None):
 
 def _collider_desktop_entry(appimage):
     """Neutron Collider in the application menu. PATH is spelled out because a menu launch may
-    not include ~/.local/bin, and Collider runs `neutron` and `mudhut` from PATH."""
+    not include ~/.local/bin, and Collider runs `neutron` and `mudhut` from PATH.
+    StartupWMClass is Collider's window class (its binary name, as in the AppImage's own
+    Collider.desktop): without it GNOME could not tie the window to this entry and showed a gear
+    in the dock (Ubuntu 26.04 VM, 2026-10-27)."""
     import tempfile
     if os.path.exists(os.path.join(APPS_DIR, "collider.desktop")):
         return "kept the existing collider.desktop"
@@ -10392,7 +10395,7 @@ def _collider_desktop_entry(appimage):
                 "GenericName=Adobe Creative Cloud\n"
                 "Comment=Install and run Adobe Creative Cloud apps on Linux\n"
                 f"Exec=env {desktop_exec_arg('PATH=' + path)} {desktop_exec_arg(appimage)}\n"
-                f"Icon={icon}\nTerminal=false\n"
+                f"Icon={icon}\nTerminal=false\nStartupWMClass=collider\n"
                 "Categories=Graphics;Photography;AudioVideo;\n")
     refresh_desktop_caches(APPS_DIR)
     return "menu entry added"
