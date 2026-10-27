@@ -135,7 +135,7 @@ The table above is the 2025 line; the 2026 line is below.
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu — tested both ways on this release (runtime 11.10-118 or later). |
 
-The [status board](https://neutronproject.org) tracks both releases and is the canonical view.
+The [status board](https://neutronproject.org) tracks both releases and is the canonical view. [What Neutron does today](https://neutronproject.org/wiki/start/basics/what-neutron-does/) covers the rest: installing and updating apps straight from Adobe, GPU acceleration, pen tablets, plugins and more.
 
 > [!NOTE]
 > Even where a specific app is untested, the core fixes built for the apps above — licensing and
