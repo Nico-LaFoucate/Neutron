@@ -1,0 +1,97 @@
+title: "[App and version] on [distribution], [GPU]"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell others how an Adobe app runs on your setup. These are reports from users: they aren't tested by Neutron, and the [status board](https://neutronproject.org/#status) only changes after a lab test. Something broken? Please also file a [bug report](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose), so it can be fixed.
+  - type: dropdown
+    id: app
+    attributes:
+      label: App
+      options:
+        - Premiere Pro
+        - After Effects
+        - Photoshop
+        - Lightroom Classic
+        - Illustrator
+        - Media Encoder
+        - Animate
+        - Audition (experimental)
+        - InDesign (experimental)
+        - Lightroom (cloud, experimental)
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: From the app's Help > About (or System Info).
+      placeholder: e.g. Premiere Pro 26.5.2
+    validations:
+      required: true
+  - type: dropdown
+    id: overall
+    attributes:
+      label: How well does it work?
+      options:
+        - Good for real work
+        - Works, with problems (say which below)
+        - Doesn't work
+    validations:
+      required: true
+  - type: checkboxes
+    id: works
+    attributes:
+      label: What did you try that worked?
+      description: Tick only what you tried yourself.
+      options:
+        - label: Launches and signs in
+        - label: Opens, edits and saves files
+        - label: GPU acceleration is on (the app sees your GPU)
+        - label: Playback or export (video and audio apps)
+        - label: Pen or tablet (pressure)
+        - label: Plugins or extension panels
+        - label: Dynamic Link between Premiere Pro and After Effects
+        - label: Two or more screens
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and version
+      placeholder: e.g. Fedora 44, Bazzite 44, Ubuntu 26.04, CachyOS
+    validations:
+      required: true
+  - type: dropdown
+    id: desktop
+    attributes:
+      label: Desktop
+      options:
+        - KDE Plasma
+        - GNOME
+        - Hyprland
+        - Other (say which below)
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: e.g. NVIDIA RTX 3070, driver 590; AMD RX 7800 XT, Mesa 26.2
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Neutron runtime
+      description: The neutron-wine version from `neutron --version` (or Collider's Preferences).
+      placeholder: e.g. 11.10-156
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Problems you hit, workarounds, anything others should know.
+  - type: textarea
+    id: report
+    attributes:
+      label: neutron report (optional)
+      description: The output of `neutron report`, or Collider's "Copy details". Your user name, home folder and sign-in details are already replaced.
+      render: text
