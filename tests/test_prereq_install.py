@@ -13,6 +13,7 @@ import importlib.util
 import os
 import shutil
 import tempfile
+import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -127,9 +128,10 @@ class Install(unittest.TestCase):
 class Setup(unittest.TestCase):
     PROBLEM = "cabextract is missing (it unpacks Microsoft's installers). Install it: ..."
     PLAN = Install.PLAN
+    NTSYNC = None           # ntsync already on (or absent): the plan is the packages alone
 
-    def run_setup(self, install_flag, checks):
-        args = SimpleNamespace(json=True, install_prereqs=install_flag, yes=False, from_dir=None)
+    def run_setup(self, install_flag, checks, no_ntsync=False):
+        args = SimpleNamespace(json=True, install_prereqs=install_flag, yes=False, from_dir=None, no_ntsync=no_ntsync)
         died = {}
 
         def fake_die(obj, code, as_json):
@@ -137,6 +139,7 @@ class Setup(unittest.TestCase):
             raise Died()
         with mock.patch.object(N, "_setup_checks", side_effect=checks), \
              mock.patch.object(N, "prereq_plan", return_value=self.PLAN), \
+             mock.patch.object(N, "_ntsync_enable_cmd", return_value=self.NTSYNC), \
              mock.patch.object(N, "install_prereqs", return_value=True) as inst, \
              mock.patch.object(N, "die", side_effect=fake_die), \
              mock.patch.object(N, "event"), \
@@ -159,6 +162,40 @@ class Setup(unittest.TestCase):
         died, inst = self.run_setup(True, [([self.PROBLEM, "glibc 2.35 is too old; Neutron needs 2.39"], [])])
         inst.assert_not_called()
         self.assertIn("prereqs", died)
+
+
+class OnePassword(Setup):
+    """2026-10-27, Ubuntu 26.04 VM: the system asked for the password twice, for the packages and then for
+    ntsync. His "so they only need to enter their password once": one command does both."""
+    NTSYNC = "echo ntsync > /etc/modules-load.d/ntsync.conf && modprobe ntsync"
+
+    def test_collider_gets_the_plan_when_it_did_not_ask_to_install(self):
+        died, _ = self.run_setup(False, [([self.PROBLEM], [])])
+        self.assertEqual(died["prereqs"]["command"], "dnf install -y cabextract && { %s || true; }" % self.NTSYNC)
+        self.assertIs(died["prereqs"]["ntsync"], True)
+
+    def test_installs_both_with_one_command(self):
+        _, inst = self.run_setup(True, [([self.PROBLEM], []), ([], [])])
+        self.assertIn("modprobe ntsync", inst.call_args[0][0]["command"])
+
+    def test_no_ntsync_keeps_the_packages_alone(self):
+        died, _ = self.run_setup(False, [([self.PROBLEM], [])], no_ntsync=True)
+        self.assertEqual(died["prereqs"]["command"], "dnf install -y cabextract")
+
+    def test_the_ntsync_step_does_not_ask_again(self):
+        args = SimpleNamespace(json=True, yes=False)
+        with mock.patch.object(N, "_enable_ntsync") as enable, \
+             mock.patch.object(N, "ntsync_status", return_value="active"):
+            self.assertEqual(N._ntsync_step(args, True), "active")
+            enable.assert_not_called()
+            N._ntsync_step(args, False)
+            enable.assert_called_once()
+
+    def test_a_failing_ntsync_never_fails_the_packages(self):
+        r = subprocess.run(["sh", "-c", "true && { false || true; }"])
+        self.assertEqual(r.returncode, 0)
+        r = subprocess.run(["sh", "-c", "false && { true || true; }"])
+        self.assertNotEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":

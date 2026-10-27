@@ -10401,13 +10401,11 @@ def _collider_desktop_entry(appimage):
     return "menu entry added"
 
 
-def _enable_ntsync(as_json, assume_yes):
-    """Turn on ntsync permanently if the kernel has it (DECISIONS G9). Neutron works without it,
-    just much slower. One root step: Fedora's ntsync-autoload package, else a modules-load.d entry
-    plus modprobe. Asks for the password through sudo in a terminal, pkexec otherwise."""
-    st = ntsync_status()
-    if st != "available":
-        return st
+def _ntsync_enable_cmd():
+    """The root command that turns ntsync on permanently, or None when it is on already or the kernel
+    has none: Fedora's ntsync-autoload package, else a modules-load.d entry plus modprobe."""
+    if ntsync_status() != "available":
+        return None
     distro = ""
     try:
         with open("/etc/os-release") as f:
@@ -10415,9 +10413,37 @@ def _enable_ntsync(as_json, assume_yes):
     except OSError:
         pass
     if distro == "fedora" and have("dnf"):
-        cmd = "dnf install -y ntsync-autoload && modprobe ntsync"
-    else:
-        cmd = "echo ntsync > /etc/modules-load.d/ntsync.conf && modprobe ntsync"
+        return "dnf install -y ntsync-autoload && modprobe ntsync"
+    return "echo ntsync > /etc/modules-load.d/ntsync.conf && modprobe ntsync"
+
+
+def _plan_with_ntsync(plan, args):
+    """One password for both root steps (2026-10-27, his "so they only need to enter their password
+    once"): Ubuntu 26.04 asked twice, for the packages and then for ntsync. When the packages can be
+    installed and ntsync is off, the same command turns it on; ntsync failing never fails the
+    packages (Neutron runs without it, slower)."""
+    if not plan.get("command") or getattr(args, "no_ntsync", False):
+        return plan
+    nt = _ntsync_enable_cmd()
+    if nt:
+        plan = dict(plan, command=f"{plan['command']} && {{ {nt} || true; }}", ntsync=True)
+    return plan
+
+
+def _ntsync_step(args, tried):
+    """Setup's ntsync step. `tried`: the package install already ran the ntsync command under the same
+    password, so report the status and never ask a second time."""
+    return ntsync_status() if tried else _enable_ntsync(args.json, getattr(args, "yes", False))
+
+
+def _enable_ntsync(as_json, assume_yes):
+    """Turn on ntsync permanently if the kernel has it (DECISIONS G9). Neutron works without it,
+    just much slower. One root step: Fedora's ntsync-autoload package, else a modules-load.d entry
+    plus modprobe. Asks for the password through sudo in a terminal, pkexec otherwise."""
+    st = ntsync_status()
+    if st != "available":
+        return st
+    cmd = _ntsync_enable_cmd()
     tty = sys.stdin.isatty() and not as_json
     if tty and not assume_yes:
         print("[neutron] Your kernel has ntsync, which makes the Adobe apps much faster, but it is "
@@ -10522,8 +10548,10 @@ def install_prereqs(plan, as_json, assume_yes):
         return False
     tty = sys.stdin.isatty() and not as_json
     if tty and not assume_yes:
-        print("[neutron] Neutron needs %s, which this system doesn't have yet.\n[neutron] Installing them needs "
-              "your password once:\n[neutron]     %s" % (" and ".join(plan["missing"]), cmd), file=sys.stderr)
+        print("[neutron] Neutron needs %s, which this system doesn't have yet.%s\n[neutron] Installing them needs "
+              "your password once:\n[neutron]     %s" % (" and ".join(plan["missing"]),
+              "\n[neutron] The same step turns on ntsync, which makes the Adobe apps much faster."
+              if plan.get("ntsync") else "", cmd), file=sys.stderr)
         try:
             if input("[neutron] Install them now? [y/N] ").strip().lower() not in ("y", "yes"):
                 return False
@@ -10572,16 +10600,18 @@ def cmd_setup(args, updating=False):
     Adobe's ACCCx through it), Collider, menu entries, ntsync."""
     what = "update" if updating else "setup"
     problems, warnings = _setup_checks()
-    plan = prereq_plan()
+    plan = _plan_with_ntsync(prereq_plan(), args)
+    ntsync_tried = False
     # Only when the missing packages are all that stops setup (installing them can't fix an old glibc).
     others = [p for p in problems if not p.startswith(("the 32-bit C library", "cabextract"))]
     if problems and not others and plan["can_install"] and (
             getattr(args, "install_prereqs", False) or (sys.stdin.isatty() and not args.json)):
         event(args, event="progress", stage="packages",
-              msg=f"{what}: installing {' and '.join(plan['missing'])} (asks for your password)")
-        install_prereqs(plan, args.json, getattr(args, "yes", False))
+              msg=f"{what}: installing {' and '.join(plan['missing'])}"
+                  f"{' and turning on ntsync' if plan.get('ntsync') else ''} (asks for your password)")
+        ntsync_tried = install_prereqs(plan, args.json, getattr(args, "yes", False)) and plan.get("ntsync", False)
         problems, warnings = _setup_checks()
-        plan = prereq_plan()
+        plan = _plan_with_ntsync(prereq_plan(), args)
     if problems:
         die({"ok": False, "reason": "; ".join(problems), "warnings": warnings, "prereqs": plan},
             EX_DEP, args.json)
@@ -10668,7 +10698,7 @@ def cmd_setup(args, updating=False):
     except (OSError, subprocess.SubprocessError):
         pass
     if not getattr(args, "no_ntsync", False):
-        st = _enable_ntsync(args.json, getattr(args, "yes", False))
+        st = _ntsync_step(args, ntsync_tried)
         steps.append({"step": "ntsync", "ok": True, "status": st, "detail": NTSYNC_DETAIL.get(st)})
     if updating and inst.get("neutron_wine"):
         event(args, event="progress", stage="prefixes", msg="update: moving prefixes to the new runtime")
