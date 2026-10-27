@@ -585,6 +585,31 @@ ADOBE_DAEMONS = [
 ]
 
 
+def _project_arg(project):
+    """The file to open, as the app should get it: a Windows path unchanged (Collider passes one); a Linux path (a .desktop
+    %f, or typed in a terminal) as Z:\\... -- absolute first, because the app starts in its own folder, not in the one
+    `neutron` was started from."""
+    if not project or re.match(r"^[A-Za-z]:[\\/]", project):
+        return project
+    if not project.startswith("/") and os.path.exists(project):
+        project = os.path.abspath(project)
+    if project.startswith("/"):
+        # Wine maps Z:\ to the filesystem root, so an absolute Linux path becomes Z:\... -- Adobe apps need a
+        # Windows-style path.
+        project = "Z:" + project.replace("/", "\\")
+    return project
+
+
+def _program_dir(path):
+    """The folder Windows starts a program in: its own. Adobe's installer sets every Start-menu shortcut's "Start in" to
+    the exe's folder, and a double-clicked installer starts in the folder it sits in. Without it a program inherits
+    whatever Linux folder Neutron was started from (from the app menu, $HOME = Z:\\home\\<user>): a drive-less path
+    ("\\users\\<user>\\...", built from HOMEPATH) then resolves on Z: and misses (Adobe's plugin installer agent), and
+    vkd3d-proton writes its shader cache into that folder."""
+    d = os.path.dirname(os.path.abspath(path))
+    return d if os.path.isdir(d) else None
+
+
 def _start_adobe_daemons(prefix, wine, env, daemons):
     """Start the Adobe RPC/IPC services (detached) if their exes exist. They are
     singletons (mutex-guarded), so a duplicate start self-exits — safe to call
@@ -595,7 +620,7 @@ def _start_adobe_daemons(prefix, wine, env, daemons):
         if not os.path.isfile(exe):
             continue
         try:
-            subprocess.Popen([wine, exe], env=env,
+            subprocess.Popen([wine, exe], env=env, cwd=_program_dir(exe),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
             started.append(os.path.basename(exe))
@@ -2346,7 +2371,7 @@ def install_mono_gecko(wine, prefix):
                 env.pop("WINEDLLOVERRIDES", None)
                 winpath = "z:" + msi.replace("/", "\\")
                 subprocess.run([wine, "msiexec", "/i", winpath, "/qn"],
-                               env=env, stdout=subprocess.DEVNULL,
+                               env=env, cwd=_program_dir(msi), stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=240)
                 wineserver_wait(wine, prefix)
                 res["mono"] = {"version": mono_ver,
@@ -5174,7 +5199,7 @@ def _run_ms_installer(wine, prefix, key, args=("/q",)):
     env.setdefault("DISPLAY", ":0")
     env.pop("WINEDLLOVERRIDES", None)
     try:
-        r = subprocess.run([wine, exe, *args], env=env, stdout=subprocess.DEVNULL,
+        r = subprocess.run([wine, exe, *args], env=env, cwd=_program_dir(exe), stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=600)
         wineserver_wait(wine, prefix)
     finally:
@@ -6997,10 +7022,7 @@ def cmd_launch(args):
     # A file to open: the --project flag (Collider passes a Windows path) or an
     # optional positional (a .desktop file association passes a Linux %f path).
     project = args.project or getattr(args, "project_file", None)
-    if project and project.startswith("/"):
-        # Linux path -> Windows path. Wine maps Z:\ to the filesystem root, so an
-        # absolute Linux path becomes Z:\... — Adobe apps need a Windows-style path.
-        project = "Z:" + project.replace("/", "\\")
+    project = _project_arg(project)
 
     # The display fix (DS.DisableDirectXDisplay) for Premiere, After Effects and Media Encoder,
     # applied before every launch exactly as Collider does. Best-effort; never blocks.
@@ -7140,7 +7162,7 @@ def cmd_launch(args):
     try:
         # Detach so Collider supervises via PID, not via this process.
         proc = subprocess.Popen(
-            cmd, env=env,
+            cmd, env=env, cwd=_program_dir(exe),
             # log file > the caller's terminal > nowhere. Never inherit a tty we are also
             # writing to, or the log and the terminal interleave the same bytes.
             stdout=log_fh if log_fh else (None if interactive else subprocess.DEVNULL),
@@ -9593,7 +9615,7 @@ def _run_installer(args, prefix, path, wine):
         print("[neutron] Running %s. Follow the installer's window; this waits until it finishes."
               % os.path.basename(path), file=sys.stderr)
     with open(log_path, "wb") as logf:
-        rc = subprocess.run(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT,
+        rc = subprocess.run(cmd, env=env, cwd=_program_dir(path), stdout=logf, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL).returncode
     # Installers often hand the work to a child (msiexec, a bootstrapper's second stage) and exit.
     wineserver_wait(wine, prefix, timeout=3600)
