@@ -4060,6 +4060,19 @@ WINE_SYSTEM_PROCS = {
 }
 
 
+def _self_and_ancestors():
+    """This pid and its parents' up to init: the shell, Collider or Mud Hut that ran us."""
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])   # comm may hold spaces and ')'
+        except (OSError, ValueError, IndexError):
+            break
+    return pids
+
+
 def _prefix_procs(prefix):
     """Live pids belonging to this prefix: [(pid, comm, is_app)].
 
@@ -4070,11 +4083,16 @@ def _prefix_procs(prefix):
     ⛔ Compare WINEPREFIX as a WHOLE NUL-separated entry, never as a substring of the joined
     environ. 2026-09-18: the substring test made ~/mudhut-accc own every process of
     ~/mudhut-accc2 -- so a full teardown of the first prefix would have killed the second's live
-    session. Measured against a synthetic known-bad in tests/test_identity.py before the fix."""
+    session. Measured against a synthetic known-bad in tests/test_identity.py before the fix.
+
+    ⛔ Never this process or the ones that started it. 2026-10-27, Fedora 44 VM: with WINEPREFIX
+    exported in the shell, `neutron prefix provision` found itself as a leftover "app", tore the
+    prefix down and SIGKILLed itself (exit 137, no output)."""
     out = []
     want = ("WINEPREFIX=" + prefix.rstrip("/")).encode("utf-8", "replace")
+    mine = _self_and_ancestors()
     for p in os.listdir("/proc"):
-        if not p.isdigit():
+        if not p.isdigit() or int(p) in mine:
             continue
         try:
             with open(f"/proc/{p}/environ", "rb") as f:
@@ -6539,16 +6557,19 @@ class ShortDownload(OSError):
 
 def _download_retryable(e):
     """A failure another attempt can fix: the server's fault (5xx, 429), a timed-out, reset or dropped
-    connection, or a body cut short. Never another 4xx (a 404 is a wrong URL every time), and never a
-    checksum mismatch, which callers check after the download."""
+    connection, a failed name lookup, or a body cut short. Never another 4xx (a 404 is a wrong URL
+    every time), and never a checksum mismatch, which callers check after the download.
+    The name lookup: 2026-10-27, a Fedora 44 VM's setup lost Mud Hut and Collider to one
+    "[Errno -5] No address associated with hostname"; 40 lookups right after all answered."""
     import http.client
+    import socket
     import urllib.error
     if isinstance(e, urllib.error.HTTPError):
         return e.code >= 500 or e.code == 429
     if isinstance(e, urllib.error.URLError) and isinstance(e.reason, BaseException):
         e = e.reason
     return isinstance(e, (TimeoutError, ConnectionResetError, ConnectionAbortedError, ShortDownload,
-                          http.client.IncompleteRead))
+                          http.client.IncompleteRead, socket.gaierror))
 
 
 def _download(src, dest, as_json):
@@ -10184,14 +10205,25 @@ def _gh_rate_limited(e):
 
 def _gh_latest(repo):
     """The release GitHub marks Latest for <owner>/<repo> (pre-releases never are):
-    {"version", "assets": {name: url}}. Raises RuntimeError with a readable reason."""
-    import urllib.error, urllib.request
+    {"version", "assets": {name: url}}. Raises RuntimeError with a readable reason. A transient
+    failure is retried like a download's (_download_retryable), except 429: a used-up rate limit
+    lasts up to an hour."""
+    import socket, urllib.error, urllib.request
     url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/releases/latest"
     req = urllib.request.Request(url, headers={"User-Agent": "neutron-cli",
                                                "Accept": "application/vnd.github+json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            rel = json.load(r)
+        for attempt in range(len(DOWNLOAD_RETRY_DELAYS) + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    rel = json.load(r)
+                break
+            except (urllib.error.URLError, OSError) as e:
+                if (attempt == len(DOWNLOAD_RETRY_DELAYS) or not _download_retryable(e)
+                        or getattr(e, "code", None) == 429):
+                    raise
+                log(f"GitHub lookup failed ({e}); trying again in {DOWNLOAD_RETRY_DELAYS[attempt]} s: {repo}")
+                time.sleep(DOWNLOAD_RETRY_DELAYS[attempt])
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise RuntimeError(f"{GITHUB_OWNER}/{repo} has no published release yet")
@@ -10200,6 +10232,9 @@ def _gh_latest(repo):
             raise RuntimeError(limit)
         raise RuntimeError(f"GitHub answered {e.code} for {GITHUB_OWNER}/{repo}")
     except (urllib.error.URLError, OSError, ValueError) as e:
+        if isinstance(getattr(e, "reason", e), socket.gaierror):
+            raise RuntimeError("could not reach GitHub (this computer could not look up api.github.com; "
+                               "check the internet connection)")
         raise RuntimeError(f"could not reach GitHub ({e})")
     return {"version": rel.get("tag_name", "").lstrip("v"),
             "assets": {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}}
@@ -11097,6 +11132,18 @@ def main(argv=None):
     except BrokenPipeError:
         return EX_OK
     except KeyboardInterrupt:
+        return EX_FAIL
+    except Exception as e:
+        # --json callers (Collider, Mud Hut) read stdout only: a bare traceback reached the user as
+        # "neutron setup exited with code 1" (2026-10-27, Fedora live VM, disk full while writing
+        # installed.json). End with the same {ok: false, reason} as any other failure; the
+        # traceback still goes to stderr.
+        if not getattr(args, "json", False):
+            raise
+        import traceback
+        traceback.print_exc()
+        reason = str(e) if isinstance(e, OSError) else f"{type(e).__name__}: {e}"
+        emit({"ok": False, "reason": f"neutron {args.cmd} stopped: {reason}", "error_code": EX_FAIL}, True)
         return EX_FAIL
 
 

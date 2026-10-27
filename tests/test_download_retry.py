@@ -160,6 +160,44 @@ class DownloadRetry(unittest.TestCase):
         self.assertGotBody()
 
 
+class NameLookup(unittest.TestCase):
+    """2026-10-27, Fedora 44 VM: one "[Errno -5] No address associated with hostname" lost Mud Hut and
+    Collider from setup; the next 40 lookups all answered. A failed lookup is retried, in downloads and
+    in the GitHub release lookup."""
+
+    def setUp(self):
+        self.saved = getattr(N, "DOWNLOAD_RETRY_DELAYS", None)
+        N.DOWNLOAD_RETRY_DELAYS = (0, 0, 0)
+
+    def tearDown(self):
+        N.DOWNLOAD_RETRY_DELAYS = self.saved
+
+    @staticmethod
+    def lookup_error():
+        return urllib.error.URLError(socket.gaierror(-5, "No address associated with hostname"))
+
+    def test_a_failed_lookup_is_retryable(self):
+        self.assertTrue(N._download_retryable(self.lookup_error()))
+
+    def test_release_lookup_retries_then_succeeds(self):
+        import io
+        import urllib.request
+        from unittest import mock
+        ok = io.BytesIO(b'{"tag_name": "v0.1.14", "assets": []}')
+        with mock.patch.object(urllib.request, "urlopen", side_effect=[self.lookup_error(), ok]) as m:
+            self.assertEqual(N._gh_latest("Collider")["version"], "0.1.14")
+        self.assertEqual(m.call_count, 2)
+
+    def test_release_lookup_failure_reads_as_words(self):
+        import urllib.request
+        from unittest import mock
+        with mock.patch.object(urllib.request, "urlopen", side_effect=self.lookup_error()):
+            with self.assertRaises(RuntimeError) as cm:
+                N._gh_latest("Collider")
+        self.assertIn("could not look up api.github.com", str(cm.exception))
+        self.assertNotIn("Errno", str(cm.exception))
+
+
 class RerunHint(unittest.TestCase):
     def test_names_the_command_that_failed(self):
         self.assertIn("`neutron setup` again", N.setup_rerun_hint(False))
