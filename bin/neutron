@@ -10471,6 +10471,7 @@ def cmd_setup(args, updating=False):
         log("⚠️  " + w)
     src = os.path.abspath(args.from_dir) if getattr(args, "from_dir", None) else None
     inst = _installed()
+    first = not updating and not inst.get("installed_at")
     steps = []
 
     def step(name, fn):
@@ -10572,10 +10573,24 @@ def cmd_setup(args, updating=False):
         for p in out.get("prefixes_on_older_runtimes", []):
             print(f"[neutron]   {p['prefix']} still runs neutron-wine {p['runtime']}; move it to "
                   f"{p['latest']} with: {p['command']}")
-        if out["ok"] and not updating:
-            print("[neutron] Done. Open Neutron Collider from your application menu to install "
-                  "the Adobe apps.")
+        if out["ok"]:
+            for line in setup_done_lines(updating, first):
+                print("[neutron] " + line)
     return EX_OK if out["ok"] else EX_FAIL
+
+
+SUPPORT_LINE = "Neutron is free. If it helps your work, you can support it: https://neutronproject.org/#support"
+
+
+def setup_done_lines(updating, first):
+    """What a successful setup prints last. The support line goes only under the FIRST setup, in a
+    terminal: never on `update`, a repeated setup, `--json` (Collider reads that) or `launch`."""
+    if updating:
+        return []
+    lines = ["Done. Open Neutron Collider from your application menu to install the Adobe apps."]
+    if first:
+        lines.append(SUPPORT_LINE)
+    return lines
 
 
 def setup_rerun_hint(updating):
