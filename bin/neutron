@@ -10432,6 +10432,75 @@ def lib32_problem(root="/"):
             "processes. Install it: %s" % (LIB32_LOADER, how))
 
 
+def prereq_plan(root="/"):
+    """The system packages setup needs that are missing, and how to install them (2026-10-27, his "get a non-terminal
+    install working before MAX"): {"missing": [what], "packages": [names], "command": shell command run as root or
+    None, "can_install": bool, "how": a sentence when it can't be done for the user}. Collider shows the command and
+    runs it through pkexec after a click; a terminal asks first and uses sudo. Image-based systems (rpm-ostree) need a
+    restart and Arch needs the multilib repository, so those get the sentence instead."""
+    osr = os_release(root)
+    fam = _distro_family(osr)
+    need_lib32 = not os.path.exists(os.path.join(root, LIB32_LOADER))
+    need_cab = not have("cabextract")
+    missing = (["the 32-bit C library"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+    out = {"missing": missing, "packages": [], "command": None, "can_install": False, "how": None}
+    if not missing:
+        return out
+    ostree = os.path.exists(os.path.join(root, "run/ostree-booted"))
+    if fam == "fedora" and ostree:
+        pk = (["glibc.i686"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+        out.update(packages=pk, how="this system is image-based: run `rpm-ostree install %s`, then restart and "
+                                    "set up again" % " ".join(pk))
+    elif fam == "fedora":
+        pk = (["glibc.i686"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+        out.update(packages=pk, command="dnf install -y " + " ".join(pk), can_install=True)
+    elif fam == "opensuse":
+        pk = (["glibc-32bit"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+        out.update(packages=pk, command="zypper --non-interactive install " + " ".join(pk), can_install=True)
+    elif fam == "debian":
+        pk = (["libc6:i386"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+        cmd = "apt-get update && apt-get install -y " + " ".join(pk)
+        out.update(packages=pk, command=("dpkg --add-architecture i386 && " + cmd) if need_lib32 else cmd,
+                   can_install=True)
+    elif fam == "arch":
+        conf = _read_text(os.path.join(root, "etc/pacman.conf")) or ""
+        pk = (["lib32-glibc"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+        out["packages"] = pk
+        if need_lib32 and not re.search(r"(?m)^\s*\[multilib\]", conf):
+            out["how"] = ("enable the [multilib] repository in /etc/pacman.conf, then run `sudo pacman -Sy %s`"
+                          % " ".join(pk))
+        else:
+            out.update(command="pacman -S --needed --noconfirm " + " ".join(pk), can_install=True)
+    else:
+        out["how"] = "install your distribution's 32-bit glibc (multilib) and cabextract packages"
+    return out
+
+
+def install_prereqs(plan, as_json, assume_yes):
+    """Run plan["command"] as root: sudo in a terminal (after asking, unless --yes), pkexec otherwise. True when it ran
+    and exited 0. Never called without a command the user can see first."""
+    cmd = plan.get("command")
+    if not cmd:
+        return False
+    tty = sys.stdin.isatty() and not as_json
+    if tty and not assume_yes:
+        print("[neutron] Neutron needs %s, which this system doesn't have yet.\n[neutron] Installing them needs "
+              "your password once:\n[neutron]     %s" % (" and ".join(plan["missing"]), cmd), file=sys.stderr)
+        try:
+            if input("[neutron] Install them now? [y/N] ").strip().lower() not in ("y", "yes"):
+                return False
+        except EOFError:
+            return False
+    runner = ["sudo", "sh", "-c", cmd] if tty else (["pkexec", "sh", "-c", cmd] if have("pkexec") else None)
+    if not runner:
+        return False
+    try:
+        return subprocess.run(runner, timeout=1800).returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not install {' '.join(plan['packages'])}: {e}")
+        return False
+
+
 def _setup_checks():
     """Problems that stop setup, and warnings that don't."""
     problems, warnings = [], []
@@ -10465,8 +10534,19 @@ def cmd_setup(args, updating=False):
     Adobe's ACCCx through it), Collider, menu entries, ntsync."""
     what = "update" if updating else "setup"
     problems, warnings = _setup_checks()
+    plan = prereq_plan()
+    # Only when the missing packages are all that stops setup (installing them can't fix an old glibc).
+    others = [p for p in problems if not p.startswith(("the 32-bit C library", "cabextract"))]
+    if problems and not others and plan["can_install"] and (
+            getattr(args, "install_prereqs", False) or (sys.stdin.isatty() and not args.json)):
+        event(args, event="progress", stage="packages",
+              msg=f"{what}: installing {' and '.join(plan['missing'])} (asks for your password)")
+        install_prereqs(plan, args.json, getattr(args, "yes", False))
+        problems, warnings = _setup_checks()
+        plan = prereq_plan()
     if problems:
-        die({"ok": False, "reason": "; ".join(problems), "warnings": warnings}, EX_DEP, args.json)
+        die({"ok": False, "reason": "; ".join(problems), "warnings": warnings, "prereqs": plan},
+            EX_DEP, args.json)
     for w in warnings:
         log("⚠️  " + w)
     src = os.path.abspath(args.from_dir) if getattr(args, "from_dir", None) else None
@@ -10960,7 +11040,11 @@ def build_parser():
         su.add_argument("--no-collider", action="store_true", help="skip Collider")
         su.add_argument("--no-mudhut", action="store_true", help="skip Mud Hut")
         su.add_argument("--no-ntsync", action="store_true", help="do not offer to turn on ntsync")
-        su.add_argument("--yes", action="store_true", help="do not ask before enabling ntsync")
+        su.add_argument("--yes", action="store_true",
+                        help="do not ask before enabling ntsync or installing missing system packages")
+        su.add_argument("--install-prereqs", action="store_true",
+                        help="install the missing system packages Neutron needs (32-bit glibc, cabextract); "
+                             "asks for your password")
         su.set_defaults(func=fn)
     un = sub.add_parser("uninstall", help="remove what `neutron setup` installed; prefixes only "
                                           "if you say so")
