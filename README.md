@@ -115,7 +115,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **NVIDIA (CUDA / NVENC)** | 🟢 `Beta` | The primary hardware used in development (RTX 5070, nvidia-open). |
 | **AMD GPUs** | 🟡 `Partial` | Photoshop 2026 and Premiere Pro 2026 use the GPU (Premiere through AMD's ROCm OpenCL), and Illustrator 2026 runs. Hardware video encoding on AMD is new in runtime 11.10-133 and testers haven't confirmed it yet ([#22](https://github.com/Nico-LaFoucate/Neutron/issues/22)). After Effects, Media Encoder and Lightroom Classic haven't been tried on AMD yet. |
 | **Intel GPUs** | 🟡 `Partial` | A user reports Premiere Pro 2026 and Photoshop 2026 working on an 11th-gen Iris Xe (Fedora 44) with Intel's OpenCL runtime and media driver (`intel-opencl intel-compute-runtime intel-media-driver` on Fedora) ([#32](https://github.com/Nico-LaFoucate/Neutron/discussions/32)). The other apps haven't been tried on Intel yet. |
-| **Third-party plugins** | 🟢 `Beta` | In daily use: Captioneer and other third-party panels in Premiere Pro, and VST3 audio plugins in Premiere Pro. The aescripts + aeplugins manager runs; installing plugins through it hasn't been tested yet. |
+| **Third-party plugins** | 🟢 `Beta` | In daily use: Captioneer and other third-party panels in Premiere Pro, and VST3 audio plugins in Premiere Pro. Install them with Collider's Plugins page or `neutron plugins install`: plugin files, extension panels (`.zxp`), UXP plugins (`.ccx`), VST3 plugins, scripts and vendors' Windows installers ([how-to](https://neutronproject.org/wiki/start/basics/plugins/)). The aescripts + aeplugins manager runs; installing plugins through it hasn't been tested yet. |
 
 ### Creative Cloud 2026
 
@@ -218,6 +218,8 @@ put `--json` before the command: `neutron --json doctor --prefix <path>`.
 | `neutron teardown [--app <id>]` | Close one app, or the whole prefix, cleanly — apps save their preferences, and Adobe's orphaned daemons are swept so they can't wedge the next launch. |
 | `neutron display` | Show the display scale Neutron will use, and whether it is one Adobe's UI lays out cleanly. A scale set in Collider's Preferences applies to every launch, including the app menu and desktop icons. |
 | `neutron runtime install --version <v>` | Install a specific [neutron-wine](https://github.com/Nico-LaFoucate/neutron-wine) version (e.g. a pre-release), verified against its sha256. |
+| `neutron plugins install <file>...` | Install plugins into a prefix where their Windows installers would put them: `.aex`/`.prm`, Photoshop and Illustrator plugin files, `.zxp` extension panels (signature checked first), `.ccx` UXP plugins, `.vst3`, scripts (`--app` says which app), or a vendor's `.exe`/`.msi` installer, run in the prefix. |
+| `neutron plugins list` / `folder` | List the third-party plugins and programs in a prefix, or print the folder each kind of plugin goes into. |
 | `neutron runtime list` / `prune` | List the installed runtimes, their size and what still uses each; `prune` removes the ones no prefix, menu entry or running app uses. |
 
 ---
