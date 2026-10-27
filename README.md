@@ -8,7 +8,7 @@
 
 # Neutron
 
-**A Wine-based compatibility engine tuned for professional creative software on Linux.**
+**Run Adobe Creative Cloud apps on Linux: a Wine-based compatibility engine tuned for professional creative software.**
 
 Premiere Pro · After Effects · Photoshop · Lightroom Classic · Illustrator · Animate · Media Encoder
 — accelerated on your GPU, running on Linux.
@@ -30,7 +30,7 @@ Premiere Pro · After Effects · Photoshop · Lightroom Classic · Illustrator �
 >
 > - The applications below are used for real work, including paid client work. They are developed
 >   and tested on CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs.
-> - Users also run Neutron on Ubuntu, Bazzite, Nobara and Arch, under GNOME and Hyprland as well
+> - Users also run Neutron on Fedora, Ubuntu, Bazzite, Nobara and Arch, under GNOME and Hyprland as well
 >   as KDE.
 > - **AMD GPUs:** Photoshop 2026 and Premiere Pro 2026 use the GPU, and Illustrator 2026 runs.
 >   Premiere needs AMD's ROCm OpenCL installed. Hardware video encoding on AMD is new in runtime
