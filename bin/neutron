@@ -2010,8 +2010,7 @@ def session_is_wayland():
     return os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
 
-X11_NOTICE = ("X11 session: Neutron is made for Wayland, so this is unsupported and Neutron's Wayland fixes "
-              "are off")
+X11_NOTICE = ("X11 session: X11 support is experimental, and Neutron's Wayland fixes are off")
 
 
 def session_display():
@@ -2019,8 +2018,9 @@ def session_display():
     to show windows in, or one we can't be sure of).
 
     2026-10-28, his "Allow x11 on x11 sessions": Linux Mint starts Cinnamon on X11 by default, and
-    launch refused there. X11 is still not what Neutron is made for (every graphics fix lives in
-    winewayland), but a session that IS X11 now runs on Wine's X11 driver instead of refusing.
+    launch refused there. A session that IS X11 now runs on Wine's X11 driver instead of refusing;
+    his call the same day: X11 support is "Experimental" (every graphics fix so far lives in
+    winewayland).
 
     The August rule stands for every UNCERTAIN case: X11 only when the session says so itself
     (XDG_SESSION_TYPE=x11, a DISPLAY) and no Wayland compositor is running for this user (no
@@ -7060,7 +7060,7 @@ def cmd_launch(args):
                         PROVISION_DXVK_CONF_BODIES.get(profile.get("dxvk_conf")))
         log(f"display: wayland | scale={scale} ({_scale_src or 'not detected'}) LogPixels={logpixels}")
     elif display_mode == "x11":
-        # A real X11 session (session_display): Wine's X11 driver, unsupported, every winewayland
+        # A real X11 session (session_display): Wine's X11 driver, experimental, every winewayland
         # fix inactive. A later launch from a Wayland session sets the driver back.
         log("WARNING: " + X11_NOTICE)
         apply_session_display(wine, prefix, "x11", env)
@@ -10662,8 +10662,7 @@ def _setup_checks():
                         "`sudo dnf install cabextract` or `sudo zypper install cabextract`")
     _mode = session_display()
     if _mode == "x11":
-        warnings.append(X11_NOTICE.replace("X11 session: ", "this is an X11 session. ", 1)
-                        + "; the apps run, but bug reports from X11 sessions aren't supported")
+        warnings.append(X11_NOTICE.replace("X11 session: ", "this is an X11 session. ", 1))
     elif _mode is None:
         warnings.append("no Wayland or X11 session found: setup works, but the apps need a desktop "
                         "session to start in")
