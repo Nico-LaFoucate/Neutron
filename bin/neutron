@@ -1160,13 +1160,14 @@ APP_PROFILES = {
         "nvapi": True, "env": {},
         "accent": "#ff9a00", "export": False,
     },
-    # EXPERIMENTAL: Audition and InDesign are not supported yet (Neutron discussion #8). These
-    # profiles exist so people can try them before official support.
+    # Audition and InDesign: Beta on Creative Cloud 2026 since 2026-10-28 (his call: "They work pretty well at this
+    # point, we can move them out of experimental and into beta"). They started as experimental profiles
+    # (Neutron discussion #8).
     # Audition is built on the same DVA framework as Premiere and Media Encoder (dvaui, dvacore,
     # ...), so its UI draws through the same D2D/GPU drawbot: it borrows Media Encoder's GPU-UI env,
     # without which that family's interface is black (see the mediaencoder profile).
     "audition": {
-        "name": "Audition (experimental)",
+        "name": "Audition",
         "exe": _adobe("Adobe Audition 2026", "Adobe Audition.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
@@ -1178,7 +1179,7 @@ APP_PROFILES = {
     },
     # InDesign has its own UI framework (no DVA); it starts from Illustrator's plain profile.
     "indesign": {
-        "name": "InDesign (experimental)",
+        "name": "InDesign",
         "exe": _adobe("Adobe InDesign 2026", "InDesign.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",

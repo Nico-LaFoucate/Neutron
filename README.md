@@ -103,8 +103,8 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Lightroom Classic** | 🟢 `Beta` | Imports 1000+ RAW files, SD-card hotplug, masking, AI Denoise, Edit-in-Photoshop. UI load-in is slow. |
 | **Illustrator 2025** | 🟢 `Beta` | Artboard, panels and toolbars render correctly (a whole-window shear traced to `CreateBitmapIndirect` discarding the caller's stride). |
 | **Media Encoder 2025** | 🟢 `Beta` | Queue, render and export end-to-end, including native muxing. |
-| **Audition 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Experimental profile: `neutron launch audition`. |
-| **InDesign 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Experimental profile: `neutron launch indesign`. |
+| **Audition 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Launch it with `neutron launch audition`. |
+| **InDesign 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Launch it with `neutron launch indesign`. |
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
 | **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu (runtime 11.10-118 or later). |
@@ -129,8 +129,8 @@ The table above is the 2025 line; the 2026 line is below.
 | **Media Encoder 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Lightroom Classic 2026** | 🟢 `Beta` | Installs and runs on this release. |
 | **Animate** | 🟢 `Beta` | Adobe stopped updating Animate in 2024, so Creative Cloud 2026 installs the same app as 2025. Canvas, panels and playback; its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
-| **Audition 2026** | 🟢 `Beta` | Experimental profile (`neutron launch audition`): recording, playback and effects work, and its Learn panel renders. |
-| **InDesign 2026** | 🟢 `Beta` | Experimental profile (`neutron launch indesign`): new documents, typing and the Type → Font menu work. |
+| **Audition 2026** | 🟢 `Beta` | `neutron launch audition`: recording, playback and effects work, and its Learn panel renders. |
+| **InDesign 2026** | 🟢 `Beta` | `neutron launch indesign`: new documents, typing and the Type → Font menu work. |
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu — tested both ways on this release (runtime 11.10-118 or later). |
 
@@ -208,7 +208,7 @@ put `--json` before the command: `neutron --json doctor --prefix <path>`.
 | Command | What it does |
 | :--- | :--- |
 | `neutron setup` / `update` / `uninstall` | Install, update or remove everything (see above). |
-| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, and three experimental ones: `lightroomcc` (Lightroom), `audition` and `indesign`. Supports `--prefix`, `--scale`, and opening a project file. |
+| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, `audition`, `indesign`, and one experimental one: `lightroomcc` (Lightroom). Supports `--prefix`, `--scale`, and opening a project file. |
 | `neutron prefix provision <path>` | Make a Wine prefix Neutron-ready: Microsoft's components, the runtime's DXVK / vkd3d-proton / NVIDIA DLLs, fonts, display fixes. |
 | `neutron prefix info <path>` | Report the paths and state Collider needs. |
 | `neutron apps --prefix <path>` | List apps and install status in a prefix. |
