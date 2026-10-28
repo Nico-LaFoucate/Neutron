@@ -2010,6 +2010,48 @@ def session_is_wayland():
     return os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
 
+X11_NOTICE = ("X11 session: Neutron is made for Wayland, so this is unsupported and Neutron's Wayland fixes "
+              "are off")
+
+
+def session_display():
+    """The display driver Wine processes use in this session: "wayland", "x11", or None (no session
+    to show windows in, or one we can't be sure of).
+
+    2026-10-28, his "Allow x11 on x11 sessions": Linux Mint starts Cinnamon on X11 by default, and
+    launch refused there. X11 is still not what Neutron is made for (every graphics fix lives in
+    winewayland), but a session that IS X11 now runs on Wine's X11 driver instead of refusing.
+
+    The August rule stands for every UNCERTAIN case: X11 only when the session says so itself
+    (XDG_SESSION_TYPE=x11, a DISPLAY) and no Wayland compositor is running for this user (no
+    wayland-N socket in XDG_RUNTIME_DIR). A launch surface that merely lacks the Wayland variables
+    on a Wayland desktop has the compositor's socket, so it is never taken for X11 and never
+    rewrites the prefix's driver. NEUTRON_ALLOW_X11=1 still forces X11 for anything else."""
+    if session_is_wayland():
+        return "wayland"
+    if os.environ.get("NEUTRON_ALLOW_X11") == "1":
+        return "x11"
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if (os.environ.get("XDG_SESSION_TYPE") == "x11" and os.environ.get("DISPLAY") and rt
+            and os.path.isdir(rt)
+            and not [n for n in os.listdir(rt) if re.fullmatch(r"wayland-\d+", n)]):
+        return "x11"
+    return None
+
+
+def apply_session_display(wine, prefix, mode, env):
+    """Point the prefix's graphics driver and `env` at `mode` ("wayland" or "x11"). The driver is a
+    prefix setting, so it is set every time a windowed process starts: a prefix used from both kinds
+    of session follows the session it is in."""
+    reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", mode)
+    if mode == "wayland":
+        env.pop("DISPLAY", None)
+        env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+    else:
+        env.pop("WAYLAND_DISPLAY", None)
+        env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
+
+
 def reg_set(wine, prefix, key, name, vtype, data):
     """Best-effort registry write via the Neutron wine. Shared-prefix safe: uses
     the prefix's existing wineserver, never kills it, and only affects newly
@@ -6981,9 +7023,9 @@ def cmd_launch(args):
     # --- Display path: Wayland-native (crisp UI + native-smooth playback) vs
     #     X11 (software frame pacer). Selected per session; merged here so there
     #     is ONE launch path (no redundant launcher script). ---
-    if session_is_wayland():
-        display_mode = "wayland"
-        reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "wayland")
+    display_mode = session_display()
+    if display_mode == "wayland":
+        apply_session_display(wine, prefix, "wayland", env)
         # auto-DPI: LogPixels = round(96 * scale) so System-DPI-aware Adobe apps
         # render at device resolution; the wp_fractional_scale patch maps it 1:1.
         scale, _scale_src = resolve_launch_scale(getattr(args, "scale", None))
@@ -6997,48 +7039,27 @@ def cmd_launch(args):
         # Pass the app's full config so a first launch never leaves a one-line stub behind.
         ensure_dxvk_gpl(dxvk_conf,
                         PROVISION_DXVK_CONF_BODIES.get(profile.get("dxvk_conf")))
-        env.pop("DISPLAY", None)
-        env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
         log(f"display: wayland | scale={scale} ({_scale_src or 'not detected'}) LogPixels={logpixels}")
-    else:
-        # ⛔ NO AUTOMATIC X11. EVER.
-        #
-        # This used to fall through to X11: write `Graphics=x11` into the PREFIX, turn on the
-        # software frame pacer, and launch. It did that on the strength of an environment
-        # variable being absent -- and launch surfaces do not share an environment (Collider
-        # inherits the login session's, a .desktop launch inherits the systemd user manager's),
-        # so the same machine could run Wayland from Collider and X11 from the application menu,
-        # rewriting the prefix's graphics driver on every launch.
-        #
-        # X11 is a HARD NEVER on this project: the winewayland work -- fractional
-        # scale, the present path, decorations, drag-and-drop, the owned-window coordinate
-        # fixes -- is where every fix of the last two months lives. Silently degrading into the
-        # one configuration we have ruled out, and persisting it into the user's installation,
-        # is not a fallback. It is the thing the rule exists to prevent, automated.
-        #
-        # So: STOP, and say exactly what is missing. Refusing is recoverable; a silently
-        # re-configured prefix is discovered days later as "the app looks wrong now".
-        if os.environ.get("NEUTRON_ALLOW_X11") != "1":
-            die({"launched": False,
-                 "reason": "no Wayland session detected, and Neutron does not fall back to X11",
-                 "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
-                 "xdg_session_type": os.environ.get("XDG_SESSION_TYPE"),
-                 "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR"),
-                 "hint": "Neutron requires a Wayland session — every graphics fix it ships lives "
-                         "in winewayland. If you ARE on Wayland, this launch surface has a "
-                         "different environment from one that works: compare it with a launch "
-                         "from Collider or a terminal. Set NEUTRON_ALLOW_X11=1 only if you "
-                         "deliberately want the unsupported X11 path, which will also rewrite "
-                         "this prefix's graphics driver."},
-                EX_DEP, args.json)
-        display_mode = "x11"
-        log("WARNING: NEUTRON_ALLOW_X11=1 -- taking the UNSUPPORTED X11 path and setting "
-            "Graphics=x11 IN THE PREFIX. Every winewayland fix is inactive here. A later "
-            "Wayland launch will set the driver back.")
-        reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", "x11")
+    elif display_mode == "x11":
+        # A real X11 session (session_display): Wine's X11 driver, unsupported, every winewayland
+        # fix inactive. A later launch from a Wayland session sets the driver back.
+        log("WARNING: " + X11_NOTICE)
+        apply_session_display(wine, prefix, "x11", env)
         env["NEUTRON_PRESENT_PACE"] = "1"   # X11 software frame pacer
-        env.setdefault("DISPLAY", ":0")
         log("display: x11 | software frame pacer (NEUTRON_PRESENT_PACE=1)")
+    else:
+        # ⛔ NO X11 ON A GUESS. A missing variable must never select X11 and rewrite the prefix's
+        # driver (2026-08-27: launch surfaces do not share an environment, so the same machine
+        # flip-flopped between Wayland and X11). Only a session that is X11 by every sign gets it.
+        die({"launched": False,
+             "reason": "no Wayland or X11 session detected to show the app in",
+             "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
+             "xdg_session_type": os.environ.get("XDG_SESSION_TYPE"),
+             "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR"),
+             "hint": "Launch from your desktop session (Collider or the application menu). If you ARE "
+                     "on a desktop, this launch surface has a different environment from one that "
+                     "works: compare it with a launch from Collider or a terminal."},
+            EX_DEP, args.json)
 
     # A file to open: the --project flag (Collider passes a Windows path) or an
     # optional positional (a .desktop file association passes a Linux %f path).
@@ -7214,6 +7235,7 @@ def cmd_launch(args):
     # report can name the exact file without the user hunting for it.
     emit({"ok": True, "launched": True, "app": args.app,
           "pid": proc.pid, "gpu_mode": gpu_mode, "display": display_mode,
+          **({"notice": X11_NOTICE} if display_mode == "x11" else {}),
           "neutron_wine": is_neutron, "log": log_path}, args.json)
     return EX_OK
 
@@ -9619,12 +9641,13 @@ def _install_ccx(prefix, path):
 
 def _run_installer(args, prefix, path, wine):
     """Run a vendor installer in the prefix and wait until it and everything it started has finished."""
-    if not session_is_wayland():
-        return {"ok": False, "reason": "no Wayland session: the installer needs a desktop to show its "
+    mode = session_display()
+    if not mode:
+        return {"ok": False, "reason": "no desktop session: the installer needs one to show its "
                                        "window in. Run this from your desktop session."}
     env = dict(os.environ)
     env["WINEPREFIX"] = prefix
-    env.pop("DISPLAY", None)
+    apply_session_display(wine, prefix, mode, env)
     # Wine's own menu entries call a bare `wine`, which can re-stamp this prefix; Neutron writes its own.
     env["WINEDLLOVERRIDES"] = "winemenubuilder.exe=d"
     env.setdefault("WINEDEBUG", "-all")
@@ -10614,9 +10637,13 @@ def _setup_checks():
         problems.append("cabextract is missing (it unpacks Microsoft's installers). Install it: "
                         "`sudo pacman -S cabextract`, `sudo apt install cabextract`, "
                         "`sudo dnf install cabextract` or `sudo zypper install cabextract`")
-    if not session_is_wayland():
-        warnings.append("this is not a Wayland session. Neutron supports Wayland only; on X11 you "
-                        "are on your own")
+    _mode = session_display()
+    if _mode == "x11":
+        warnings.append(X11_NOTICE.replace("X11 session: ", "this is an X11 session. ", 1)
+                        + "; the apps run, but bug reports from X11 sessions aren't supported")
+    elif _mode is None:
+        warnings.append("no Wayland or X11 session found: setup works, but the apps need a desktop "
+                        "session to start in")
     if LOCAL_BIN not in os.environ.get("PATH", "").split(":"):
         warnings.append(f"{LOCAL_BIN} is not on your PATH; add it so `neutron` and `mudhut` work "
                         "in a terminal")
