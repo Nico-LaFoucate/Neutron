@@ -220,6 +220,21 @@ class Premiere2026DirectXDisplay(unittest.TestCase):
         p25 = os.path.join(self.roaming, "Premiere Pro", "25.0", "Debug Database.txt")
         self.assertFalse(N._display_fix_matches(PREMIERE_PREFS, N._display_fix_wanted("premiere", p25, self.prefix)))
 
+    def test_display_fix_needed_only_where_there_is_one(self):
+        """Collider's "Display fix pending" pill on every Premiere 2026 card: 2026 runs on Adobe's default display, so
+        there is no fix, run or never run. 2025, and 2026 on a pinned pre-121 runtime, still need it."""
+        self._premiere(2026)                          # never run: no Debug Database
+        self.assertFalse(N._premiere_display_fix_needed(self.prefix, USER))
+        p26 = self._premiere(2026, PREMIERE_PREFS)    # has run
+        self.assertFalse(N._premiere_display_fix_needed(self.prefix, USER, p26))
+        self._dxgi(fixed=False)                       # pre-121 dxgi: 2026 stays on the OpenGL display + the fix
+        self.assertTrue(N._premiere_display_fix_needed(self.prefix, USER, p26))
+        self._dxgi(fixed=True)
+        shutil.rmtree(os.path.join(self.roaming, "Premiere Pro"))
+        shutil.rmtree(os.path.join(self.adobe, "Adobe Premiere Pro 2026"))
+        self._premiere(2025)
+        self.assertTrue(N._premiere_display_fix_needed(self.prefix, USER))
+
     def test_launch_env_blit_to_window_off_for_2026_only(self):
         prof = N.APP_PROFILES["premiere"]
         for year, want in ((2025, None), (2026, "1")):

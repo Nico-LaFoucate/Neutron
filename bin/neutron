@@ -1652,6 +1652,15 @@ def find_debug_database(prefix, user):
     return hits[0]
 
 
+def _premiere_display_fix_needed(prefix, user, dbg=None):
+    """False for Premiere 2026+ on a runtime that shows its DirectX display: it runs on Adobe's default display and
+    there is no fix to apply (see PREMIERE_DIRECTX_DISPLAY_FROM). True for Premiere 2025, or 2026 on an older runtime.
+    `dbg` is Premiere's Debug Database when it has one; a never-run Premiere is judged by its prefs dir or install.
+    Collider showed "Display fix pending" on every Premiere 2026 card because nothing reported this."""
+    where = dbg or _display_fix_pref_dir(prefix, user, "premiere")
+    return not (where and _display_fix_wanted("premiere", where, prefix) == DISPLAY_FIX_DEFAULT)
+
+
 def find_debug_databases(prefix, user):
     """Every DVA app's live Debug Database.txt, plus whether that app is installed.
 
@@ -4494,6 +4503,7 @@ def cmd_prefix_info(args):
     link, real = documents_paths(prefix, user)
     dbg = find_debug_database(prefix, user)
     display_fix_applied = False
+    display_fix_needed = _premiere_display_fix_needed(prefix, user, dbg if dbg and os.path.isfile(dbg) else None)
     if dbg and os.path.isfile(dbg):
         try:
             with open(dbg, "r", encoding="utf-8", errors="replace") as f:
@@ -4502,6 +4512,8 @@ def cmd_prefix_info(args):
             display_fix_applied = _display_fix_matches(content, _display_fix_wanted("premiere", dbg, prefix))
         except OSError:
             display_fix_applied = False
+    elif not display_fix_needed:
+        display_fix_applied = True   # no file = Adobe's default = what Premiere 2026 wants (apply-display-fix: "already")
 
     out = {
         "valid": True,
@@ -4512,6 +4524,7 @@ def cmd_prefix_info(args):
         "documents_real": real,          # <- symlink-resolved real Documents dir
         "debug_database": dbg,
         "display_fix_applied": display_fix_applied,
+        "display_fix_needed": display_fix_needed,   # False: Premiere 2026+, nothing to fix (Collider shows no pill)
         "neutron_stack": _stack_versions(),  # best-effort, provisional
         "_schema": "provisional-v0",      # signal: not frozen yet
     }
