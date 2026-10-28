@@ -183,7 +183,14 @@ class Failure(unittest.TestCase):
         self.assertIn("does not have a Release file", plan["failed"])
 
     def test_a_closed_password_dialog_says_so(self):
-        self.assertEqual(N._prereq_failure(126, ""), "the password dialog was closed")
+        self.assertEqual(N._prereq_failure(126, "Error executing command as another user: Request dismissed\n"),
+                         "the password dialog was closed")
+        self.assertIn("didn't allow", N._prereq_failure(127, "Error executing command as another user: Not authorized\n"))
+
+    def test_a_missing_command_is_not_called_a_refusal(self):
+        msg = N._prereq_failure(127, "sh: 1: apt-get: not found\n")
+        self.assertIn("code 127", msg)
+        self.assertIn("apt-get: not found", msg)
 
     def test_setup_passes_the_reason_to_collider(self):
         args = SimpleNamespace(json=True, install_prereqs=True, yes=False, from_dir=None, no_ntsync=True)

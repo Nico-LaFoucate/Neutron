@@ -10544,13 +10544,15 @@ def prereq_plan(root="/"):
 
 
 def _prereq_failure(code, output):
-    """Why the package command didn't finish, in a sentence for Collider: pkexec's own exit codes, else the
-    package manager's last error line."""
-    if code == 126:
+    """Why the package command didn't finish, in a sentence for Collider: pkexec's own message when it refused
+    (its 126/127 codes are also what sh returns for a command that can't run, so the message decides), else
+    the package manager's last error line."""
+    out = output or ""
+    if "Request dismissed" in out:
         return "the password dialog was closed"
-    if code == 127:
+    if "Not authorized" in out:
         return "your system didn't allow it (no password dialog could open)"
-    lines = [l.strip() for l in (output or "").splitlines() if l.strip()]
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
     errs = [l for l in lines if l.startswith(("E:", "Error", "error:", "Problem"))]
     last = (errs or lines or [""])[-1]
     return f"the command stopped with code {code}" + (f": {last}" if last else "")
