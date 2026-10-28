@@ -10523,7 +10523,10 @@ def prereq_plan(root="/"):
         out.update(packages=pk, command="zypper --non-interactive install " + " ".join(pk), can_install=True)
     elif fam == "debian":
         pk = (["libc6:i386"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
-        cmd = "apt-get update && apt-get install -y " + " ".join(pk)
+        # `;`, not `&&`, after the update: one broken source (a stale PPA; a live session's install disc) makes
+        # apt-get update exit 100 and stopped the install, though the archive the packages come from was
+        # fine (Linux Mint 22.3 live VM, 2026-10-27).
+        cmd = "apt-get update; apt-get install -y " + " ".join(pk)
         out.update(packages=pk, command=("dpkg --add-architecture i386 && " + cmd) if need_lib32 else cmd,
                    can_install=True)
     elif fam == "arch":
@@ -10540,9 +10543,23 @@ def prereq_plan(root="/"):
     return out
 
 
+def _prereq_failure(code, output):
+    """Why the package command didn't finish, in a sentence for Collider: pkexec's own exit codes, else the
+    package manager's last error line."""
+    if code == 126:
+        return "the password dialog was closed"
+    if code == 127:
+        return "your system didn't allow it (no password dialog could open)"
+    lines = [l.strip() for l in (output or "").splitlines() if l.strip()]
+    errs = [l for l in lines if l.startswith(("E:", "Error", "error:", "Problem"))]
+    last = (errs or lines or [""])[-1]
+    return f"the command stopped with code {code}" + (f": {last}" if last else "")
+
+
 def install_prereqs(plan, as_json, assume_yes):
     """Run plan["command"] as root: sudo in a terminal (after asking, unless --yes), pkexec otherwise. True when it ran
-    and exited 0. Never called without a command the user can see first."""
+    and exited 0. Never called without a command the user can see first. When it fails without a terminal, the
+    reason goes in plan["failed"]: Collider showed the same panel again with no word of why (Mint live VM)."""
     cmd = plan.get("command")
     if not cmd:
         return False
@@ -10562,9 +10579,17 @@ def install_prereqs(plan, as_json, assume_yes):
     if not runner:
         return False
     try:
-        return subprocess.run(runner, timeout=1800).returncode == 0
+        if tty:
+            return subprocess.run(runner, timeout=1800).returncode == 0
+        r = subprocess.run(runner, timeout=1800, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, errors="replace")
+        sys.stderr.write(r.stdout)
+        if r.returncode != 0:
+            plan["failed"] = _prereq_failure(r.returncode, r.stdout)
+        return r.returncode == 0
     except (OSError, subprocess.SubprocessError) as e:
         log(f"could not install {' '.join(plan['packages'])}: {e}")
+        plan["failed"] = str(e)
         return False
 
 
@@ -10611,8 +10636,11 @@ def cmd_setup(args, updating=False):
               msg=f"{what}: installing {' and '.join(plan['missing'])}"
                   f"{' and turning on ntsync' if plan.get('ntsync') else ''} (asks for your password)")
         ntsync_tried = install_prereqs(plan, args.json, getattr(args, "yes", False)) and plan.get("ntsync", False)
+        failed = plan.get("failed")
         problems, warnings = _setup_checks()
         plan = _plan_with_ntsync(prereq_plan(), args)
+        if failed and problems:
+            plan["failed"] = failed
     if problems:
         die({"ok": False, "reason": "; ".join(problems), "warnings": warnings, "prereqs": plan},
             EX_DEP, args.json)

@@ -74,10 +74,10 @@ class Plan(unittest.TestCase):
     def test_ubuntu_adds_the_i386_architecture_only_for_the_32_bit_library(self):
         self.distro("ID=ubuntu\nID_LIKE=debian\n")
         p = self.plan()
-        self.assertEqual(p["command"], "dpkg --add-architecture i386 && apt-get update && apt-get install -y libc6:i386 cabextract")
+        self.assertEqual(p["command"], "dpkg --add-architecture i386 && apt-get update; apt-get install -y libc6:i386 cabextract")
         self.write("lib/ld-linux.so.2")
         p = self.plan()
-        self.assertEqual(p["command"], "apt-get update && apt-get install -y cabextract")
+        self.assertEqual(p["command"], "apt-get update; apt-get install -y cabextract")
 
     def test_opensuse(self):
         self.distro('ID="opensuse-tumbleweed"\nID_LIKE="opensuse suse"\n')
@@ -108,7 +108,7 @@ class Install(unittest.TestCase):
     def test_collider_path_uses_pkexec_without_asking(self):
         with mock.patch.object(N.sys.stdin, "isatty", return_value=False), \
              mock.patch.object(N, "have", return_value=True), \
-             mock.patch.object(N.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
+             mock.patch.object(N.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="")) as run:
             self.assertTrue(N.install_prereqs(self.PLAN, as_json=True, assume_yes=False))
         self.assertEqual(run.call_args[0][0], ["pkexec", "sh", "-c", "dnf install -y cabextract"])
 
@@ -162,6 +162,48 @@ class Setup(unittest.TestCase):
         died, inst = self.run_setup(True, [([self.PROBLEM, "glibc 2.35 is too old; Neutron needs 2.39"], [])])
         inst.assert_not_called()
         self.assertIn("prereqs", died)
+
+
+class Failure(unittest.TestCase):
+    """2026-10-27, Linux Mint 22.3 live VM: the install stopped (apt-get update exit 100 on the live session's
+    install-disc source) and Collider showed the same panel again with no reason."""
+
+    def test_an_update_error_does_not_stop_the_install(self):
+        r = subprocess.run(["sh", "-c", "false; true"])
+        self.assertEqual(r.returncode, 0)          # `update; install` exits with the install's status
+
+    def test_the_reason_reaches_the_plan(self):
+        plan = dict(Install.PLAN)
+        out = "Reading package lists...\nE: The repository 'cdrom://Linux Mint 22.3' does not have a Release file.\n"
+        with mock.patch.object(N.sys.stdin, "isatty", return_value=False), \
+             mock.patch.object(N, "have", return_value=True), \
+             mock.patch.object(N.subprocess, "run", return_value=SimpleNamespace(returncode=100, stdout=out)):
+            self.assertFalse(N.install_prereqs(plan, as_json=True, assume_yes=False))
+        self.assertIn("code 100", plan["failed"])
+        self.assertIn("does not have a Release file", plan["failed"])
+
+    def test_a_closed_password_dialog_says_so(self):
+        self.assertEqual(N._prereq_failure(126, ""), "the password dialog was closed")
+
+    def test_setup_passes_the_reason_to_collider(self):
+        args = SimpleNamespace(json=True, install_prereqs=True, yes=False, from_dir=None, no_ntsync=True)
+        died = {}
+
+        def fake_die(obj, code, as_json):
+            died.update(obj)
+            raise Died()
+
+        def failing_install(plan, *a):
+            plan["failed"] = "the command stopped with code 100: E: boom"
+            return False
+        with mock.patch.object(N, "_setup_checks", return_value=([Setup.PROBLEM], [])), \
+             mock.patch.object(N, "prereq_plan", side_effect=lambda: dict(Install.PLAN)), \
+             mock.patch.object(N, "install_prereqs", side_effect=failing_install), \
+             mock.patch.object(N, "die", side_effect=fake_die), \
+             mock.patch.object(N, "event"):
+            with self.assertRaises(Died):
+                N.cmd_setup(args)
+        self.assertEqual(died["prereqs"]["failed"], "the command stopped with code 100: E: boom")
 
 
 class OnePassword(Setup):
