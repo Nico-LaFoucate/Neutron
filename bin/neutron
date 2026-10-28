@@ -6379,6 +6379,12 @@ NEUTRON_GATES = {
         "why": "runtime 11.10-157: Lightroom Classic's maximized Export dialog kept a stale picture of its old "
                "size. Turn it off if a maximized window shows an empty strip along its bottom or right edge.",
     },
+    "clickthrough-live": {
+        "env": "NEUTRON_CLICKTHROUGH_LIVE", "default": True,
+        "what": "let a see-through window take clicks again as soon as it stops being click-through, as Windows does",
+        "why": "runtime 11.10-158: Photoshop's \"Try Adjustments presets\" tip could not be dismissed. Turn it off "
+               "if clicks start landing on a fading pop-up instead of the window under it.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
