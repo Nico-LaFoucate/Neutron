@@ -6373,6 +6373,12 @@ NEUTRON_GATES = {
                "\"vkQueueSubmit2\" assertion. Turn it off if an app's memory keeps growing while it draws "
                "with Direct3D 12.",
     },
+    "max-short": {
+        "env": "NEUTRON_MAX_SHORT", "default": True,
+        "what": "show a maximized window that sizes itself shorter than the screen at its own size, as Windows does",
+        "why": "runtime 11.10-157: Lightroom Classic's maximized Export dialog kept a stale picture of its old "
+               "size. Turn it off if a maximized window shows an empty strip along its bottom or right edge.",
+    },
     "dock-owned": {
         "env": "NEUTRON_DOCK_OWNED", "default": False,
         "what": "embed owned captioned toplevels as subsurfaces (older, blunter prototype)",
