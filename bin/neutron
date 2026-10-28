@@ -10548,12 +10548,13 @@ def install_prereqs(plan, as_json, assume_yes):
         return False
     tty = sys.stdin.isatty() and not as_json
     if tty and not assume_yes:
-        print("[neutron] Neutron needs %s, which this system doesn't have yet.%s\n[neutron] Installing them needs "
+        them = "them" if len(plan["missing"]) > 1 else "it"
+        print("[neutron] Neutron needs %s, which this system doesn't have yet.%s\n[neutron] Installing %s needs "
               "your password once:\n[neutron]     %s" % (" and ".join(plan["missing"]),
               "\n[neutron] The same step turns on ntsync, which makes the Adobe apps much faster."
-              if plan.get("ntsync") else "", cmd), file=sys.stderr)
+              if plan.get("ntsync") else "", them, cmd), file=sys.stderr)
         try:
-            if input("[neutron] Install them now? [y/N] ").strip().lower() not in ("y", "yes"):
+            if input(f"[neutron] Install {them} now? [y/N] ").strip().lower() not in ("y", "yes"):
                 return False
         except EOFError:
             return False
