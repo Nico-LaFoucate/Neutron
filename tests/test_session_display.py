@@ -81,12 +81,32 @@ class SessionDisplay(unittest.TestCase):
 
 
 class ApplySessionDisplay(unittest.TestCase):
-    def run_apply(self, mode, env, outer):
+    def run_apply(self, mode, env, outer, current=None):
         calls = []
         with mock.patch.dict(os.environ, outer, clear=True), \
+             mock.patch.object(N, "prefix_graphics_driver", return_value=current), \
+             mock.patch.object(N, "wineserver_wait") as self.wait, \
              mock.patch.object(N, "reg_set", side_effect=lambda *a: calls.append(a)):
             N.apply_session_display("/w/bin/wine", "/p", mode, env)
         return calls
+
+    def test_a_driver_change_waits_for_the_old_session(self):
+        # Mint VM 2026-10-28: without the wait, the first run after a switch got "no driver could be loaded"
+        self.run_apply("x11", {}, {"DISPLAY": ":0"}, current="wayland")
+        self.wait.assert_called_once()
+
+    def test_no_change_never_waits(self):
+        # an app already open in the prefix must not hold up a second app's launch
+        self.run_apply("wayland", {}, {"WAYLAND_DISPLAY": "wayland-0"}, current="wayland")
+        self.wait.assert_not_called()
+
+    def test_the_driver_is_read_from_user_reg(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "user.reg"), "w") as f:
+                f.write('WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Drivers] 1\n"Graphics"="x11"\n\n'
+                        '[Software\\\\Wine\\\\X11 Driver] 1\n"Graphics"="nope"\n')
+            self.assertEqual(N.prefix_graphics_driver(d), "x11")
+            self.assertIsNone(N.prefix_graphics_driver(os.path.join(d, "missing")))
 
     def test_x11_sets_the_driver_and_keeps_display(self):
         env = {"WAYLAND_DISPLAY": "stale"}

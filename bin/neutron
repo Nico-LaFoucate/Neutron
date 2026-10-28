@@ -2039,11 +2039,30 @@ def session_display():
     return None
 
 
+def prefix_graphics_driver(prefix):
+    """The prefix's HKCU\\Software\\Wine\\Drivers "Graphics" value as written in user.reg, or None."""
+    try:
+        with open(os.path.join(prefix, "user.reg"), encoding="utf-8", errors="replace") as f:
+            m = re.search(r'\[Software\\\\Wine\\\\Drivers\][^\[]*?"Graphics"="([^"]*)"', f.read())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
 def apply_session_display(wine, prefix, mode, env):
     """Point the prefix's graphics driver and `env` at `mode` ("wayland" or "x11"). The driver is a
     prefix setting, so it is set every time a windowed process starts: a prefix used from both kinds
-    of session follows the session it is in."""
+    of session follows the session it is in.
+
+    When the driver CHANGES, the wine session that `reg add` itself started still has the old one,
+    and the program would join it: Linux Mint VM, 2026-10-28, a prefix on "wayland" in an X11
+    session, 2 of 2 first runs got "Application tried to create a window, but no driver could be
+    loaded" (the run after worked). So after a change, let that session end first (bounded: an app
+    still open in the prefix keeps it alive)."""
+    changed = prefix_graphics_driver(prefix) != mode
     reg_set(wine, prefix, r"HKCU\Software\Wine\Drivers", "Graphics", "REG_SZ", mode)
+    if changed:
+        wineserver_wait(wine, prefix, timeout=60)
     if mode == "wayland":
         env.pop("DISPLAY", None)
         env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
@@ -9012,11 +9031,15 @@ def doctor_checks(prefix_arg=None):
                     _g = re.search(r'"Graphics"="([^"]*)"', _m.group(1))
                     _gfx = _g.group(1) if _g else None
                 if _gfx is not None:
-                    check("graphics-driver", "wayland" in _gfx,
-                          _gfx if "wayland" in _gfx else
-                          "prefix is set to %r, not wayland -- every winewayland fix is INACTIVE. "
-                          "A Wayland launch sets it back; `neutron launch` no longer falls back "
-                          "to X11 automatically." % _gfx)
+                    _sess = session_display()
+                    if _sess == "x11":
+                        # An X11 session: launch sets x11 itself (session_display); say what it means.
+                        check("graphics-driver", True, "%s (%s)" % (_gfx, X11_NOTICE))
+                    else:
+                        check("graphics-driver", "wayland" in _gfx,
+                              _gfx if "wayland" in _gfx else
+                              "prefix is set to %r, not wayland -- every winewayland fix is INACTIVE. "
+                              "A launch from a Wayland session sets it back." % _gfx)
             except OSError:
                 pass
             _mm = stamp_mismatch(prefix, _wine)
