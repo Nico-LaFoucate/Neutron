@@ -10513,8 +10513,8 @@ def prereq_plan(root="/"):
     ostree = os.path.exists(os.path.join(root, "run/ostree-booted"))
     if fam == "fedora" and ostree:
         pk = (["glibc.i686"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
-        out.update(packages=pk, how="this system is image-based: run `rpm-ostree install %s`, then restart and "
-                                    "set up again" % " ".join(pk))
+        out.update(packages=pk, how="run `rpm-ostree install %s` in a terminal, then restart and set up again "
+                                    "(this system is image-based)" % " ".join(pk))
     elif fam == "fedora":
         pk = (["glibc.i686"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
         out.update(packages=pk, command="dnf install -y " + " ".join(pk), can_install=True)
