@@ -5928,6 +5928,7 @@ def cmd_prefix_provision(args):
                   # the step now, and if one of the refreshers fails the report says which.
                   "caches": desktop_entries["caches"],
                   "superseded": desktop_entries["superseded"],
+                  "file_icons": desktop_entries["file_icons"],
                   "claimed_types": desktop_entries["claimed_types"],
                   "detail": desktop_entries["entries"]})
 
@@ -7344,6 +7345,113 @@ def _app_version(exe_rel):
 _ICON_EXTRACTOR_VERSION = "3"
 
 
+def _pe_map(exe):
+    """The file as a read-only map: Premiere's exe is ~800 MB and an icon needs a few KB of it."""
+    import mmap
+    with open(exe, "rb") as f:
+        return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+
+def _pe_icon_resources(d):
+    """The icons of the PE image `d`: (icons, groups), each {resource id: (offset, size)}, or None
+    when it is not a PE with resources. `groups` keeps the resource directory's order, which is
+    the order a DefaultIcon index counts in."""
+    def u16(b, o): return struct.unpack_from("<H", b, o)[0]
+    def u32(b, o): return struct.unpack_from("<I", b, o)[0]
+
+    pe = u32(d, 0x3c)
+    if d[pe:pe + 4] != b"PE\0\0":
+        return None
+    nsec, optsz, opt = u16(d, pe + 6), u16(d, pe + 20), pe + 24
+    ddoff = opt + (112 if u16(d, opt) == 0x20b else 96)
+    res_rva = u32(d, ddoff + 2 * 8)
+    if not res_rva:
+        return None
+    secs = [(u32(d, opt + optsz + i * 40 + 12), u32(d, opt + optsz + i * 40 + 8),
+             u32(d, opt + optsz + i * 40 + 20)) for i in range(nsec)]
+
+    def rva2off(r):
+        for va, vs, raw in secs:
+            if va <= r < va + max(vs, 1):
+                return raw + (r - va)
+        return None
+
+    rbase = rva2off(res_rva)
+    if rbase is None:
+        return None
+
+    def entries(off):
+        n = u16(d, off + 12) + u16(d, off + 14)
+        return [(u32(d, off + 16 + i * 8), u32(d, off + 16 + i * 8 + 4)) for i in range(n)]
+
+    icons = {}    # resource id -> (offset, size)
+    groups = {}   # resource id -> (offset, size)
+    for eid, eoff in entries(rbase):
+        rtype = eid & 0x7fffffff
+        if rtype not in (3, 14) or not (eoff & 0x80000000):   # RT_ICON, RT_GROUP_ICON
+            continue
+        for nid, noff in entries(rbase + (eoff & 0x7fffffff)):
+            if not (noff & 0x80000000):
+                continue
+            for _, loff in entries(rbase + (noff & 0x7fffffff)):
+                if loff & 0x80000000:
+                    continue
+                de = rbase + loff
+                doff, size = rva2off(u32(d, de)), u32(d, de + 4)
+                if doff is None:
+                    continue
+                (groups if rtype == 14 else icons)[nid & 0x7fffffff] = (doff, size)
+                break
+    return icons, groups
+
+
+def _icon_group_members(d, group):
+    """The RT_ICON ids of one RT_GROUP_ICON. GRPICONDIR: reserved,type,count then count x 14-byte
+    GRPICONDIRENTRY, whose last field is the RT_ICON resource id of that member."""
+    goff, gsize = group
+    g = d[goff:goff + gsize]
+    count = struct.unpack_from("<H", g, 4)[0] if len(g) >= 6 else 0
+    return [struct.unpack_from("<H", g, 6 + i * 14 + 12)[0] for i in range(count)
+            if 6 + i * 14 + 14 <= len(g)]
+
+
+def _icon_decode(blob):
+    """(width, height, bytes, kind) for one icon resource, or None."""
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack_from(">II", blob, 16) + (blob, "png")
+    if len(blob) >= 40 and struct.unpack_from("<I", blob, 0)[0] == 40 \
+            and struct.unpack_from("<H", blob, 14)[0] == 32:
+        w, h = struct.unpack_from("<II", blob, 4)
+        if w and h:
+            return (w, h // 2, blob, "dib")
+    return None
+
+
+def _icon_png(w, h, blob, kind):
+    """One decoded icon as PNG bytes. Adobe's large sizes already are PNG, lifted VERBATIM."""
+    import zlib
+    if kind == "png":
+        return blob
+    # 32-bit BGRA DIB, bottom-up, no colour table -> minimal PNG via stdlib zlib.
+    px = blob[40:40 + w * h * 4]
+    if len(px) < w * h * 4:
+        return None
+    raw = bytearray()
+    for y in range(h - 1, -1, -1):          # bottom-up
+        raw.append(0)                        # filter: none
+        row = px[y * w * 4:(y + 1) * w * 4]
+        for x in range(0, len(row), 4):
+            b, g, r, a = row[x:x + 4]
+            raw += bytes((r, g, b, a))
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+            + chunk(b"IEND", b""))
+
+
 def _pe_extract_icon_png(exe):
     """The app's largest icon as PNG BYTES, parsed straight out of the PE. NO EXTERNAL TOOLS.
 
@@ -7359,129 +7467,70 @@ def _pe_extract_icon_png(exe):
     ⚖️ We extract from the user's OWN installed copy on their OWN machine, and never redistribute
     an Adobe icon — a deliberate decision, not an accident of implementation.
     """
-    import struct, zlib
-
-    def u16(b, o): return struct.unpack_from("<H", b, o)[0]
-    def u32(b, o): return struct.unpack_from("<I", b, o)[0]
-
     try:
-        with open(exe, "rb") as f:
-            d = f.read()
-        pe = u32(d, 0x3c)
-        if d[pe:pe + 4] != b"PE\0\0":
+        d = _pe_map(exe)
+        found = _pe_icon_resources(d)
+        if not found:
             return None
-        nsec, optsz, opt = u16(d, pe + 6), u16(d, pe + 20), pe + 24
-        ddoff = opt + (112 if u16(d, opt) == 0x20b else 96)
-        res_rva = u32(d, ddoff + 2 * 8)
-        if not res_rva:
-            return None
-        secs = [(u32(d, opt + optsz + i * 40 + 12), u32(d, opt + optsz + i * 40 + 8),
-                 u32(d, opt + optsz + i * 40 + 20)) for i in range(nsec)]
+        icons, groups = found
 
-        def rva2off(r):
-            for va, vs, raw in secs:
-                if va <= r < va + max(vs, 1):
-                    return raw + (r - va)
-            return None
-
-        rbase = rva2off(res_rva)
-        if rbase is None:
-            return None
-
-        def entries(off):
-            n = u16(d, off + 12) + u16(d, off + 14)
-            return [(u32(d, off + 16 + i * 8), u32(d, off + 16 + i * 8 + 4)) for i in range(n)]
-
-        # 🚨 Collect BOTH icon resources and icon GROUPS, then pick the way Windows
-        # does: the application icon is the LOWEST-NUMBERED RT_GROUP_ICON, and the
-        # largest member OF THAT GROUP.
+        # 🚨 Pick the way Windows does: the application icon is the LOWEST-NUMBERED RT_GROUP_ICON,
+        # and the largest member OF THAT GROUP.
         #
         # Taking the widest RT_ICON anywhere in the file is wrong, and visibly so:
         # Adobe ships file-type icons in the same executable, so Premiere resolved
         # to its .prlaunch document icon -- a page with "LAUNCH" written across it --
         # which is what Collider and the dock displayed.
-        icons = {}    # resource id -> (offset, size)
-        groups = {}   # resource id -> (offset, size)
-        for eid, eoff in entries(rbase):
-            rtype = eid & 0x7fffffff
-            if rtype not in (3, 14) or not (eoff & 0x80000000):   # RT_ICON, RT_GROUP_ICON
-                continue
-            for nid, noff in entries(rbase + (eoff & 0x7fffffff)):
-                if not (noff & 0x80000000):
-                    continue
-                for _, loff in entries(rbase + (noff & 0x7fffffff)):
-                    if loff & 0x80000000:
-                        continue
-                    de = rbase + loff
-                    doff, size = rva2off(u32(d, de)), u32(d, de + 4)
-                    if doff is None:
-                        continue
-                    (groups if rtype == 14 else icons)[nid & 0x7fffffff] = (doff, size)
-                    break
-
-        def decode(blob):
-            """(width, bytes, kind) for one icon resource, or None."""
-            if blob[:8] == b"\x89PNG\r\n\x1a\n":
-                return (struct.unpack_from(">I", blob, 16)[0], blob, "png")
-            if len(blob) >= 40 and u32(blob, 0) == 40 and u16(blob, 14) == 32:
-                w, h = u32(blob, 4), u32(blob, 8) // 2
-                if w and h:
-                    return (w, blob, "dib")
-            return None
-
-        best = None   # (width, bytes, kind)
+        best = None   # (width, height, bytes, kind)
         if groups:
-            gid = min(groups)                     # lowest id == the app icon group
-            goff, gsize = groups[gid]
-            g = d[goff:goff + gsize]
-            # GRPICONDIR: reserved,type,count then count x 14-byte GRPICONDIRENTRY,
-            # whose last field is the RT_ICON resource id of that member.
-            count = u16(g, 4) if len(g) >= 6 else 0
-            for i in range(count):
-                e = 6 + i * 14
-                if e + 14 > len(g):
-                    break
-                nid = u16(g, e + 12)
+            for nid in _icon_group_members(d, groups[min(groups)]):   # lowest id == the app icon
                 if nid not in icons:
                     continue
                 doff, size = icons[nid]
-                got = decode(d[doff:doff + size])
+                got = _icon_decode(d[doff:doff + size])
                 if got and (not best or got[0] > best[0]):
                     best = got
         if not best:
             # No usable group (or a malformed one) -> fall back to the old
             # widest-anywhere behaviour rather than losing the icon entirely.
             for doff, size in icons.values():
-                got = decode(d[doff:doff + size])
+                got = _icon_decode(d[doff:doff + size])
                 if got and (not best or got[0] > best[0]):
                     best = got
-        if not best:
-            return None
-        w, blob, kind = best
-        if kind == "png":
-            return blob
-
-        # 32-bit BGRA DIB, bottom-up, no colour table -> minimal PNG via stdlib zlib.
-        h = u32(blob, 8) // 2
-        px = blob[40:40 + w * h * 4]
-        if len(px) < w * h * 4:
-            return None
-        raw = bytearray()
-        for y in range(h - 1, -1, -1):          # bottom-up
-            raw.append(0)                        # filter: none
-            row = px[y * w * 4:(y + 1) * w * 4]
-            for x in range(0, len(row), 4):
-                b, g, r, a = row[x:x + 4]
-                raw += bytes((r, g, b, a))
-        def chunk(tag, data):
-            return (struct.pack(">I", len(data)) + tag + data
-                    + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
-        return (b"\x89PNG\r\n\x1a\n"
-                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-                + chunk(b"IEND", b""))
+        return _icon_png(*best) if best else None
     except Exception:
         return None
+
+
+def _pe_icon_group_pngs(exe, index):
+    """Every square member of ONE icon group as {size: PNG bytes}, {} when there is none. `index`
+    is the number in a DefaultIcon value, read as ExtractIcon reads it: >= 0 is a position among
+    the groups, negative is a resource id. Past the end means the last group: Lightroom registers
+    .lrcat as icon 5 of a program with 2, and the second is the catalog's."""
+    try:
+        d = _pe_map(exe)
+        found = _pe_icon_resources(d)
+        if not found:
+            return {}
+        icons, groups = found
+        if not groups:
+            return {}
+        gid = -index if index < 0 else list(groups)[min(index, len(groups) - 1)]
+        if gid not in groups:
+            return {}
+        out = {}
+        for nid in _icon_group_members(d, groups[gid]):
+            if nid not in icons:
+                continue
+            doff, size = icons[nid]
+            got = _icon_decode(d[doff:doff + size])
+            if got and got[0] == got[1] and got[0] not in out:
+                png = _icon_png(*got)
+                if png:
+                    out[got[0]] = png
+        return out
+    except Exception:
+        return {}
 
 
 def _app_icon(exe):
@@ -7541,12 +7590,24 @@ APP_CATEGORIES = {
 # player, and its own .epr files are presets nobody double-clicks.
 APP_MIME_TYPES = {
     "photoshop":    ("image/vnd.adobe.photoshop", "image/x-neutron-psb"),
-    "illustrator":  ("application/illustrator",),
+    "illustrator":  ("application/illustrator", "application/x-neutron-ait"),
     "premiere":     ("application/x-neutron-prproj",),
-    "aftereffects": ("application/x-neutron-aep",),
-    "animate":      ("application/x-neutron-fla",),
+    "aftereffects": ("application/x-neutron-aep", "application/x-neutron-aet",
+                     "application/x-neutron-aepx"),
+    "animate":      ("application/x-neutron-fla", "application/x-neutron-xfl"),
     "lightroom":    ("application/x-neutron-lrcat",),
+    "indesign":     ("application/x-neutron-indd", "application/x-neutron-indt",
+                     "application/x-neutron-idml"),
+    "audition":     ("application/x-neutron-sesx",),
 }
+
+
+def _mime_extension(mime):
+    """The extension a type stands for, which is how a prefix's registry names it. One type per
+    extension, because Windows gives .aep and .aet, .fla and .xfl different icons."""
+    return {"image/vnd.adobe.photoshop": "psd",
+            "application/illustrator": "ai"}.get(mime, mime.rsplit("-", 1)[-1])
+
 
 # Our own shared-mime-info package for the Adobe project formats the system does not define.
 # Glob-only (no magic): these are container formats whose signatures vary by version, and a
@@ -7565,12 +7626,42 @@ NEUTRON_MIME_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <mime-type type="application/x-neutron-aep">
     <comment>Adobe After Effects project</comment>
     <glob pattern="*.aep" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-aet">
+    <comment>Adobe After Effects template</comment>
     <glob pattern="*.aet" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-aepx">
+    <comment>Adobe After Effects XML project</comment>
+    <glob pattern="*.aepx" weight="60"/>
   </mime-type>
   <mime-type type="application/x-neutron-fla">
     <comment>Adobe Animate document</comment>
     <glob pattern="*.fla" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-xfl">
+    <comment>Adobe Animate XFL document</comment>
     <glob pattern="*.xfl" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-ait">
+    <comment>Adobe Illustrator template</comment>
+    <glob pattern="*.ait" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-indd">
+    <comment>Adobe InDesign document</comment>
+    <glob pattern="*.indd" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-indt">
+    <comment>Adobe InDesign template</comment>
+    <glob pattern="*.indt" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-idml">
+    <comment>Adobe InDesign markup document</comment>
+    <glob pattern="*.idml" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-sesx">
+    <comment>Adobe Audition session</comment>
+    <glob pattern="*.sesx" weight="60"/>
   </mime-type>
   <mime-type type="application/x-neutron-lrcat">
     <comment>Lightroom Classic catalog</comment>
@@ -7604,6 +7695,150 @@ def install_neutron_mime_package():
     except Exception as e:
         log("mime package: %s" % e)
         return False
+
+
+# The sizes the hicolor theme lists under mimetypes. Others (Adobe's 20 and 40) are never looked up.
+_HICOLOR_SIZES = (16, 22, 24, 32, 36, 48, 64, 72, 96, 128, 192, 256, 512)
+_FILE_ICON_ROOT = os.path.join(DATA_HOME, "icons", "hicolor")
+
+
+def _reg_classes(prefix):
+    """Software\\Classes from the prefix's registry ON DISK as {key: {value name: value}}, keys
+    lower-cased and relative to Classes, the default value under "". HKCU over HKLM, as on Windows."""
+    out = {}
+    root = "[Software\\\\Classes\\\\"
+    for name in ("system.reg", "user.reg"):
+        try:
+            with open(os.path.join(prefix, name), encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for sec in text.split("\n["):
+            sec = "[" + sec.lstrip("[")
+            if not sec.startswith(root):
+                continue
+            head, _, body = sec.partition("\n")
+            vals = out.setdefault(head[len(root):].partition("]")[0].replace("\\\\", "\\").lower(), {})
+            for n, v in re.findall(r'^"((?:[^"\\]|\\.)*)"="((?:[^"\\]|\\.)*)"', body, re.M):
+                vals[_reg_unescape(n)] = _reg_unescape(v)
+            for v in re.findall(r'^@="((?:[^"\\]|\\.)*)"', body, re.M):
+                vals[""] = _reg_unescape(v)
+    return out
+
+
+def _file_type_icon_source(prefix, classes, ext, exe):
+    """(file, index) of the icon Windows shows for .ext where `exe` opens it, or None.
+
+    The ProgID comes from the one that opens the file with this app: the extension's default,
+    else its OpenWithProgids. The default alone is not enough: After Effects takes .psd's default
+    with a ProgID that has an icon and no open command, and Photoshop's stays in OpenWithProgids.
+    """
+    key = "." + ext
+    progids = [classes.get(key, {}).get("")] + list(classes.get(key + "\\openwithprogids", {}))
+    for progid in progids:
+        if not progid:
+            continue
+        command = classes.get(progid.lower() + "\\shell\\open\\command", {}).get("", "")
+        if os.path.basename(exe).lower() not in command.lower():
+            continue
+        m = re.fullmatch(r'\s*"?([A-Za-z]:\\[^",]+)"?\s*(?:,\s*(-?\d+))?\s*',
+                         classes.get(progid.lower() + "\\defaulticon", {}).get("", ""))
+        if not m:
+            continue
+        index = int(m.group(2) or 0)
+        if index > 0x7fffffff:      # InDesign's icons.dll,4294967163 is -133 written unsigned
+            index -= 1 << 32
+        return (os.path.join(prefix, "drive_c", *m.group(1)[3:].split("\\")), index)
+    return None
+
+
+def _mimeapps_defaults():
+    import configparser
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str
+    try:
+        cp.read(os.path.join(CONFIG_HOME, "mimeapps.list"))
+        return dict(cp.items("Default Applications"))
+    except Exception:
+        return {}
+
+
+def install_file_type_icons(prefix, written):
+    """Show each project file with the icon Windows gives it, taken from the app installed in this
+    prefix. Returns the extensions that have one.
+
+    Windows reads the icon from the program; so does this, and like the app icons nothing of
+    Adobe's is shipped. Where two prefixes carry the same app, the one that opens the type by
+    double-click supplies it. A type's own name would lose to the desktop theme (Breeze ships
+    application-illustrator), so ours get names no theme has, attached to the type by a package
+    of their own. That package only lists icons that exist: a type pointing at a missing icon
+    would lose the theme's as well.
+    """
+    classes = _reg_classes(prefix)
+    defaults = _mimeapps_defaults()
+    stamp_dir = os.path.join(NEUTRON_DATA_DIR, "icon-stamps")
+
+    def icon_files(ext):
+        return glob.glob(os.path.join(_FILE_ICON_ROOT, "*", "mimetypes", "neutron-file-%s.png" % ext))
+
+    for w in written:
+        exe = _resolve_app_exe(prefix, APP_PROFILES[w["app"]]["exe"])
+        for mime in w.get("mime", ()):
+            ext = _mime_extension(mime)
+            handler = defaults.get(mime, "")
+            if handler and w["file"] not in handler and icon_files(ext):
+                continue                # another prefix's app opens this type
+            source = _file_type_icon_source(prefix, classes, ext, exe)
+            if not (source and os.path.isfile(source[0])):
+                continue
+            stamp = "|".join((_ICON_EXTRACTOR_VERSION, source[0], str(source[1]),
+                              str(int(os.path.getmtime(source[0])))))
+            stamp_path = os.path.join(stamp_dir, "file-%s.v" % ext)
+            try:
+                with open(stamp_path) as f:
+                    if f.read() == stamp and icon_files(ext):
+                        continue
+            except OSError:
+                pass
+            pngs = {n: b for n, b in _pe_icon_group_pngs(*source).items() if n in _HICOLOR_SIZES}
+            if not pngs:
+                continue
+            try:
+                for size, png in pngs.items():
+                    d = os.path.join(_FILE_ICON_ROOT, "%dx%d" % (size, size), "mimetypes")
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, "neutron-file-%s.png" % ext), "wb") as f:
+                        f.write(png)
+                os.makedirs(stamp_dir, exist_ok=True)
+                with open(stamp_path, "w") as f:
+                    f.write(stamp)
+            except OSError as e:
+                log("file icon .%s: %s" % (ext, e))
+
+    have = {m: _mime_extension(m) for types in APP_MIME_TYPES.values() for m in types
+            if icon_files(_mime_extension(m))}
+    xml = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+           '<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">\n'
+           "  <!-- Written by `neutron prefix provision`: icons taken from the installed apps. -->\n"
+           + "".join('  <mime-type type="%s"><icon name="neutron-file-%s"/></mime-type>\n' % (m, e)
+                     for m, e in sorted(have.items()))
+           + "</mime-info>\n")
+    d = os.path.join(DATA_HOME, "mime", "packages")
+    target = os.path.join(d, "neutron-file-icons.xml")
+    try:
+        prev = ""
+        if os.path.isfile(target):
+            with open(target) as f:
+                prev = f.read()
+        if prev != xml:
+            os.makedirs(d, exist_ok=True)
+            with open(target, "w") as f:
+                f.write(xml)
+            subprocess.run(["update-mime-database", os.path.dirname(d)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except Exception as e:
+        log("file icons: %s" % e)
+    return sorted(have.values())
 
 
 def retire_superseded_entries(apps_dir, app_ids, prefix):
@@ -8028,9 +8263,10 @@ def register_app_desktop_entries(prefix):
 
     superseded = retire_superseded_entries(apps_dir, [w["app"] for w in written], prefix)
     claimed = repair_mime_defaults(apps_dir, written)
+    file_icons = install_file_type_icons(prefix, written) if written else []
     caches = refresh_desktop_caches(apps_dir) if written else {}
     return {"entries": written, "superseded": superseded, "claimed_types": claimed,
-            "rewrote": changed, "caches": caches}
+            "file_icons": file_icons, "rewrote": changed, "caches": caches}
 
 
 def _app_running_pid(exe, prefix=None):
@@ -10994,9 +11230,11 @@ def cmd_uninstall(args):
              and os.path.realpath(os.path.join(LOCAL_BIN, n)).startswith(
                  os.path.realpath(NEUTRON_DATA_DIR) + os.sep)]
     entries = sorted(glob.glob(os.path.join(APPS_DIR, "neutron-*.desktop")))
-    icons = sorted(glob.glob(os.path.join(DATA_HOME, "icons", "hicolor", "*", "apps", "neutron-*.png")))
-    mime = os.path.join(DATA_HOME, "mime", "packages", "neutron-adobe.xml")
-    plan = {"remove": remove + links + entries + icons + ([mime] if os.path.exists(mime) else []),
+    icons = sorted(glob.glob(os.path.join(DATA_HOME, "icons", "hicolor", "*", "apps", "neutron-*.png"))
+                   + glob.glob(os.path.join(DATA_HOME, "icons", "hicolor", "*", "mimetypes", "neutron-file-*.png")))
+    mime = [m for m in (os.path.join(DATA_HOME, "mime", "packages", n)
+                        for n in ("neutron-adobe.xml", "neutron-file-icons.xml")) if os.path.exists(m)]
+    plan = {"remove": remove + links + entries + icons + mime,
             "kept_because_a_prefix_is_inside": keep}
     del_prefixes = bool(getattr(args, "delete_prefixes", False))
     if not getattr(args, "yes", False):
