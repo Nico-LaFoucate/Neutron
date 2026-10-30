@@ -3129,6 +3129,36 @@ def install_corefonts(wine, prefix, as_json=True):
     return True
 
 
+def _retest_failed_camera_raw_gpu(prefix):
+    """Let Camera Raw test its GPU again where it has a cached failure. Returns the hosts reset.
+
+    Camera Raw (inside Photoshop and Lightroom Classic) runs a GPU self-test once and caches the result in
+    AppData/Roaming/Adobe/CameraRaw/GPU/<host>/Camera Raw GPU Config.txt. While that says the test failed it never
+    tests again and runs without GPU acceleration; its log says "*** GPU Warning: GPU3 failed (previous) sanity
+    test ***". 2026-10-29: every Photoshop prefix on the dev box carried a failure cached by an older runtime
+    (July to October), and the test passes on 11.10-156, -158 and -162, also with empty shader caches. Moving a
+    cached failure aside makes Camera Raw test again on its next start; where the GPU really fails it records the
+    failure again. A passing result is never touched."""
+    user = prefix_user(prefix)
+    gpu = os.path.join(prefix, "drive_c", "users", user, "AppData", "Roaming", "Adobe", "CameraRaw", "GPU") if user else None
+    reset = []
+    if not gpu or not os.path.isdir(gpu):
+        return reset
+    for host in sorted(os.listdir(gpu)):
+        if ".failed-" in host:          # one this step set aside before
+            continue
+        cfg = os.path.join(gpu, host, "Camera Raw GPU Config.txt")
+        try:
+            with open(cfg, encoding="utf-8", errors="replace") as f:
+                failed = 'gpu_compute_quick_self_test_passed="False"' in f.read()
+        except OSError:
+            continue
+        if failed:
+            os.rename(os.path.join(gpu, host), os.path.join(gpu, "%s.failed-%s" % (host, time.strftime("%Y%m%d-%H%M%S"))))
+            reset.append(host)
+    return reset
+
+
 def _repair_roman_defaults(wine, prefix):
     """Make at least one of times/arial/cour a genuine Microsoft face. Returns
     (repaired, unrepaired, fetched_corefonts).
@@ -5821,6 +5851,13 @@ def cmd_prefix_provision(args):
     # _roman_default_status(). We only ever copy a font whose PostScript name is
     # genuinely the one CoolType wants, so this cannot make a prefix worse.
     repaired, unrepaired, _fetched = _repair_roman_defaults(wine, prefix)
+    # Camera Raw's GPU self-test result cached as failed by an older runtime keeps its GPU acceleration off
+    # for good; let it test again (see _retest_failed_camera_raw_gpu). Never while an Adobe app runs.
+    if not _running_app_ids(prefix):
+        _cr_reset = _retest_failed_camera_raw_gpu(prefix)
+        if _cr_reset:
+            log("Camera Raw: cached GPU self-test failure set aside (%s) -- it tests again on next start" % ", ".join(_cr_reset))
+            steps.append({"step": "camera_raw_gpu_retest", "ok": True, "hosts": _cr_reset})
     # ⭐ 2026-09-13 (operator's decision): ALSO fetch when ANY of the six Microsoft core fonts is
     # missing, not only when the Roman defaults could not be repaired locally. install_microsoft
     # above already put them in place; this catches a prefix whose Fonts dir was changed since.
