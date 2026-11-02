@@ -7099,6 +7099,30 @@ def cmd_launch(args):
     if "--dns-result-order" not in _node_opts:
         env["NODE_OPTIONS"] = (_node_opts + " --dns-result-order=ipv4first").strip()
 
+    # --- AMD OpenCL: build Adobe's kernels the way AMD's Windows driver does ---------
+    # GitHub Neutron#44: Premiere 2026 on an AMD card (ROCm OpenCL) showed a black Program
+    # Monitor for every frame it had to render -- paused frames, and anything with more
+    # than one layer -- while exports came out right. Premiere compiles ~120 OpenCL
+    # programs from source at startup; on gfx1200 exactly one fails,
+    # GPUFoundation\Src\Transfer\Memory.cl, the one that moves finished frames off the GPU.
+    # It passes an `int*` where a `float*` is expected (4 places). Recent clang, which
+    # ROCm's compiler is, makes -Wincompatible-pointer-types an ERROR by default; the
+    # compiler Premiere is tested against on Windows lets it through. Without that program
+    # no rendered frame is ever read back for display.
+    # MEASURED 2026-11-02: clang for gfx1200 -> 2,824-byte error report; + ROCm's 68-byte
+    # "Failed to compile" line + NUL = 2,893 = the reporter's CL_PROGRAM_BUILD_LOG size.
+    # Lab (NVIDIA OpenCL presented as AMD): failing only that program -> black paused and
+    # playing, 2/2; compiling it -> picture.
+    #
+    # ROCm appends AMD_OCL_BUILD_OPTIONS_APPEND to every clBuildProgram/clCompileProgram
+    # (rocclr/platform/program.cpp) and hands `-Wf,<opt>` to clang (options.cpp,
+    # OID_WFComma), so this turns that one diagnostic back into a warning. Other drivers
+    # never read it. Append rather than overwrite, so a user's own options still apply.
+    _ocl_opts = env.get("AMD_OCL_BUILD_OPTIONS_APPEND", "")
+    if "incompatible-pointer-types" not in _ocl_opts:
+        env["AMD_OCL_BUILD_OPTIONS_APPEND"] = (
+            _ocl_opts + " -Wf,-Wno-error=incompatible-pointer-types").strip()
+
     # GPU-vendor EGL/GLX: NVIDIA's when an NVIDIA GPU is in use, else the system's (Mesa).
     gpus = drm_gpus()
     _apply_gl_vendor_env(env, gpus)
