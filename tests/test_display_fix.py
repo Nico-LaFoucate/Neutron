@@ -131,11 +131,8 @@ class DisplayFixBeforeLaunch(unittest.TestCase):
                         launch.index("subprocess.Popen("), "the fix must run before the app starts")
 
 
-class Premiere2026DirectXDisplay(unittest.TestCase):
-    """Neutron#21 (2026-10-14): Premiere 2026+ draws its Transform/Crop handles with a GPU overlay renderer
-    that Adobe's OpenGL display drops, so Premiere 2026+ keeps Adobe's default DirectX display (`false`) --
-    including undoing the `true` older CLIs wrote -- and launches with blit-to-window off. Premiere 2025
-    keeps `true`. Each test starts from the state an older CLI left behind (the known-bad state)."""
+class _DirectXDisplayPrefix(unittest.TestCase):
+    """A prefix with a user profile and a DXVK dxgi.dll, for the apps that keep Adobe's DirectX display."""
 
     def setUp(self):
         self.prefix = tempfile.mkdtemp(prefix="neutron-dfix26-")
@@ -165,6 +162,23 @@ class Premiere2026DirectXDisplay(unittest.TestCase):
             f.write(b"MZ...DxgiSwapChain::Present..." if fixed else
                     b"MZ...DxgiSwapChain::GetBackgroundColor: Not implemented...")
 
+    def _run(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            N._display_fix_before_launch(self.prefix)
+        return out.getvalue(), err.getvalue()
+
+    def _read(self, path):
+        with open(path, newline="") as f:
+            return f.read()
+
+
+class Premiere2026DirectXDisplay(_DirectXDisplayPrefix):
+    """Neutron#21 (2026-10-14): Premiere 2026+ draws its Transform/Crop handles with a GPU overlay renderer
+    that Adobe's OpenGL display drops, so Premiere 2026+ keeps Adobe's default DirectX display (`false`) --
+    including undoing the `true` older CLIs wrote -- and launches with blit-to-window off. Premiere 2025
+    keeps `true`. Each test starts from the state an older CLI left behind (the known-bad state)."""
+
     def _premiere(self, year, prefs=None):
         os.makedirs(os.path.join(self.adobe, "Adobe Premiere Pro %d" % year), exist_ok=True)
         with open(os.path.join(self.adobe, "Adobe Premiere Pro %d" % year, "Adobe Premiere Pro.exe"), "w"):
@@ -177,16 +191,6 @@ class Premiere2026DirectXDisplay(unittest.TestCase):
         with open(path, "w", newline="") as f:
             f.write(prefs)
         return path
-
-    def _run(self):
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            N._display_fix_before_launch(self.prefix)
-        return out.getvalue(), err.getvalue()
-
-    def _read(self, path):
-        with open(path, newline="") as f:
-            return f.read()
 
     def test_2026_reverts_old_fix_and_2025_keeps_it(self):
         old_cli = PREMIERE_PREFS.replace("DisableDirectXDisplay\tfalse", "DisableDirectXDisplay\ttrue")
@@ -261,6 +265,90 @@ class Premiere2026DirectXDisplay(unittest.TestCase):
         N._apply_app_env(env, "premiere", N.APP_PROFILES["premiere"], self.prefix,
                          os.path.join(os.path.dirname(exe), "dxvk.conf"), exe=exe)
         self.assertNotIn("NEUTRON_DISABLE_BTW", env)
+
+
+
+AE_PREFS = ("AEDebugDatabaseVersion\t2\t0\r\r\n"
+            "DS.DisableDirectXDisplay\ttrue\tfalse\r\r\n"
+            "GF.OpenCL.UseKernelCache\ttrue\ttrue\r\r\n")
+
+
+class AfterEffects2026DirectXDisplay(_DirectXDisplayPrefix):
+    """Neutron#45 (2026-11-05): After Effects 2026 on an AMD card (OpenCL, no CUDA) showed an entirely black viewer
+    on every launch after the first, because each launch wrote `true` (Adobe's OpenGL display) into the Debug
+    Database it had saved. After Effects 2026+ without CUDA keeps Adobe's default (`false`) on runtime 11.10-121+,
+    undoing an older CLI's `true`; with a GPU on NVIDIA's own driver, and on After Effects 2025, it keeps `true`;
+    a never-run After Effects 2026 gets no one-line file."""
+
+    def setUp(self):
+        super().setUp()
+        self._gpus = N.drm_gpus
+        N.drm_gpus = lambda *a, **k: [("0x1002", "amdgpu")]    # the reporter's machine: AMD, no CUDA
+
+    def tearDown(self):
+        N.drm_gpus = self._gpus
+        super().tearDown()
+
+    def _ae(self, year, prefs=None, version=None):
+        os.makedirs(os.path.join(self.adobe, "Adobe After Effects %d" % year, "Support Files"), exist_ok=True)
+        with open(os.path.join(self.adobe, "Adobe After Effects %d" % year, "Support Files", "AfterFX.exe"), "w"):
+            pass
+        if prefs is None:
+            return None
+        d = os.path.join(self.roaming, "After Effects", version or "%d.0" % (year - 2000))
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "Debug Database.txt")
+        with open(path, "w", newline="") as f:
+            f.write(prefs)
+        return path
+
+    def test_ae_2026_goes_back_to_adobes_default(self):
+        ae = self._ae(2026, AE_PREFS)                 # what every launch since the first left behind
+        out, err = self._run()
+        self.assertEqual(out, "")
+        self.assertEqual(_settings(self._read(ae)), [
+            ["AEDebugDatabaseVersion", "2", "0"],
+            ["DS.DisableDirectXDisplay", "false", "false"],
+            ["GF.OpenCL.UseKernelCache", "true", "true"]])
+        before = self._read(ae)
+        self.assertEqual(self._run(), ("", ""))       # idempotent
+        self.assertEqual(self._read(ae), before)
+
+    def test_ae_2026_stub_dir_does_not_win(self):
+        """After Effects 2026 keeps its real database at 26.0 next to a 3-line stub at 26.x: the real one is set."""
+        ae = self._ae(2026, AE_PREFS)
+        stub = self._ae(2026, "DS.DisableDirectXDisplay\ttrue\tfalse\r\n", version="26.5")
+        self._run()
+        self.assertEqual(_settings(self._read(ae))[1], ["DS.DisableDirectXDisplay", "false", "false"])
+        self.assertEqual(self._read(stub), "DS.DisableDirectXDisplay\ttrue\tfalse\r\n")   # never read by AE
+
+    def test_ae_2025_keeps_the_opengl_display(self):
+        ae = self._ae(2025, AE_PREFS.replace("DisableDirectXDisplay\ttrue", "DisableDirectXDisplay\tfalse"))
+        self._run()
+        self.assertEqual(_settings(self._read(ae))[1], ["DS.DisableDirectXDisplay", "true", "false"])
+
+    def test_never_run_ae_2026_gets_no_file(self):
+        self._ae(2026)
+        self.assertEqual(self._run(), ("", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.roaming, "After Effects")))
+
+    def test_nvidia_keeps_ae_2026_on_the_opengl_display(self):
+        """A GPU on NVIDIA's own driver, alone or next to an Intel/AMD iGPU (a hybrid laptop): CUDA renders and the
+        OpenGL display shows it, so nothing changes until the DirectX display is tested on CUDA."""
+        for gpus in ([("0x10de", "nvidia")], [("0x8086", "i915"), ("0x10de", "nvidia")]):
+            N.drm_gpus = lambda *a, gpus=gpus, **k: gpus
+            ae = self._ae(2026, AE_PREFS.replace("DisableDirectXDisplay\ttrue", "DisableDirectXDisplay\tfalse"))
+            self._run()
+            self.assertEqual(_settings(self._read(ae))[1], ["DS.DisableDirectXDisplay", "true", "false"], gpus)
+        N.drm_gpus = lambda *a, **k: [("0x10de", "nouveau")]   # nouveau: no CUDA, the OpenCL path
+        self._run()
+        self.assertEqual(_settings(self._read(ae))[1], ["DS.DisableDirectXDisplay", "false", "false"])
+
+    def test_older_runtime_keeps_ae_2026_on_the_opengl_display(self):
+        self._dxgi(fixed=False)
+        ae = self._ae(2026, AE_PREFS.replace("DisableDirectXDisplay\ttrue", "DisableDirectXDisplay\tfalse"))
+        self._run()
+        self.assertEqual(_settings(self._read(ae))[1], ["DS.DisableDirectXDisplay", "true", "false"])
 
 
 if __name__ == "__main__":

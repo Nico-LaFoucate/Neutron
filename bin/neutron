@@ -395,11 +395,55 @@ def _premiere_directx_display(prefix, path):
             and _prefix_dxgi_presents_directx_display(prefix))
 
 
+# ⭐ 2026-11-05 (Neutron#45) — AFTER EFFECTS 2026+ RUNS ON ADOBE'S DIRECTX DISPLAY TOO.
+# On an AMD card (ROCm OpenCL, no CUDA) After Effects 2026 showed its composition on the first launch and an
+# entirely black viewer on every later one; deleting its Debug Database gave one more good launch. The first
+# launch has no Debug Database, so it runs Adobe's DirectX display; After Effects then saves the file, and every
+# later `neutron launch` wrote `true` into it -- Adobe's OpenGL display, which renders nothing on the OpenCL
+# path. Lab, the AMD-like OpenCL setup (NVIDIA OpenCL presented as AMD, CUDA hidden), two launches each: `true`
+# black viewer paused and playing 2/2; `false` the composition 2/2; no file 2/2. With CUDA both values show it.
+# Only machines without a GPU on NVIDIA's own driver switch (no CUDA, so After Effects renders through OpenCL):
+# that is where it is broken, and NVIDIA users keep the display they have until the DirectX display is tested
+# on CUDA with real projects. A hybrid laptop with an NVIDIA GPU keeps `true`: After Effects renders on the
+# NVIDIA GPU there.
+# The one-line file this CLI creates for a never-run app has no effect on After Effects 2026 (it reads only the
+# file it wrote itself), so a never-run After Effects 2026 gets none, as Premiere 2026 does. After Effects 2025 and
+# Media Encoder keep `true` (not measured on the OpenCL path). Same runtime gate as Premiere: a prefix whose dxgi
+# predates 11.10-121 keeps the OpenGL display.
+AFTEREFFECTS_DIRECTX_DISPLAY_FROM = 26   # After Effects major version: prefs dir "26.0", install "Adobe After Effects 2026"
+
+
+def _aftereffects_major(path):
+    """After Effects' major version from a prefs path (".../After Effects/26.0/Debug Database.txt" or the "26.x"
+    dir) or an install path (".../Adobe After Effects 2026/..."). 0 if it names none."""
+    m = re.search(r"Adobe After Effects (20\d\d)", path or "")
+    if m:
+        return int(m.group(1)) - 2000
+    m = re.search(r"After Effects[/\\](\d+)\.\d+", path or "")
+    return int(m.group(1)) if m else 0
+
+
+def _nvidia_cuda_gpu():
+    """True when a GPU runs NVIDIA's own driver, so After Effects renders through CUDA."""
+    return any(v == NVIDIA_PCI_VENDOR and drv == "nvidia" for v, drv in drm_gpus())
+
+
+def _aftereffects_directx_display(prefix, path):
+    """After Effects 2026+ on a machine without CUDA, in a prefix whose dxgi can show its DirectX display
+    (see AFTEREFFECTS_DIRECTX_DISPLAY_FROM)."""
+    return (_aftereffects_major(path) >= AFTEREFFECTS_DIRECTX_DISPLAY_FROM
+            and _prefix_dxgi_presents_directx_display(prefix)
+            and not _nvidia_cuda_gpu())
+
+
 def _display_fix_wanted(label, path, prefix):
     """The DS.DisableDirectXDisplay value Neutron wants for this app's Debug Database (or prefs dir):
-    "true" (Adobe's OpenGL display) everywhere except Premiere 2026+ on a runtime that can show its DirectX
-    display, which keeps Adobe's default "false". See PREMIERE_DIRECTX_DISPLAY_FROM."""
+    "true" (Adobe's OpenGL display) everywhere except Premiere 2026+, and After Effects 2026+ without CUDA, on a
+    runtime that can show their DirectX display, which keep Adobe's default "false". See
+    PREMIERE_DIRECTX_DISPLAY_FROM and AFTEREFFECTS_DIRECTX_DISPLAY_FROM."""
     if label == "premiere" and _premiere_directx_display(prefix, path):
+        return DISPLAY_FIX_DEFAULT
+    if label == "aftereffects" and _aftereffects_directx_display(prefix, path):
         return DISPLAY_FIX_DEFAULT
     return DISPLAY_FIX_CURRENT
 
