@@ -4321,6 +4321,31 @@ def _running_app_ids(prefix):
     return out
 
 
+def _third_party_procs(prefix):
+    """Windows programs running in the prefix that belong to neither Adobe, Wine nor Microsoft's
+    runtimes: [(pid, windows exe)].
+
+    A plugin's own desktop app lives here. The Mister Horse Product Manager is started by its
+    Animation Composer / Premiere Composer plugins from inside After Effects or Premiere, and to
+    install a pack it asks the user to quit them. On Windows it keeps running; here the last app's
+    teardown swept the prefix (wineserver -k) and took the Product Manager down with it, mid-install.
+    Adobe's daemons (Common Files/Adobe), Wine's programs (C:/windows) and Microsoft runtimes such as
+    EdgeWebView (Program Files (x86)/Microsoft) are not counted: those are exactly the leftovers the
+    sweep exists to reap."""
+    out = []
+    for pid, _comm, is_app in _prefix_procs(prefix):
+        if not is_app:
+            continue
+        exe = _proc_win_exe(pid)
+        low = exe.lower()
+        if not re.match(r"^[a-z]:/", low):
+            continue  # a Linux process that merely carries WINEPREFIX in its environment
+        if "/adobe/" in low or "/microsoft/" in low or low.startswith("c:/windows/"):
+            continue
+        out.append((pid, exe))
+    return out
+
+
 def _post_wm_close(wine, env, images):
     """`wine taskkill /im NAME` (no /F) for each image: post WM_CLOSE to every top-level window of every process of that
     name, so an app runs its own shutdown and writes its preferences. Returns the images that were SENT a WM_CLOSE.
@@ -4429,16 +4454,24 @@ def _teardown_app(args, prefix, wine, env):
     # 3. Last one out reaps the shared machinery. While ANY app is still up, Adobe's shared daemons
     #    are in use -- killing them is what wedges the next launch, so we only sweep when the
     #    prefix is otherwise idle.
+    #    A third-party program the user is still running (a plugin's own app) keeps the session
+    #    too: the sweep is wineserver -k, and it would kill that program as well. It waits for the
+    #    next teardown, exactly as it waits while another Adobe app is open.
     swept = False
-    if not left and not others:
+    third = _third_party_procs(prefix) if not left and not others else []
+    if not left and not others and not third:
         log(f"teardown[{app_id}]: last app out -- sweeping shared daemons + wineserver")
         args.app = None
         cmd_teardown(args, _emitted=True)
         swept = True
+    elif third:
+        names = sorted({e.rsplit("/", 1)[-1] for _p, e in third})
+        log(f"teardown[{app_id}]: last Adobe app out, but {', '.join(names)} still running -- not sweeping")
 
     emit({"ok": not left, "app": app_id, "torn_down": not left,
           "killed": len(before) - len(left), "still_alive": [c for _p, c in left],
-          "still_running": others, "swept_prefix": swept}, args.json)
+          "still_running": others, "swept_prefix": swept,
+          "kept_for": sorted({e for _p, e in third})}, args.json)
     if left:
         sys.exit(EX_FAIL)
 
