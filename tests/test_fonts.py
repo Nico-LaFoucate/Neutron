@@ -416,7 +416,8 @@ class FontsVerdict(unittest.TestCase):
         for key in ("status", "summary", "checks", "repair", "apps_running"):
             self.assertIn(key, v)
         self.assertEqual([c["name"] for c in v["checks"]],
-                         ["roman-default", "cooltype-cache", "ms-core-fonts", "replacements", "registered"])
+                         ["roman-default", "cooltype-cache", "ms-core-fonts", "replacements", "icon-font",
+                          "registered"])
         for c in v["checks"]:
             self.assertIn(c["status"], ("good", "warn", "bad"))
             self.assertTrue(c["detail"])

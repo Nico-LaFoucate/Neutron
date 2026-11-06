@@ -516,6 +516,19 @@ PROVISION_FONT_REPLACEMENTS = {
     "Noto Serif TC": "Adobe Clean", "Sans": "Adobe Clean",
     "Segoe UI": "Adobe Clean", "Segoe UI Symbol": "Adobe Clean",
 }
+# Windows' icon fonts. Programs draw window buttons and check marks with private-use code points of
+# "Segoe MDL2 Assets" (Windows' icon font since Windows 10): Topaz Photo's minimize,
+# maximize, restore and close (E921 E922 E923 E8BB) and its check mark (E73E). Microsoft's fonts are
+# not redistributable; the runtime ships "Neutron Icons" (share/wine/fonts/neutron-icons.ttf, drawn
+# by us from geometric primitives, LGPL like Wine's own fonts) with only those glyphs, and these
+# entry points the name at it (Wine's Replacements apply only while the real font is absent).
+# "Segoe Fluent Icons" is deliberately NOT mapped: no program in the lab asks it for these glyphs, and
+# Chromium (CEF/WebView2) and Qt's Windows 11 style choose between that font and their own drawing by
+# whether it exists -- a 5-glyph stand-in would make them pick the font and miss their arrows.
+# Kept apart from the Adobe map above: a missing entry costs wrong symbols, never a failed start.
+ICON_FONT_FAMILY = "Neutron Icons"
+ICON_FONT_FILE = "neutron-icons.ttf"
+ICON_FONT_REPLACEMENTS = {"Segoe MDL2 Assets": ICON_FONT_FAMILY}
 # The Adobe-suite DXVK config placed at the prefix root (Adobe panel render fix).
 # ⚠️ The shared conf above is NOT the only one. Two profiles point DXVK_CONFIG_FILE at their own
 # file, and provision used to create neither — so on a FRESH prefix, Premiere and After Effects
@@ -3372,6 +3385,21 @@ def expected_font_replacements(runtime=None):
     return fonts
 
 
+def runtime_icon_font(wine):
+    """The icon font file in the Wine fonts dir of `wine` (the runtime's share/wine/fonts, which
+    register_prefix_fonts() registers), or None for a runtime from before it shipped one."""
+    d = _wine_fonts_dir(wine) if wine else None
+    p = os.path.join(d, ICON_FONT_FILE) if d else None
+    return p if p and os.path.isfile(p) else None
+
+
+def expected_icon_font_replacements(wine=None):
+    """The icon-font entries a prefix should carry: ICON_FONT_REPLACEMENTS when the runtime of
+    `wine` ships the font, else none (an entry pointing at an absent family maps the name to
+    nothing). Shared by provision (writes), fonts check (verifies) and fonts repair (restores)."""
+    return dict(ICON_FONT_REPLACEMENTS) if runtime_icon_font(wine) else {}
+
+
 def _prefix_font_replacements(prefix):
     """The HKCU\\Software\\Wine\\Fonts\\Replacements map as the prefix has it (user.reg), or
     None when unreadable."""
@@ -3647,6 +3675,33 @@ def fonts_verdict(prefix):
                 % (n_exp, exp_targets, ", ".join(sorted({f for fs in target_files.values() for f in fs})[:3])),
                 missing=[], absent_targets=[], differ={})
 
+    # 4b. Windows' icon fonts -> Neutron Icons, when the runtime ships it.
+    icon_exp = expected_icon_font_replacements(resolve_wine()[0])
+    icon_have = _prefix_font_replacements(prefix)
+    if not icon_exp:
+        add("icon-font", "good", "this runtime ships no icon font, so there is nothing to map")
+    elif icon_have is None:
+        add("icon-font", "warn", "user.reg is unreadable, so whether Windows' icon fonts are mapped is unknown")
+    else:
+        icon_missing = [k for k in icon_exp if icon_have.get(k) != icon_exp[k]]
+        icon_files = (_family_registered_files(prefix, ICON_FONT_FAMILY)
+                      if _registered_font_basenames(prefix) is not None else [])
+        if icon_missing:
+            add("icon-font", "warn",
+                "%s %s not mapped to %s, so programs that draw their window buttons with Windows' "
+                "icon font (Topaz Photo) show wrong symbols. Repair maps %s."
+                % (" and ".join(icon_missing), "is" if len(icon_missing) == 1 else "are", ICON_FONT_FAMILY,
+                   "it" if len(icon_missing) == 1 else "them"), missing=icon_missing)
+            repair.append("map %s to %s" % (" and ".join(icon_missing), ICON_FONT_FAMILY))
+        elif not icon_files:
+            add("icon-font", "warn",
+                "Windows' icon fonts are mapped to %s, but it is not registered in this prefix, so "
+                "window-button symbols stay wrong. Repair registers it." % ICON_FONT_FAMILY, missing=[])
+            repair.append("register %s" % ICON_FONT_FAMILY)
+        else:
+            add("icon-font", "good", "%s -> %s (registered: %s)"
+                % (" and ".join(icon_exp), ICON_FONT_FAMILY, ", ".join(icon_files)), missing=[])
+
     # 5. Registration -- a font the prefix merely HAS is invisible to the apps.
     unreg = _unregistered_prefix_fonts(prefix)
     fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
@@ -3699,6 +3754,9 @@ def fonts_verdict(prefix):
     elif by["replacements"]["status"] == "warn" and rep_differ:
         summary = ("%d font replacement%s differ from the runtime's map; the apps start, Repair "
                    "restores it" % (len(rep_differ), "" if len(rep_differ) == 1 else "s"))
+    elif by["icon-font"]["status"] == "warn":
+        summary = ("Window-button symbols will be wrong in programs such as Topaz Photo: Windows' icon "
+                   "font is not mapped to %s" % ICON_FONT_FAMILY)
     elif by["registered"]["status"] == "warn":
         summary = ("%d font file%s in the prefix %s not registered, so the apps cannot see %s"
                    % (len(unreg or []), "" if len(unreg or []) == 1 else "s",
@@ -3758,6 +3816,13 @@ def repair_prefix_fonts(wine, prefix):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", k, "REG_SZ", expected[k])
     rep_step = {"step": "font_replacements", "ok": None, "restored": to_write}
     steps.append(rep_step)          # `ok` judged from a re-read after the registry has reached disk
+    # Windows' icon fonts -> Neutron Icons (registered below with the runtime's other Wine fonts).
+    icon_exp = expected_icon_font_replacements(wine)
+    icon_write = [k for k in icon_exp if have.get(k) != icon_exp[k]]
+    for k in icon_write:
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", k, "REG_SZ", icon_exp[k])
+    icon_step = {"step": "icon_font_replacements", "ok": None, "restored": icon_write}
+    steps.append(icon_step)
 
     # The map's target: Adobe Clean copied in from an installed app when windows/Fonts has none.
     # Without this, a prefix with only Lightroom stayed "still broken after repair" for good.
@@ -3784,6 +3849,10 @@ def repair_prefix_fonts(wine, prefix):
     rep_step["ok"] = all(have.get(k) == v for k, v in expected.items())
     rep_step["detail"] = ("%d/%d entries as expected" % (sum(1 for k, v in expected.items() if have.get(k) == v),
                                                         len(expected)))
+    icon_step["ok"] = all(have.get(k) == v for k, v in icon_exp.items())
+    icon_step["detail"] = ("%d/%d entries as expected" % (sum(1 for k, v in icon_exp.items() if have.get(k) == v),
+                                                         len(icon_exp)) if icon_exp
+                           else "this runtime ships no icon font")
 
     ncache = invalidate_cooltype_caches(prefix)
     steps.append({"step": "cooltype_cache_invalidate", "ok": True, "count": ncache})
@@ -5903,6 +5972,12 @@ def cmd_prefix_provision(args):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
     event(args, event="progress", stage="fonts", pct=82, msg="applied the Adobe font replacement map")
     steps.append({"step": "fonts", "count": len(fonts), "ok": True})
+    # Windows' icon fonts -> Neutron Icons (registered with the other Wine fonts below).
+    icon_fonts = expected_icon_font_replacements(wine)
+    for name, repl in icon_fonts.items():
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
+    steps.append({"step": "icon_fonts", "count": len(icon_fonts), "ok": True,
+                  **({} if icon_fonts else {"detail": "this runtime ships no icon font"})})
 
     # The replacement map's target must exist: copy Adobe Clean in from whichever Adobe app is
     # installed (see _adobe_clean_sources), for every install method, before registering.
