@@ -246,6 +246,19 @@ def nvidia_gpu_expected(gpus):
         return False
 
 
+def cuda_gpu_expected(gpus):
+    """False only when the kernel lists GPUs, none runs NVIDIA's own driver, and NVIDIA's driver reports no GPU
+    either. CUDA exists only on NVIDIA's own driver (not on nouveau, AMD or Intel), so this gates the profile
+    variables that exist only for our nvcuda (CUDA_ONLY_ENV). As in nvidia_gpu_expected, an empty list means the
+    GPUs could not be read, so it keeps the settings CUDA was tested with."""
+    if not gpus or any(v == NVIDIA_PCI_VENDOR and drv == "nvidia" for v, drv in gpus):
+        return True
+    try:
+        return bool(os.listdir(NVIDIA_PROC_GPUS))
+    except OSError:
+        return False
+
+
 def _apply_gl_vendor_env(env, gpus):
     """NVIDIA's EGL and GLX vendor for a launch, plus PRIME render offload on a hybrid laptop. `gpus` is
     drm_gpus(). Returns True when NVIDIA's vendor was requested.
@@ -276,6 +289,14 @@ def _apply_gl_vendor_env(env, gpus):
 # DLL overrides that exist only for NVIDIA's API (dxvk-nvapi); a profile's copy is dropped when
 # nvidia_gpu_expected() is False.
 NVIDIA_ONLY_DLL_OVERRIDES = ("nvapi64",)
+
+# Profile variables that exist only for CUDA interop through our nvcuda; a profile's value is left out when
+# cuda_gpu_expected() is False (a value the caller or neutron-env.conf sets still applies).
+#   NEUTRON_DXVK_EXPORT_TEXTURES (After Effects): our DXVK marks interop-shaped textures shared so nvcuda can
+#   hand their memory to CUDA. Without CUDA nothing registers them, and the forced sharing is not what Windows
+#   does: After Effects then reads MiscFlags SHARED|SHARED_NTHANDLE back from a texture it created plain, and
+#   each one gets a dedicated exportable allocation (Neutron#47, an AMD card on the OpenCL path).
+CUDA_ONLY_ENV = ("NEUTRON_DXVK_EXPORT_TEXTURES",)
 
 
 def _drop_dll_overrides(spec, dlls):
@@ -836,7 +857,9 @@ def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None,
     # there anyway: DXVK hides only NVIDIA adapters, the prefix registry already loads nvapi64
     # native, and dxvk-nvapi's NvAPI_Initialize finds no NVIDIA adapter. Any NVIDIA GPU, or GPUs that
     # could not be read, keeps both exactly as before.
-    nvidia = nvidia_gpu_expected(drm_gpus() if gpus is None else gpus)
+    if gpus is None:
+        gpus = drm_gpus()
+    nvidia = nvidia_gpu_expected(gpus)
     overrides = profile["overrides"]
     if not nvidia:
         overrides = _drop_dll_overrides(overrides, NVIDIA_ONLY_DLL_OVERRIDES)
@@ -862,7 +885,11 @@ def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None,
     # Trade-off accepted: a stale exported NEUTRON_* in a shell now sticks instead of being
     # corrected. That is the price of having an override at all, and it is the behaviour the
     # validated soak path always assumed it had.
+    # CUDA-only variables (CUDA_ONLY_ENV) are left out where no GPU runs NVIDIA's own driver.
+    cuda = cuda_gpu_expected(gpus)
     for k, v in profile.get("env", {}).items():
+        if k in CUDA_ONLY_ENV and not cuda:
+            continue
         env.setdefault(k, v)
     # Premiere 2026+ runs on Adobe's DirectX display (PREMIERE_DIRECTX_DISPLAY_FROM). Its Program Monitor
     # presents through vkd3d-proton straight to its own surface; blit-to-window would ALSO read every
@@ -1155,7 +1182,10 @@ APP_PROFILES = {
         # DXVK to make interop-shaped textures exportable. Narrowly scoped inside DXVK
         # (2D, >=512x512, BIND_UNORDERED_ACCESS, GPU-only) because a shared allocation is
         # dedicated and bypasses the suballocator. ⚠️ Needs the staged nvcuda.dll +
-        # d3d11.dll (neutron-wine external/patches).
+        # d3d11.dll (neutron-wine external/patches). CUDA only (CUDA_ONLY_ENV, Neutron#47
+        # 2026-11-06): left out where no GPU runs NVIDIA's own driver -- After Effects renders
+        # through OpenCL there, nothing registers the texture with CUDA, and the forced sharing
+        # only changes what After Effects sees.
         # ⭐ 2026-08-03 — THE D2D/PRESENT SET. These four had lived only in ~/ae-best.sh, so a
         # plain `neutron launch aftereffects` produced a BLACK, UNRENDERED UI. I had looked at
         # them, called them unjustified carry-over from the Premiere harnesses because ae-best.sh

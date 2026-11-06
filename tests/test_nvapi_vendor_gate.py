@@ -11,7 +11,7 @@ The invariants tested here:
   * any NVIDIA GPU (alone, hybrid, on nouveau), or a GPU list that could not be read: every app's environment
     is exactly what it was before the gate (WINEDLLOVERRIDES is the profile's string, byte for byte);
   * AMD and/or Intel only: those two settings are the ONLY difference, for every app, also in
-    neutron-appenv.conf.
+    neutron-appenv.conf, besides the CUDA-only variables (test_cuda_only_env.py), which nouveau loses too.
 Nothing here starts wine; the prefix is a temp dir with empty files where the exes would be.
 
 Run:  python3 tests/test_nvapi_vendor_gate.py
@@ -144,7 +144,11 @@ class ProfileEnv(unittest.TestCase):
             self.assertEqual(want.get("WINEDLLOVERRIDES"), profile["overrides"] or None, app)
             self.assertEqual(want.get("DXVK_ENABLE_NVAPI"), "1" if profile["nvapi"] else None, app)
             for name, gpus in WITH_NVIDIA.items():
-                self.assertEqual(self.env(app, gpus), want, "%s on %s" % (app, name))
+                w = dict(want)
+                if not N.cuda_gpu_expected(gpus):       # nouveau: no CUDA (test_cuda_only_env.py)
+                    for key in N.CUDA_ONLY_ENV:
+                        w.pop(key, None)
+                self.assertEqual(self.env(app, gpus), w, "%s on %s" % (app, name))
 
     def test_amd_and_intel_lose_only_the_two_settings(self):
         for app, profile in N.APP_PROFILES.items():
@@ -155,6 +159,8 @@ class ProfileEnv(unittest.TestCase):
                 self.assertNotIn("nvapi64", got.get("WINEDLLOVERRIDES", "").lower(), "%s on %s" % (app, name))
                 want = dict(nv)
                 want.pop("DXVK_ENABLE_NVAPI", None)
+                for key in N.CUDA_ONLY_ENV:              # no CUDA either (test_cuda_only_env.py)
+                    want.pop(key, None)
                 ovr = N._drop_dll_overrides(profile["overrides"], N.NVIDIA_ONLY_DLL_OVERRIDES)
                 if ovr:
                     want["WINEDLLOVERRIDES"] = ovr
