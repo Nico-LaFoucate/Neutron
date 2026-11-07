@@ -514,7 +514,14 @@ PROVISION_FONT_REPLACEMENTS = {
     "Noto Sans TC": "Adobe Clean", "Noto Serif JP": "Adobe Clean",
     "Noto Serif KR": "Adobe Clean", "Noto Serif SC": "Adobe Clean",
     "Noto Serif TC": "Adobe Clean", "Sans": "Adobe Clean",
-    "Segoe UI": "Adobe Clean", "Segoe UI Symbol": "Adobe Clean",
+    "Segoe UI": "Adobe Clean",
+    # Segoe UI Symbol is where Windows' symbols come from: it has the rating stars (U+2605/U+2606, Bridge's
+    # Label menu) and the rest of the symbol blocks, DirectWrite maps the star to it, and Windows' font links
+    # for Segoe UI and Tahoma end with it (starprobe on Windows 11, 2026-11-07). Its stand-in therefore has
+    # to HAVE those glyphs: Adobe Clean has none, so the stars drew as boxes. A tuple is written as
+    # REG_MULTI_SZ and Wine takes the first family that is installed; Adobe Clean stays last so the name
+    # still answers (dwrite FindFamilyName, see above) on a system with neither symbol font.
+    "Segoe UI Symbol": ("Noto Sans Symbols 2", "DejaVu Sans", "Adobe Clean"),
 }
 # Windows' icon fonts. Programs draw window buttons and check marks with private-use code points of
 # "Segoe MDL2 Assets" (Windows' icon font since Windows 10): Topaz Photo's minimize,
@@ -3356,7 +3363,28 @@ def _reg_unescape(s):
     return s.replace('\\"', '"').replace("\\\\", "\\")
 
 
-def _reg_section_values(reg_file, section):
+def _reg_unescape_multi(s):
+    """The strings of a .reg str(7) value (REG_MULTI_SZ): \\0 separates, trailing empties dropped."""
+    out, cur, i = [], [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n == "0":
+                out.append("".join(cur)); cur = []
+            else:
+                cur.append(n)
+            i += 2
+            continue
+        cur.append(c); i += 1
+    if cur:
+        out.append("".join(cur))
+    while out and out[-1] == "":
+        out.pop()
+    return tuple(out)
+
+
+def _reg_section_values(reg_file, section, multi=False):
     """{name: value} of the string values under ONE key of a Wine .reg file ON DISK -- never
     through wine. `section` takes single backslashes. None when the file is unreadable, {} when
     the key is absent.
@@ -3376,6 +3404,9 @@ def _reg_section_values(reg_file, section):
     out = {}
     for name, val in re.findall(r'^"((?:[^"\\]|\\.)*)"="((?:[^"\\]|\\.)*)"', m.group(1), re.M):
         out[_reg_unescape(name)] = _reg_unescape(val)
+    if multi:   # REG_MULTI_SZ values, as tuples (Wine writes them as str(7):"a\0b\0")
+        for name, val in re.findall(r'^"((?:[^"\\]|\\.)*)"=str\(7\):"((?:[^"\\]|\\.)*)"', m.group(1), re.M):
+            out[_reg_unescape(name)] = _reg_unescape_multi(val)
     return out
 
 
@@ -3389,6 +3420,25 @@ def _registered_font_basenames(prefix):
     return {v.replace("\\", "/").rsplit("/", 1)[-1].lower() for v in vals.values()}
 
 
+def _replacement_choices(value):
+    """The families a Replacements value names, in order: a REG_SZ is one, a REG_MULTI_SZ (tuple) several."""
+    return list(value) if isinstance(value, (tuple, list)) else [value]
+
+
+def _replacement_text(value):
+    """A Replacements value for messages: "A" or "A, else B, else C"."""
+    return ", else ".join(_replacement_choices(value))
+
+
+def write_font_replacement(wine, prefix, name, value):
+    """One HKCU\\Software\\Wine\\Fonts\\Replacements entry: REG_SZ for one family, REG_MULTI_SZ for a tuple
+    (Wine's reg.exe splits /d on \\0; Wine's font loader takes the first family that is installed)."""
+    if isinstance(value, (tuple, list)):
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_MULTI_SZ", "\\0".join(value))
+    else:
+        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", value)
+
+
 def expected_font_replacements(runtime=None):
     """The replacement map a prefix should carry: the runtime's fonts.json when present, else
     the builtin PROVISION_FONT_REPLACEMENTS. ONE definition, shared by `prefix provision` (which
@@ -3399,7 +3449,7 @@ def expected_font_replacements(runtime=None):
             with open(os.path.join(runtime, "fonts.json")) as f:
                 bundled = json.load(f)
             if bundled:
-                fonts = bundled
+                fonts = {k: tuple(v) if isinstance(v, list) else v for k, v in bundled.items()}
         except Exception as e:
             log(f"runtime fonts.json unreadable ({e}); using builtin map")
     return fonts
@@ -3423,7 +3473,7 @@ def expected_icon_font_replacements(wine=None):
 def _prefix_font_replacements(prefix):
     """The HKCU\\Software\\Wine\\Fonts\\Replacements map as the prefix has it (user.reg), or
     None when unreadable."""
-    return _reg_section_values(os.path.join(prefix, "user.reg"), r"Software\Wine\Fonts\Replacements")
+    return _reg_section_values(os.path.join(prefix, "user.reg"), r"Software\Wine\Fonts\Replacements", multi=True)
 
 
 def _family_registered_files(prefix, family):
@@ -3644,11 +3694,17 @@ def fonts_verdict(prefix):
     else:
         rep_missing = [k for k in expected if k not in have]
         rep_differ = {k: have[k] for k in expected if k in have and have[k] != expected[k]}
-        targets = sorted(set(expected.values()) | set(rep_differ.values()))
+        # A REG_MULTI_SZ value is satisfied by any of its families (Wine takes the first installed one).
+        values = set(expected.values()) | set(rep_differ.values())
+        targets = sorted({f for v in values for f in _replacement_choices(v)})
         reg_readable = _registered_font_basenames(prefix) is not None
         target_files = {t: (_family_registered_files(prefix, t) if reg_readable else []) for t in targets}
-        rep_absent = [t for t in targets if not target_files[t]] if reg_readable else []
-        n_exp, exp_targets = len(expected), ", ".join(sorted(set(expected.values())))
+        # An unsatisfied value is reported by its last family, the one the map relies on being there.
+        rep_absent = (sorted({_replacement_choices(v)[-1] for v in values
+                              if not any(target_files[f] for f in _replacement_choices(v))})
+                      if reg_readable else [])
+        n_exp = len(expected)
+        exp_targets = ", ".join(sorted({_replacement_text(v) for v in expected.values()}))
         shown = ", ".join(rep_missing[:4]) + (" and %d more" % (len(rep_missing) - 4) if len(rep_missing) > 4 else "")
         if rep_missing:
             add("replacements", "bad",
@@ -3686,7 +3742,7 @@ def fonts_verdict(prefix):
                 "%d font replacement%s point%s somewhere other than the runtime's map (%s); the "
                 "targets exist, so the apps start. Repair restores the map."
                 % (len(rep_differ), "" if len(rep_differ) == 1 else "s", "s" if len(rep_differ) == 1 else "",
-                   "; ".join("%s -> %s" % (k, v) for k, v in sorted(rep_differ.items())[:3])),
+                   "; ".join("%s -> %s" % (k, _replacement_text(v)) for k, v in sorted(rep_differ.items())[:3])),
                 missing=[], absent_targets=[], differ=rep_differ)
             repair.append("restore %d font replacement entries" % len(rep_differ))
         else:
@@ -3833,7 +3889,7 @@ def repair_prefix_fonts(wine, prefix):
     have = _prefix_font_replacements(prefix) or {}
     to_write = [k for k in expected if have.get(k) != expected[k]]
     for k in to_write:
-        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", k, "REG_SZ", expected[k])
+        write_font_replacement(wine, prefix, k, expected[k])
     rep_step = {"step": "font_replacements", "ok": None, "restored": to_write}
     steps.append(rep_step)          # `ok` judged from a re-read after the registry has reached disk
     # Windows' icon fonts -> Neutron Icons (registered below with the runtime's other Wine fonts).
@@ -5994,7 +6050,7 @@ def cmd_prefix_provision(args):
                       "builtins_bundle_only": sorted(unrefreshable)})
     fonts = expected_font_replacements(runtime)
     for name, repl in fonts.items():
-        reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
+        write_font_replacement(wine, prefix, name, repl)
     event(args, event="progress", stage="fonts", pct=82, msg="applied the Adobe font replacement map")
     steps.append({"step": "fonts", "count": len(fonts), "ok": True})
     # Windows' icon fonts -> Neutron Icons (registered with the other Wine fonts below).

@@ -110,7 +110,8 @@ class Prefix:
                   "[Software\\\\Wine\\\\Drivers] 1789168449", '"Graphics"="wayland"', ""]
         if self.replacements is not None:
             ulines += ["[Software\\\\Wine\\\\Fonts\\\\Replacements] 1789168449", "#time=1dd3be727dfa524"]
-            ulines += ['"%s"="%s"' % (k, v) for k, v in self.replacements.items()]
+            ulines += [('"%s"=str(7):"%s\\0"' % (k, "\\0".join(v)) if isinstance(v, tuple) else '"%s"="%s"' % (k, v))
+                       for k, v in self.replacements.items()]
             ulines.append("")
         ulines += ["[Software\\\\Wine\\\\Fonts] 1789168449", '"Unrelated"="value"', ""]
         with open(os.path.join(self.root, "user.reg"), "w") as f:
@@ -388,7 +389,8 @@ class FontsVerdict(unittest.TestCase):
 
     def test_reg_section_reader_unescapes_and_scopes(self):
         self.p.healthy()
-        vals = N._reg_section_values(os.path.join(self.p.root, "user.reg"), r"Software\Wine\Fonts\Replacements")
+        vals = N._reg_section_values(os.path.join(self.p.root, "user.reg"), r"Software\Wine\Fonts\Replacements",
+                                     multi=True)
         self.assertEqual(vals, EXPECTED_MAP)
         self.assertEqual(N._reg_section_values(os.path.join(self.p.root, "user.reg"), r"Software\Wine\Fonts"),
                          {"Unrelated": "value"})
@@ -400,7 +402,64 @@ class FontsVerdict(unittest.TestCase):
         """One definition: whatever provision writes is what check verifies."""
         self.assertEqual(N.expected_font_replacements(None), N.PROVISION_FONT_REPLACEMENTS)
         self.assertGreaterEqual(len(EXPECTED_MAP), 16)
-        self.assertTrue(all(v == "Adobe Clean" for v in EXPECTED_MAP.values()), EXPECTED_MAP)
+        self.assertTrue(all(v == "Adobe Clean" for k, v in EXPECTED_MAP.items() if k != "Segoe UI Symbol"), EXPECTED_MAP)
+        self.assertEqual(EXPECTED_MAP["Segoe UI Symbol"][-1], "Adobe Clean")
+
+    # --- Segoe UI Symbol: its stand-in must have its glyphs (Bridge's rating stars, 2026-11-07) --------
+    # Windows 11 (starprobe): Segoe UI Symbol has U+2605/U+2606, DirectWrite maps the star to it and the font
+    # links of Segoe UI and Tahoma end with it. Mapped to Adobe Clean (no star) Bridge's Label menu drew boxes.
+    SYMBOLS = ("Noto Sans Symbols 2", "DejaVu Sans", "Adobe Clean")
+
+    def test_segoe_ui_symbol_stand_in_has_the_symbols(self):           # KNOWN-BAD: the old map ("Adobe Clean")
+        self.assertEqual(N.PROVISION_FONT_REPLACEMENTS["Segoe UI Symbol"], self.SYMBOLS)
+
+    def test_multi_string_entry_reads_back_as_written(self):
+        """Wine stores the REG_MULTI_SZ as str(7):"a\\0b\\0c\\0"; check must read it back as the same tuple."""
+        self.p.healthy()
+        self.p.replacements["Segoe UI Symbol"] = self.SYMBOLS; self.p.write_reg()
+        self.assertEqual(N._prefix_font_replacements(self.p.root)["Segoe UI Symbol"], self.SYMBOLS)
+        c = by_name(N.fonts_verdict(self.p.root))["replacements"]
+        self.assertEqual(c["status"], "good", c)            # satisfied by Adobe Clean alone (no symbol font here)
+        self.assertEqual(c["differ"], {})
+
+    def test_old_single_symbol_entry_is_warn_and_repair_writes_multi_sz(self):   # KNOWN-BAD -> repaired
+        from unittest import mock
+        self.p.healthy()
+        self.p.replacements["Segoe UI Symbol"] = "Adobe Clean"; self.p.write_reg()
+        c = by_name(N.fonts_verdict(self.p.root))["replacements"]
+        self.assertEqual(c["status"], "warn", c)
+        self.assertEqual(c["differ"], {"Segoe UI Symbol": "Adobe Clean"})
+        writes = []
+        with mock.patch.object(N, "reg_set", side_effect=lambda *a: writes.append(a[2:])):
+            N.write_font_replacement("wine", self.p.root, "Segoe UI Symbol", N.PROVISION_FONT_REPLACEMENTS["Segoe UI Symbol"])
+            N.write_font_replacement("wine", self.p.root, "Segoe UI", N.PROVISION_FONT_REPLACEMENTS["Segoe UI"])
+        self.assertEqual(writes, [
+            (r"HKCU\Software\Wine\Fonts\Replacements", "Segoe UI Symbol", "REG_MULTI_SZ",
+             "Noto Sans Symbols 2\\0DejaVu Sans\\0Adobe Clean"),
+            (r"HKCU\Software\Wine\Fonts\Replacements", "Segoe UI", "REG_SZ", "Adobe Clean")])
+        self.p.replacements["Segoe UI Symbol"] = self.SYMBOLS; self.p.write_reg()   # what the write puts on disk
+        self.assertEqual(by_name(N.fonts_verdict(self.p.root))["replacements"]["status"], "good")
+
+    def test_multi_entry_with_nothing_installed_names_its_fallback(self):
+        """No family of the list registered (Adobe Clean absent too): bad, reported by the fallback family."""
+        self.p.genuine_roman(); self.p.core_six()
+        self.p.replacements["Segoe UI Symbol"] = self.SYMBOLS; self.p.write_reg()
+        c = by_name(N.fonts_verdict(self.p.root))["replacements"]
+        self.assertEqual(c["status"], "bad", c)
+        self.assertEqual(c["absent_targets"], ["Adobe Clean"])
+        # a registered symbol font satisfies the list on its own, but Adobe Clean's single entries stay unmet
+        self.p.font("DejaVuSans.ttf", "DejaVuSans", family="DejaVu Sans")
+        self.assertEqual(by_name(N.fonts_verdict(self.p.root))["replacements"]["absent_targets"], ["Adobe Clean"])
+
+    def test_bundled_fonts_json_lists_become_tuples(self):
+        d = tempfile.mkdtemp(prefix="neutron-fontsjson-")
+        try:
+            with open(os.path.join(d, "fonts.json"), "w") as f:
+                f.write('{"Segoe UI": "Adobe Clean", "Segoe UI Symbol": ["DejaVu Sans", "Adobe Clean"]}')
+            self.assertEqual(N.expected_font_replacements(d),
+                             {"Segoe UI": "Adobe Clean", "Segoe UI Symbol": ("DejaVu Sans", "Adobe Clean")})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     # --- the summary leads with the startup failure, not the first check --------------------
     def test_summary_priority(self):
