@@ -1273,6 +1273,26 @@ APP_PROFILES = {
         "nvapi": True, "env": {},
         "accent": "#ff3366", "export": False,
     },
+    # Bridge and InCopy (Mud Hut installs them from Adobe's feed as KBRG and AICY). Both start from InDesign's plain
+    # profile: no DVA/GPU-UI drawbot (no D2D env), and the real GPU reported (nvapi) as Windows does -- Bridge renders
+    # previews with the GPU and InCopy shares InDesign's framework. Accents are the icons' letter colors (Bridge: white
+    # on navy).
+    "bridge": {
+        "name": "Bridge",
+        "exe": _adobe("Adobe Bridge 2026", "Adobe Bridge.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b",
+        "nvapi": True, "env": {},
+        "accent": "#ffffff", "export": False,
+    },
+    "incopy": {
+        "name": "InCopy",
+        "exe": _adobe("Adobe InCopy 2026", "InCopy.exe"),
+        "dxvk_conf": "neutron-apps-dxvk.conf",
+        "overrides": "ucrtbase=n,b;dwrite=b",
+        "nvapi": True, "env": {},
+        "accent": "#ff3366", "export": False,
+    },
 }
 
 
@@ -5879,6 +5899,11 @@ def cmd_prefix_provision(args):
     reg_set(wine, prefix, r"HKCU\Software\Wine\AppDefaults\InDesign.exe",
             "Version", "REG_SZ", "win10")
     steps.append({"step": "indesign_menu_win10", "ok": True})
+    # InCopy shares InDesign's framework and its Type > Font menu has the same Windows 11 branch (at 168 dpi: a thin
+    # unscaled highlight bar with the previous row showing through; with this key the row fills, same row, same build).
+    reg_set(wine, prefix, r"HKCU\Software\Wine\AppDefaults\InCopy.exe",
+            "Version", "REG_SZ", "win10")
+    steps.append({"step": "incopy_menu_win10", "ok": True})
 
     # 2b''. Photoshop pen pressure: WinTab instead of Windows Ink (see PS_WINTAB_LINE). Launches repeat it for a
     # Photoshop installed after this.
@@ -7751,6 +7776,8 @@ APP_CATEGORIES = {
     "animate":      "Graphics;2DGraphics;",
     "audition":     "AudioVideo;Audio;AudioVideoEditing;",
     "indesign":     "Graphics;Publishing;",
+    "bridge":       "Graphics;Photography;Viewer;",
+    "incopy":       "Office;WordProcessor;Publishing;",
 }
 
 # The types each app OWNS. `image/vnd.adobe.photoshop` and `application/illustrator` come from
@@ -7772,6 +7799,8 @@ APP_MIME_TYPES = {
     "indesign":     ("application/x-neutron-indd", "application/x-neutron-indt",
                      "application/x-neutron-idml"),
     "audition":     ("application/x-neutron-sesx",),
+    # Bridge owns nothing: it is a file browser, and every type it shows belongs to another app or the user's viewer.
+    "incopy":       ("application/x-neutron-icml", "application/x-neutron-icma"),
 }
 
 
@@ -7835,6 +7864,14 @@ NEUTRON_MIME_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <mime-type type="application/x-neutron-sesx">
     <comment>Adobe Audition session</comment>
     <glob pattern="*.sesx" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-icml">
+    <comment>Adobe InCopy story</comment>
+    <glob pattern="*.icml" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-neutron-icma">
+    <comment>Adobe InCopy assignment</comment>
+    <glob pattern="*.icma" weight="60"/>
   </mime-type>
   <mime-type type="application/x-neutron-lrcat">
     <comment>Lightroom Classic catalog</comment>
