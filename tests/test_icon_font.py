@@ -165,6 +165,7 @@ class IconFontTests(unittest.TestCase):
         with mock.patch.object(N, "_repair_roman_defaults", return_value=([], [], False)), \
              mock.patch.object(N, "_ms_core_fonts_status", return_value=([], [])), \
              mock.patch.object(N, "expected_font_replacements", return_value={}), \
+             mock.patch.object(N, "CJK_FONT_REPLACEMENTS", {}, create=True), \
              mock.patch.object(N, "reg_set", side_effect=reg_set), \
              mock.patch.object(N, "seed_adobe_clean", return_value={"ok": True}), \
              mock.patch.object(N, "register_prefix_fonts", return_value=1), \

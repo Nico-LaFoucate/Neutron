@@ -506,14 +506,29 @@ PROVISION_DLL_OVERRIDES = {          # HKCU\Software\Wine\DllOverrides: Wine bui
 # apps). Missing these -> dwrite FindFamilyName NULL -> AdobeOwl AV -> leaked
 # critsec -> deadlock/crash on new-doc. The full proven map (fallback when no
 # runtime fonts.json is present).
+# Japanese, Chinese and Korean stand-ins: the Linux CJK families (Noto Sans CJK from the distribution's
+# noto-fonts-cjk package, or Adobe's identical Source Han Sans), then Adobe Clean so the name still
+# answers on a system with neither. Adobe Clean has no CJK glyphs, so the old one-name map drew every
+# Japanese, Chinese and Korean character as a box in any text Wine draws with these fonts (GDI and
+# its font links: the "MS Shell Dlg"/Tahoma links name MS UI Gothic, SimSun, Gulim and PMingLiU).
+# Wine applies a replacement only while the real font is absent, so Windows fonts the user copied
+# into the prefix still win.
+CJK_JA = ("Noto Sans CJK JP", "Source Han Sans JP", "Adobe Clean")
+CJK_JA_SERIF = ("Noto Serif CJK JP", "Source Han Serif JP", "Adobe Clean")
+CJK_SC = ("Noto Sans CJK SC", "Source Han Sans SC", "Adobe Clean")
+CJK_SC_SERIF = ("Noto Serif CJK SC", "Source Han Serif SC", "Adobe Clean")
+CJK_TC = ("Noto Sans CJK TC", "Source Han Sans TC", "Adobe Clean")
+CJK_TC_SERIF = ("Noto Serif CJK TC", "Source Han Serif TC", "Adobe Clean")
+CJK_KR = ("Noto Sans CJK KR", "Source Han Sans KR", "Adobe Clean")
+CJK_KR_SERIF = ("Noto Serif CJK KR", "Source Han Serif KR", "Adobe Clean")
 PROVISION_FONT_REPLACEMENTS = {
-    "BIZ UDGothic": "Adobe Clean", "Calibri": "Adobe Clean",
-    "Microsoft Sans Serif": "Adobe Clean", "MS Gothic": "Adobe Clean",
-    "MS UI Gothic": "Adobe Clean", "Noto Sans JP": "Adobe Clean",
-    "Noto Sans KR": "Adobe Clean", "Noto Sans SC": "Adobe Clean",
-    "Noto Sans TC": "Adobe Clean", "Noto Serif JP": "Adobe Clean",
-    "Noto Serif KR": "Adobe Clean", "Noto Serif SC": "Adobe Clean",
-    "Noto Serif TC": "Adobe Clean", "Sans": "Adobe Clean",
+    "BIZ UDGothic": CJK_JA, "Calibri": "Adobe Clean",
+    "Microsoft Sans Serif": "Adobe Clean", "MS Gothic": CJK_JA,
+    "MS UI Gothic": CJK_JA, "Noto Sans JP": CJK_JA,
+    "Noto Sans KR": CJK_KR, "Noto Sans SC": CJK_SC,
+    "Noto Sans TC": CJK_TC, "Noto Serif JP": CJK_JA_SERIF,
+    "Noto Serif KR": CJK_KR_SERIF, "Noto Serif SC": CJK_SC_SERIF,
+    "Noto Serif TC": CJK_TC_SERIF, "Sans": "Adobe Clean",
     "Segoe UI": "Adobe Clean",
     # Segoe UI Symbol is where Windows' symbols come from: it has the rating stars (U+2605/U+2606, Bridge's
     # Label menu) and the rest of the symbol blocks, DirectWrite maps the star to it, and Windows' font links
@@ -536,6 +551,20 @@ PROVISION_FONT_REPLACEMENTS = {
 ICON_FONT_FAMILY = "Neutron Icons"
 ICON_FONT_FILE = "neutron-icons.ttf"
 ICON_FONT_REPLACEMENTS = {"Segoe MDL2 Assets": ICON_FONT_FAMILY}
+# Windows' own Japanese, Chinese and Korean UI fonts: the families Windows' font links for Segoe UI and
+# Tahoma name (Windows 11, HKLM FontLink\SystemLink: MS UI Gothic, Yu Gothic UI, Meiryo UI, Microsoft
+# YaHei UI, Microsoft JhengHei UI, Malgun Gothic, SimSun, PMingLiU, Gulim) and the other UI families
+# programs ask for by name. None is redistributable. Kept apart from the Adobe map like the icon font:
+# a missing entry costs boxes instead of CJK text, never a failed start.
+CJK_FONT_REPLACEMENTS = {
+    "Yu Gothic": CJK_JA, "Yu Gothic UI": CJK_JA, "Meiryo": CJK_JA, "Meiryo UI": CJK_JA,
+    "MS PGothic": CJK_JA, "MS Mincho": CJK_JA_SERIF, "MS PMincho": CJK_JA_SERIF,
+    "Microsoft YaHei": CJK_SC, "Microsoft YaHei UI": CJK_SC, "SimHei": CJK_SC,
+    "SimSun": CJK_SC_SERIF, "NSimSun": CJK_SC_SERIF,
+    "Microsoft JhengHei": CJK_TC, "Microsoft JhengHei UI": CJK_TC,
+    "MingLiU": CJK_TC_SERIF, "PMingLiU": CJK_TC_SERIF,
+    "Malgun Gothic": CJK_KR, "Gulim": CJK_KR, "Dotum": CJK_KR, "Batang": CJK_KR_SERIF,
+}
 # The Adobe-suite DXVK config placed at the prefix root (Adobe panel render fix).
 # ⚠️ The shared conf above is NOT the only one. Two profiles point DXVK_CONFIG_FILE at their own
 # file, and provision used to create neither — so on a FRESH prefix, Premiere and After Effects
@@ -3778,6 +3807,23 @@ def fonts_verdict(prefix):
             add("icon-font", "good", "%s -> %s (registered: %s)"
                 % (" and ".join(icon_exp), ICON_FONT_FAMILY, ", ".join(icon_files)), missing=[])
 
+    # 4c. Windows' Japanese, Chinese and Korean UI fonts -> the Linux CJK families.
+    cjk_have = _prefix_font_replacements(prefix)
+    if cjk_have is None:
+        add("cjk-fonts", "warn", "user.reg is unreadable, so whether Windows' CJK fonts are mapped is unknown")
+    else:
+        cjk_missing = [k for k in CJK_FONT_REPLACEMENTS if cjk_have.get(k) != CJK_FONT_REPLACEMENTS[k]]
+        if cjk_missing:
+            shown = ", ".join(cjk_missing[:4]) + (" and %d more" % (len(cjk_missing) - 4) if len(cjk_missing) > 4 else "")
+            add("cjk-fonts", "warn",
+                "%d of Windows' %d Japanese, Chinese and Korean UI fonts are not mapped (%s), so text in "
+                "those languages can draw as boxes. Repair maps them." % (len(cjk_missing), len(CJK_FONT_REPLACEMENTS), shown),
+                missing=cjk_missing)
+            repair.append("map %d Japanese, Chinese and Korean font names" % len(cjk_missing))
+        else:
+            add("cjk-fonts", "good", "Windows' %d Japanese, Chinese and Korean UI fonts are mapped" % len(CJK_FONT_REPLACEMENTS),
+                missing=[])
+
     # 5. Registration -- a font the prefix merely HAS is invisible to the apps.
     unreg = _unregistered_prefix_fonts(prefix)
     fd = os.path.join(prefix, "drive_c", "windows", "Fonts")
@@ -3830,6 +3876,8 @@ def fonts_verdict(prefix):
     elif by["replacements"]["status"] == "warn" and rep_differ:
         summary = ("%d font replacement%s differ from the runtime's map; the apps start, Repair "
                    "restores it" % (len(rep_differ), "" if len(rep_differ) == 1 else "s"))
+    elif by["cjk-fonts"]["status"] == "warn":
+        summary = "Japanese, Chinese and Korean text can draw as boxes: Windows' CJK font names are not mapped"
     elif by["icon-font"]["status"] == "warn":
         summary = ("Window-button symbols will be wrong in programs such as Topaz Photo: Windows' icon "
                    "font is not mapped to %s" % ICON_FONT_FAMILY)
@@ -3899,6 +3947,11 @@ def repair_prefix_fonts(wine, prefix):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", k, "REG_SZ", icon_exp[k])
     icon_step = {"step": "icon_font_replacements", "ok": None, "restored": icon_write}
     steps.append(icon_step)
+    cjk_write = [k for k in CJK_FONT_REPLACEMENTS if have.get(k) != CJK_FONT_REPLACEMENTS[k]]
+    for k in cjk_write:
+        write_font_replacement(wine, prefix, k, CJK_FONT_REPLACEMENTS[k])
+    cjk_step = {"step": "cjk_font_replacements", "ok": None, "restored": cjk_write}
+    steps.append(cjk_step)
 
     # The map's target: Adobe Clean copied in from an installed app when windows/Fonts has none.
     # Without this, a prefix with only Lightroom stayed "still broken after repair" for good.
@@ -3929,6 +3982,9 @@ def repair_prefix_fonts(wine, prefix):
     icon_step["detail"] = ("%d/%d entries as expected" % (sum(1 for k, v in icon_exp.items() if have.get(k) == v),
                                                          len(icon_exp)) if icon_exp
                            else "this runtime ships no icon font")
+    cjk_step["ok"] = all(have.get(k) == v for k, v in CJK_FONT_REPLACEMENTS.items())
+    cjk_step["detail"] = "%d/%d entries as expected" % (
+        sum(1 for k, v in CJK_FONT_REPLACEMENTS.items() if have.get(k) == v), len(CJK_FONT_REPLACEMENTS))
 
     ncache = invalidate_cooltype_caches(prefix)
     steps.append({"step": "cooltype_cache_invalidate", "ok": True, "count": ncache})
@@ -6059,6 +6115,10 @@ def cmd_prefix_provision(args):
         reg_set(wine, prefix, r"HKCU\Software\Wine\Fonts\Replacements", name, "REG_SZ", repl)
     steps.append({"step": "icon_fonts", "count": len(icon_fonts), "ok": True,
                   **({} if icon_fonts else {"detail": "this runtime ships no icon font"})})
+    # Windows' CJK UI fonts -> the Linux CJK families (Adobe Clean last).
+    for name, repl in CJK_FONT_REPLACEMENTS.items():
+        write_font_replacement(wine, prefix, name, repl)
+    steps.append({"step": "cjk_fonts", "count": len(CJK_FONT_REPLACEMENTS), "ok": True})
 
     # The replacement map's target must exist: copy Adobe Clean in from whichever Adobe app is
     # installed (see _adobe_clean_sources), for every install method, before registering.

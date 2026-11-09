@@ -84,7 +84,7 @@ class Prefix:
                                       "Temp", "Adobe", "After Effects", "25.3", "Typesupport")
         os.makedirs(self.cache_dir)
         self.registered = []
-        self.replacements = dict(EXPECTED_MAP)
+        self.replacements = {**EXPECTED_MAP, **N.CJK_FONT_REPLACEMENTS}   # what provision writes
         self.write_reg()
 
     def font(self, filename, ps_name, mac_record=False, register=True, family=None):
@@ -391,7 +391,7 @@ class FontsVerdict(unittest.TestCase):
         self.p.healthy()
         vals = N._reg_section_values(os.path.join(self.p.root, "user.reg"), r"Software\Wine\Fonts\Replacements",
                                      multi=True)
-        self.assertEqual(vals, EXPECTED_MAP)
+        self.assertEqual(vals, {**EXPECTED_MAP, **N.CJK_FONT_REPLACEMENTS})
         self.assertEqual(N._reg_section_values(os.path.join(self.p.root, "user.reg"), r"Software\Wine\Fonts"),
                          {"Unrelated": "value"})
         self.assertEqual(N._reg_section_values(os.path.join(self.p.root, "user.reg"), r"Software\Nope"), {})
@@ -402,7 +402,8 @@ class FontsVerdict(unittest.TestCase):
         """One definition: whatever provision writes is what check verifies."""
         self.assertEqual(N.expected_font_replacements(None), N.PROVISION_FONT_REPLACEMENTS)
         self.assertGreaterEqual(len(EXPECTED_MAP), 16)
-        self.assertTrue(all(v == "Adobe Clean" for k, v in EXPECTED_MAP.items() if k != "Segoe UI Symbol"), EXPECTED_MAP)
+        self.assertTrue(all(v == "Adobe Clean" for k, v in EXPECTED_MAP.items() if isinstance(v, str)), EXPECTED_MAP)
+        self.assertTrue(all(v[-1] == "Adobe Clean" for v in EXPECTED_MAP.values() if isinstance(v, tuple)), EXPECTED_MAP)
         self.assertEqual(EXPECTED_MAP["Segoe UI Symbol"][-1], "Adobe Clean")
 
     # --- Segoe UI Symbol: its stand-in must have its glyphs (Bridge's rating stars, 2026-11-07) --------
@@ -440,6 +441,51 @@ class FontsVerdict(unittest.TestCase):
         self.p.replacements["Segoe UI Symbol"] = self.SYMBOLS; self.p.write_reg()   # what the write puts on disk
         self.assertEqual(by_name(N.fonts_verdict(self.p.root))["replacements"]["status"], "good")
 
+    # --- Japanese, Chinese and Korean (issue 48, 2026-11-08) -----------------------------------------
+    # The CJK names used to map to Adobe Clean, which has no CJK glyphs: every CJK character Wine drew with
+    # them (and with the Tahoma / MS Shell Dlg font links, which name MS UI Gothic, SimSun, Gulim, PMingLiU)
+    # was a box. Windows 11's font links for Segoe UI and Tahoma (FontLink\SystemLink, Windows probe
+    # 2026-11-07) name these families; each must reach a CJK family first and Adobe Clean last.
+    WINDOWS_LINKED_CJK = ("MS UI Gothic", "Yu Gothic UI", "Meiryo UI", "Microsoft YaHei UI",
+                          "Microsoft JhengHei UI", "Malgun Gothic", "SimSun", "PMingLiU", "Gulim")
+
+    def test_cjk_names_reach_a_cjk_family(self):          # KNOWN-BAD: the old map ("Adobe Clean" only)
+        for name, lang in (("MS UI Gothic", "JP"), ("MS Gothic", "JP"), ("BIZ UDGothic", "JP"),
+                           ("Noto Sans JP", "JP"), ("Noto Sans SC", "SC"), ("Noto Sans TC", "TC"),
+                           ("Noto Sans KR", "KR"), ("Noto Serif JP", "JP")):
+            v = N.PROVISION_FONT_REPLACEMENTS[name]
+            self.assertIsInstance(v, tuple, name)
+            self.assertTrue(v[0].startswith("Noto S") and v[0].endswith("CJK " + lang), (name, v))
+            self.assertEqual(v[-1], "Adobe Clean", name)
+
+    def test_windows_linked_cjk_fonts_are_mapped(self):   # KNOWN-BAD: no CJK_FONT_REPLACEMENTS before
+        full = {**N.PROVISION_FONT_REPLACEMENTS, **N.CJK_FONT_REPLACEMENTS}
+        for name in self.WINDOWS_LINKED_CJK:
+            self.assertIn(name, full)
+            self.assertIn("CJK", full[name][0], (name, full[name]))
+            self.assertEqual(full[name][-1], "Adobe Clean", name)
+        self.assertFalse(set(N.CJK_FONT_REPLACEMENTS) & set(N.PROVISION_FONT_REPLACEMENTS))
+
+    def test_prefix_without_cjk_map_is_warn_and_repair_maps_it(self):   # KNOWN-BAD -> repaired
+        from unittest import mock
+        self.p.healthy()
+        for k in N.CJK_FONT_REPLACEMENTS:
+            del self.p.replacements[k]
+        self.p.write_reg()
+        v = N.fonts_verdict(self.p.root)
+        c = by_name(v)["cjk-fonts"]
+        self.assertEqual(c["status"], "warn", c)        # boxes, never a failed start: not "bad"
+        self.assertEqual(sorted(c["missing"]), sorted(N.CJK_FONT_REPLACEMENTS))
+        self.assertEqual(v["status"], "warn", v["summary"])
+        self.assertIn("Japanese, Chinese and Korean", v["summary"])
+        writes = []
+        with mock.patch.object(N, "reg_set", side_effect=lambda *a: writes.append(a[2:])):
+            N.write_font_replacement("wine", self.p.root, "Yu Gothic UI", N.CJK_FONT_REPLACEMENTS["Yu Gothic UI"])
+        self.assertEqual(writes, [(r"HKCU\Software\Wine\Fonts\Replacements", "Yu Gothic UI", "REG_MULTI_SZ",
+                                   "Noto Sans CJK JP\\0Source Han Sans JP\\0Adobe Clean")])
+        self.p.replacements.update(N.CJK_FONT_REPLACEMENTS); self.p.write_reg()   # what repair puts on disk
+        self.assertEqual(by_name(N.fonts_verdict(self.p.root))["cjk-fonts"]["status"], "good")
+
     def test_multi_entry_with_nothing_installed_names_its_fallback(self):
         """No family of the list registered (Adobe Clean absent too): bad, reported by the fallback family."""
         self.p.genuine_roman(); self.p.core_six()
@@ -475,7 +521,7 @@ class FontsVerdict(unittest.TestCase):
         for key in ("status", "summary", "checks", "repair", "apps_running"):
             self.assertIn(key, v)
         self.assertEqual([c["name"] for c in v["checks"]],
-                         ["roman-default", "cooltype-cache", "ms-core-fonts", "replacements", "icon-font",
+                         ["roman-default", "cooltype-cache", "ms-core-fonts", "replacements", "icon-font", "cjk-fonts",
                           "registered"])
         for c in v["checks"]:
             self.assertIn(c["status"], ("good", "warn", "bad"))
