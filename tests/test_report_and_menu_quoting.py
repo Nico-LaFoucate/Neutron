@@ -215,6 +215,39 @@ class Report(FakeHome):
         self.assertNotIn(self.home, text)
         self.assertIn("starting ~/My Prefix/drive_c\nlast line", text)
 
+    def test_long_log_shows_its_header_above_the_tail(self):
+        prefix = self.fake_prefix("Pfx")
+        os.makedirs(self.cli.NEUTRON_LOGS_DIR)
+        with open(os.path.join(self.cli.NEUTRON_LOGS_DIR, "photoshop-pfx-20261109-120000.log"), "w") as f:
+            f.write("=== neutron runtime 11.10-184 | 2026-11-09 12:00:00\n"
+                    "    prefix  : %s  (stamp 1)\n"
+                    "    gpus    : 0x10de nvidia, 0x1002 amdgpu  (boot 0x1002)  (hybrid: __NV_PRIME_RENDER_OFFLOAD=1)\n"
+                    "%s\n\n" % (prefix, self.cli.LOG_HEADER_END))
+            for i in range(500):
+                f.write("app line %d\n" % i)
+        rc, text = self.run_report("--prefix", prefix, "--app", "photoshop", "--lines", "5")
+        self.assertEqual(rc, 0)
+        self.assertIn("(2026-", text)
+        self.assertIn("header and last 5 lines)", text)
+        self.assertIn("(hybrid: __NV_PRIME_RENDER_OFFLOAD=1)\n" + self.cli.LOG_HEADER_END + "\n…\napp line 495\n", text)
+        self.assertIn("    prefix  : ~/Pfx  (stamp 1)", text)
+        self.assertNotIn("app line 494", text)
+        self.assertNotIn(self.home, text)
+
+    def test_short_log_is_not_shown_twice(self):
+        prefix = self.fake_prefix("Pfx")
+        os.makedirs(self.cli.NEUTRON_LOGS_DIR)
+        with open(os.path.join(self.cli.NEUTRON_LOGS_DIR, "photoshop-pfx-20261109-120000.log"), "w") as f:
+            f.write("=== neutron runtime 11.10-184 | x\n%s\n\nonly line\n" % self.cli.LOG_HEADER_END)
+        rc, text = self.run_report("--prefix", prefix, "--app", "photoshop")
+        self.assertEqual(text.count("=== neutron runtime 11.10-184"), 1)
+        self.assertNotIn("header and", text)
+
+    def test_launch_writes_the_header_end_the_report_looks_for(self):
+        with open(_CLI, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('"%s\\n\\n"' % self.cli.LOG_HEADER_END, src)
+
     def test_unknown_prefix_is_refused(self):
         args = self.cli.build_parser().parse_args(["report", "--prefix", os.path.join(self.home, "nope")])
         with mock.patch.dict(os.environ, self.env), redirect_stdout(io.StringIO()), \

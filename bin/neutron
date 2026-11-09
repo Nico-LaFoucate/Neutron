@@ -10744,6 +10744,22 @@ def _newest_log(app=None, prefix=None):
     return best[1] if best else None
 
 
+# The last line of the header `neutron launch` writes at the top of each session log (runtime, prefix, GPUs, EGL vendor,
+# gates). `neutron report` shows that header above the log's tail.
+LOG_HEADER_END = "=== everything below this line is the application's own output"
+
+
+def _log_header(path, max_lines=20, width=2000):
+    """The provenance header at the top of a session log, through LOG_HEADER_END, or [] when the file has none in its
+    first `max_lines` lines (a log from before the header, or another program's)."""
+    with open(path, "rb") as f:
+        head = f.read(16 * 1024).decode("utf-8", "replace").splitlines()[:max_lines]
+    for i, line in enumerate(head):
+        if line == LOG_HEADER_END:
+            return [l if len(l) <= width else l[:width] + " …" for l in head[:i + 1]]
+    return []
+
+
 def _tail_lines(path, n, width=500):
     """The last `n` lines of a file without reading all of it (single logs reach 137 MB)."""
     with open(path, "rb") as f:
@@ -10799,9 +10815,12 @@ def cmd_report(args):
     if log and os.path.isfile(log):
         try:
             tail = _tail_lines(log, args.lines)
+            # The header says which runtime, GPUs and settings the session ran with; a short log's tail has it already.
+            header = [] if LOG_HEADER_END in tail else _log_header(log)
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(log)))
-            section("Log: %s (%s, last %d lines)" % (os.path.basename(log), when, len(tail)),
-                    "\n".join(tail))
+            section("Log: %s (%s, %slast %d lines)" % (os.path.basename(log), when,
+                                                     "header and " if header else "", len(tail)),
+                    "\n".join(header + ["…"] + tail if header else tail))
         except OSError as e:
             section("Log", "could not read %s: %s" % (log, e))
     else:
