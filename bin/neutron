@@ -259,6 +259,23 @@ def cuda_gpu_expected(gpus):
         return False
 
 
+# Adobe apps on a machine with an NVIDIA GPU on NVIDIA's own driver next to another vendor's GPU (a laptop's
+# Radeon/Intel iGPU) see only the NVIDIA GPU through DXVK and vkd3d-proton. GitHub Neutron#49 (Radeon 760M + RTX 5050
+# laptop, Premiere 26.5): with both GPUs visible an H.264 export kept the RTX's encoder and decoder near idle and the
+# CPU at ~600%; with DXVK_FILTER_DEVICE_NAME/VKD3D_FILTER_DEVICE_NAME naming the RTX the reporter measured the decoder
+# working through playback, the encoder and decoder working through the export, and a shorter export (2026-11-10).
+# On Windows, NVIDIA's driver profile puts Adobe apps on the NVIDIA GPU on such laptops. Our lab emulation of a hybrid
+# (a software GPU dressed as the iGPU) did NOT reproduce the difference, so the mechanism is unproven; the reporter's
+# hardware is the evidence. Device-name substring, as DXVK and vkd3d-proton match it. A value the caller sets wins.
+HYBRID_ADOBE_GPU_FILTER = "NVIDIA"
+HYBRID_ADOBE_GPU_FILTER_VARS = ("DXVK_FILTER_DEVICE_NAME", "VKD3D_FILTER_DEVICE_NAME")
+
+
+def nvidia_hybrid_on_nvidia_driver(gpus):
+    """True for a GPU on NVIDIA's own driver next to another vendor's GPU (see HYBRID_ADOBE_GPU_FILTER)."""
+    return nvidia_hybrid(gpus) and any(v == NVIDIA_PCI_VENDOR and drv == "nvidia" for v, drv in gpus)
+
+
 def _apply_gl_vendor_env(env, gpus):
     """NVIDIA's EGL and GLX vendor for a launch, plus PRIME render offload on a hybrid laptop. `gpus` is
     drm_gpus(). Returns True when NVIDIA's vendor was requested.
@@ -923,6 +940,11 @@ def _apply_app_env(env, app, profile, prefix, dxvk_conf, protected=(), exe=None,
         env["WINEDLLOVERRIDES"] = (_pre + ";" + overrides) if _pre else overrides
     if profile.get("nvapi") and nvidia:
         env["DXVK_ENABLE_NVAPI"] = "1"
+    # Adobe apps on an NVIDIA + other-vendor machine see only the NVIDIA GPU (HYBRID_ADOBE_GPU_FILTER, Neutron#49).
+    if app in APP_PROFILES and nvidia_hybrid_on_nvidia_driver(gpus):
+        for var in HYBRID_ADOBE_GPU_FILTER_VARS:
+            if var not in protected:
+                env.setdefault(var, HYBRID_ADOBE_GPU_FILTER)
     # setdefault, NOT assignment: an explicitly pre-set NEUTRON_* in the caller's environment
     # must WIN, or no gate can ever be turned off from outside. Two independent failures of the
     # old `env[k] = v` (both 2026-08-09):
@@ -7564,7 +7586,9 @@ def cmd_launch(args):
             _gpus = (", ".join("%s %s" % g for g in gpus) or "(none found)") + \
                 ("  (boot %s)" % _boot if _boot and len(gpus) > 1 else "") + \
                 ("  (hybrid: __NV_PRIME_RENDER_OFFLOAD=%s)" % env["__NV_PRIME_RENDER_OFFLOAD"]
-                 if "__NV_PRIME_RENDER_OFFLOAD" in env else "")
+                 if "__NV_PRIME_RENDER_OFFLOAD" in env else "") + \
+                ("  (device filter: %s)" % env["DXVK_FILTER_DEVICE_NAME"]
+                 if "DXVK_FILTER_DEVICE_NAME" in env else "")
             # ⛔ Report the runtime we RESOLVED, never NEUTRON_WINE_VERSION. That variable is what
             # was ASKED FOR; the binary is what ran. Caught in testing 2026-08-26 when a scratch
             # XDG_DATA_HOME moved the runtimes directory, resolution fell through to the dev build

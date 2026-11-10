@@ -148,6 +148,9 @@ class ProfileEnv(unittest.TestCase):
                 if not N.cuda_gpu_expected(gpus):       # nouveau: no CUDA (test_cuda_only_env.py)
                     for key in N.CUDA_ONLY_ENV:
                         w.pop(key, None)
+                if N.nvidia_hybrid_on_nvidia_driver(gpus):   # Adobe apps see only NVIDIA (test_hybrid_adobe_gpu_filter.py)
+                    for key in N.HYBRID_ADOBE_GPU_FILTER_VARS:
+                        w[key] = N.HYBRID_ADOBE_GPU_FILTER
                 self.assertEqual(self.env(app, gpus), w, "%s on %s" % (app, name))
 
     def test_amd_and_intel_lose_only_the_two_settings(self):
