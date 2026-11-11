@@ -169,7 +169,7 @@ class IconFontTests(unittest.TestCase):
              mock.patch.object(N, "reg_set", side_effect=reg_set), \
              mock.patch.object(N, "seed_adobe_clean", return_value={"ok": True}), \
              mock.patch.object(N, "register_prefix_fonts", return_value=1), \
-             mock.patch.object(N, "registry_to_disk", return_value=True), \
+             mock.patch.object(N, "registry_to_disk", return_value=True, create=True), \
              mock.patch.object(N, "invalidate_cooltype_caches", return_value=0):
             res = N.repair_prefix_fonts(self.wine, self.prefix)
         return res, [w for w in writes if w[0] == r"HKCU\Software\Wine\Fonts\Replacements"]
