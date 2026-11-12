@@ -2682,11 +2682,28 @@ def font_postscript_names(path):
     return _font_name_records(path, 6)
 
 
+_FONT_FAMILY_NAMES = {}
+
+
 def font_family_names(path):
     """EVERY family name a font declares: nameID 1 (legacy family, what GDI and Wine's
     replacement map key on) plus nameID 16 (typographic family, e.g. "Adobe Clean" on a face
-    whose nameID 1 is "Adobe Clean Black"). Used to verify a replacement TARGET exists."""
-    return _font_name_records(path, 1) | _font_name_records(path, 16)
+    whose nameID 1 is "Adobe Clean Black"). Used to verify a replacement TARGET exists.
+
+    Read once per file per run (keyed on path, size and mtime): `doctor` asks for ~20 families,
+    and each miss walks every registered font, so without this one run read ~1,900 name tables
+    19 times (Collider#4: 1 s -> 16 s on a Lightroom prefix)."""
+    try:
+        st = os.stat(path)
+        key = (path, st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    names = _FONT_FAMILY_NAMES.get(key) if key else None
+    if names is None:
+        names = frozenset(_font_name_records(path, 1) | _font_name_records(path, 16))
+        if key:
+            _FONT_FAMILY_NAMES[key] = names
+    return names
 
 
 def _font_name_records(path, want_nid):
