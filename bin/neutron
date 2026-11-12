@@ -4340,10 +4340,22 @@ def _third_party_procs(prefix):
         low = exe.lower()
         if not re.match(r"^[a-z]:/", low):
             continue  # a Linux process that merely carries WINEPREFIX in its environment
-        if "/adobe/" in low or "/microsoft/" in low or low.startswith("c:/windows/"):
+        if "/adobe/" in low or "/microsoft/" in low or low.startswith("c:/windows/") \
+                or re.match(_WINE_PROGRAM_DIRS, low):
             continue
         out.append((pid, exe))
     return out
+
+
+# Wine's own programs that live outside C:/windows (Internet Explorer, Windows Media Player, WordPad): Wine's, not
+# a program the user installed, so they do not keep the prefix open.
+_WINE_PROGRAM_DIRS = r"^c:/program files( \(x86\))?/(internet explorer|windows media player|windows nt)/"
+
+
+def _third_party_names(prefix):
+    """The exe names of the third-party programs still running in the prefix (see _third_party_procs), sorted:
+    what keeps the prefix open, in the words `teardown`, `prefix provision`, `update` and `uninstall` report it."""
+    return sorted({e.rsplit("/", 1)[-1] for _p, e in _third_party_procs(prefix)})
 
 
 def _post_wm_close(wine, env, images):
@@ -4458,20 +4470,19 @@ def _teardown_app(args, prefix, wine, env):
     #    too: the sweep is wineserver -k, and it would kill that program as well. It waits for the
     #    next teardown, exactly as it waits while another Adobe app is open.
     swept = False
-    third = _third_party_procs(prefix) if not left and not others else []
+    third = _third_party_names(prefix) if not left and not others else []
     if not left and not others and not third:
         log(f"teardown[{app_id}]: last app out -- sweeping shared daemons + wineserver")
         args.app = None
         cmd_teardown(args, _emitted=True)
         swept = True
     elif third:
-        names = sorted({e.rsplit("/", 1)[-1] for _p, e in third})
-        log(f"teardown[{app_id}]: last Adobe app out, but {', '.join(names)} still running -- not sweeping")
+        log(f"teardown[{app_id}]: last Adobe app out, but {', '.join(third)} still running -- not sweeping")
 
     emit({"ok": not left, "app": app_id, "torn_down": not left,
           "killed": len(before) - len(left), "still_alive": [c for _p, c in left],
           "still_running": others, "swept_prefix": swept,
-          "kept_for": sorted({e for _p, e in third})}, args.json)
+          "kept_for": third}, args.json)
     if left:
         sys.exit(EX_FAIL)
 
@@ -5694,10 +5705,11 @@ def cmd_prefix_provision(args):
     # Photoshop; CCXProcess and node, which the apps start) outlive the app, so the prefix's wine
     # session never ends and every wineserver_wait below sat out its 240 s behind them (release
     # test, 2026-10-07: 495 s instead of 27). With no Adobe app open, close the session first;
-    # with one open, leave it alone.
+    # with one open, leave it alone. A third-party program the user still runs (the Mister Horse Product Manager,
+    # installing a pack) keeps the session too: closing it is the same wineserver -k as the last app's teardown.
     leftover = [_proc_win_exe(pid).rsplit("/", 1)[-1] or c
                 for pid, c, is_app in _prefix_procs(prefix) if is_app]
-    if leftover and not _running_app_ids(prefix):
+    if leftover and not (_running_app_ids(prefix) or _third_party_names(prefix)):
         cmd_teardown(argparse.Namespace(prefix=prefix, json=True, force=False, grace=25, app=None),
                      _emitted=True)
         steps.append({"step": "closed_helpers", "ok": not _prefix_procs(prefix),
@@ -11240,7 +11252,8 @@ def _reprovision_prefixes(version, as_json):
     for p in neutron_prefixes():
         if not stamp_mismatch(p, newest):
             continue
-        running = _running_app_ids(p)
+        # A third-party program (a plugin's own app) is skipped the same way: provisioning would close its session.
+        running = _running_app_ids(p) + _third_party_names(p)
         if running:
             skipped.append({"prefix": p, "running": running})
             continue
@@ -11353,7 +11366,7 @@ def cmd_uninstall(args):
                 print("    " + p)
             del_prefixes = input("[neutron] Delete them too? [y/N] ").strip().lower() in ("y", "yes")
     if del_prefixes:
-        busy = [p for p in prefixes if _running_app_ids(p)]
+        busy = [p for p in prefixes if _running_app_ids(p) or _third_party_names(p)]
         if busy:
             die({"ok": False, "reason": "close the Adobe apps first; they are running in "
                  + ", ".join(busy)}, EX_RUNNING, args.json)

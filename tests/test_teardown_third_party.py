@@ -87,7 +87,7 @@ class ThirdParty(unittest.TestCase):
         fake = Fake({**PROCS, MH[0]: MH[1]})
         teardown(fake)
         self.assertFalse(fake.swept, "the prefix was swept under a running third-party program")
-        self.assertEqual(fake.emitted["kept_for"], [MH[1][2]])
+        self.assertEqual(fake.emitted["kept_for"], ["ProductManager.exe"])
         self.assertFalse(fake.emitted["swept_prefix"])
 
     def test_sweep_when_only_leftovers(self):
@@ -95,6 +95,94 @@ class ThirdParty(unittest.TestCase):
         teardown(fake)
         self.assertTrue(fake.swept, "Adobe/Wine/Microsoft leftovers must still be swept")
         self.assertEqual(fake.emitted["kept_for"], [])
+
+
+    def test_wine_programs_outside_windows_are_not_third_party(self):
+        wine_progs = {
+            301: ("iexplore.exe", True, "C:/Program Files/Internet Explorer/iexplore.exe"),
+            302: ("iexplore.exe", True, "C:/Program Files (x86)/Internet Explorer/iexplore.exe"),
+            303: ("wordpad.exe", True, "C:/Program Files/Windows NT/Accessories/wordpad.exe"),
+            304: ("wmplayer.exe", True, "C:/Program Files/Windows Media Player/wmplayer.exe"),
+        }
+        fake = Fake({**PROCS, **wine_progs})
+        fake.install()
+        try:
+            self.assertEqual(N._third_party_procs("/tmp/pfx"), [])
+        finally:
+            fake.restore()
+
+
+class Reprovision(unittest.TestCase):
+    """`neutron update` moves every prefix to the new runtime by running `prefix provision` in it, and
+    provision closes the prefix's wine session first. A prefix with the Product Manager still
+    installing a pack is skipped and named, as one with an Adobe app open is."""
+
+    def run_update(self, procs):
+        fake = Fake(procs)
+        fake.install()
+        saved = {k: getattr(N, k) for k in ("neutron_prefixes", "stamp_mismatch", "mudhut_busy")}
+        provisioned = []
+        saved_run = N.subprocess.run
+        N.neutron_prefixes = lambda: ["/tmp/pfx"]
+        N.stamp_mismatch = lambda p, wine: True
+        N.mudhut_busy = lambda p: None
+        N.subprocess.run = lambda *a, **k: provisioned.append(a) or argparse.Namespace(returncode=0)
+        try:
+            return N._reprovision_prefixes("11.10-999", True), provisioned
+        finally:
+            N.subprocess.run = saved_run
+            for k, v in saved.items():
+                setattr(N, k, v)
+            fake.restore()
+
+    def test_skipped_while_third_party_runs(self):
+        step, provisioned = self.run_update({**PROCS, MH[0]: MH[1]})
+        self.assertEqual(provisioned, [], "the prefix was provisioned under a running third-party program")
+        self.assertEqual(step["skipped"], [{"prefix": "/tmp/pfx", "running": ["ProductManager.exe"]}])
+        self.assertIn("ProductManager.exe", step["detail"])
+
+    def test_moved_with_only_leftovers(self):
+        step, provisioned = self.run_update(dict(PROCS))
+        self.assertEqual(len(provisioned), 1)
+        self.assertEqual(step["moved"], ["/tmp/pfx"])
+
+
+
+class Provision(unittest.TestCase):
+    """`prefix provision` (Collider's setup, and every prefix after `neutron update`) closes Adobe's
+    leftover helpers before it boots wine. It leaves the session alone while a third-party program
+    still runs in it."""
+
+    class Reached(Exception):
+        pass
+
+    def provision(self, procs):
+        fake = Fake(procs)
+        fake.install()
+        names = ("resolve_prefix", "resolve_wine", "remember_prefix", "event")
+        saved = {k: getattr(N, k) for k in names}
+        N.resolve_prefix = lambda path: "/tmp/pfx"
+        N.resolve_wine = lambda: ("/usr/bin/wine", True)
+        N.remember_prefix = lambda p: None
+
+        def event(*a, **k):
+            raise self.Reached()     # the first step after the sweep: stop here
+        N.event = event
+        try:
+            with self.assertRaises(self.Reached):
+                N.cmd_prefix_provision(argparse.Namespace(path="/tmp/pfx", prefix=None, json=True))
+        finally:
+            for k, v in saved.items():
+                setattr(N, k, v)
+            fake.restore()
+        return fake.swept
+
+    def test_no_sweep_while_third_party_runs(self):
+        self.assertFalse(self.provision({**PROCS, MH[0]: MH[1]}),
+                         "provision closed the session under a running third-party program")
+
+    def test_sweeps_leftovers(self):
+        self.assertTrue(self.provision(dict(PROCS)))
 
 
 if __name__ == "__main__":
