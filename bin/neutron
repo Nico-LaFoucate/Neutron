@@ -1853,7 +1853,7 @@ def find_debug_databases(prefix, user):
         # between. Collider re-applies this on every launch, so the fix was being
         # written to the wrong file over and over.
         #
-        # Rank: has the AEDebugDatabaseVersion marker > more keys > higher version.
+        # Rank: has the AEDebugDatabaseVersion marker > newer MAJOR (yearly) version > more keys > higher version.
         def rank(p):
             try:
                 with open(p, "rb") as f:
@@ -1867,7 +1867,12 @@ def find_debug_databases(prefix, user):
                 v = tuple(int(x) for x in ver.split("."))
             except ValueError:
                 v = (0,)
-            return (real, keys, v)
+            # The MAJOR version ranks before the key count: with two yearly versions installed
+            # (After Effects 2026 beside 2027, both genuine databases) `launch` starts the newest
+            # year (_resolve_app_exe), so its database is the live one. Counting keys first picked
+            # 26.0 (207 lines) over 27.0 (206) -- measured 2026-11-14 in a lab prefix. The 26.0-vs-26.3
+            # stub case above still resolves by the marker and then by keys within one major.
+            return (real, v[0], keys, v)
 
         hits.sort(key=rank, reverse=True)
         out.append((label, hits[0] if hits else None, installed))
