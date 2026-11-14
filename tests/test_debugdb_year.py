@@ -16,8 +16,17 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import test_programs as tp                          # noqa: E402
+import importlib.machinery
+import importlib.util
+
+_CLI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "neutron")
+
+
+def _load_cli():
+    spec = importlib.util.spec_from_loader("neutron_cli", importlib.machinery.SourceFileLoader("neutron_cli", _CLI))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _db(root, user, subdir, ver, lines, marker=True):
@@ -31,7 +40,7 @@ def _db(root, user, subdir, ver, lines, marker=True):
 
 class DebugDatabaseYear(unittest.TestCase):
     def setUp(self):
-        self.cli = tp._load_cli({})
+        self.cli = _load_cli()
         self.tmp = tempfile.TemporaryDirectory()
         self.p = self.tmp.name
         os.makedirs(os.path.join(self.p, "drive_c", "Program Files", "Adobe", "Adobe After Effects 2026"))
