@@ -105,7 +105,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 | **Media Encoder 2025** | 🟢 `Beta` | Queue, render and export end-to-end, including native muxing. |
 | **Audition 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Launch it with `neutron launch audition`. |
 | **InDesign 2025** | 🔵 `Likely` | Tested on 2026 (below). Its fixes are in Neutron's Wine, so the 2025 build should run as well, but it hasn't been tried. Launch it with `neutron launch indesign`. |
-| **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
+| **Lightroom CC** | 🟢 `Beta` | The cloud app, distinct from Lightroom Classic: `neutron launch lightroomcc`. Lightroom 10 needs runtime 11.10-206 or later; earlier runtimes stop at startup. Its cloud and local libraries open, photos can be edited, and its round buttons draw correctly. |
 | **Animate 2024** | 🟢 `Beta` | Canvas, panels and playback. Its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu (runtime 11.10-118 or later). |
 | **CEP / UXP panels** | 🟢 `Beta` | Third-party panels render and stay interactive inside their docks. |
@@ -131,7 +131,7 @@ The table above is the 2025 line; the 2026 and 2027 lines are below.
 | **Animate** | 🟢 `Beta` | Adobe stopped updating Animate in 2024, so Creative Cloud 2026 installs the same app as 2025. Canvas, panels and playback; its home screen is sometimes blank — a bug that also happens on Windows; File → New works. |
 | **Audition 2026** | 🟢 `Beta` | `neutron launch audition`: recording, playback and effects work, and its Learn panel renders. |
 | **InDesign 2026** | 🟢 `Beta` | `neutron launch indesign`: new documents, typing and the Type → Font menu work. |
-| **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
+| **Lightroom CC** | 🟢 `Beta` | The cloud app, distinct from Lightroom Classic: `neutron launch lightroomcc`. Lightroom 10 needs runtime 11.10-206 or later; earlier runtimes stop at startup. Its cloud and local libraries open, photos can be edited, and its round buttons draw correctly. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu — tested both ways on this release (runtime 11.10-118 or later). |
 
 ### Creative Cloud 2027
@@ -147,7 +147,7 @@ The table above is the 2025 line; the 2026 and 2027 lines are below.
 | **Animate 2027** | 🟢 `Beta` | Runs on this release the same as 2026: canvas, drawing, frames and playback. |
 | **Audition 2027** | 🟢 `Beta` | `neutron launch audition`: playback with level meters, effects and multitrack sessions, the same as 2026. |
 | **InDesign 2027** | 🟢 `Beta` | `neutron launch indesign`: new documents, typing, the Type → Font menu and PDF export. On its first launch InDesign indexes every installed font once for its Find Similar Fonts feature, which keeps one CPU core busy for several minutes (about 12 on the test machine). Let it finish; if InDesign is closed first, it starts over on the next launch. |
-| **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
+| **Lightroom CC** | 🟢 `Beta` | The cloud app, distinct from Lightroom Classic: `neutron launch lightroomcc`. Lightroom 10 needs runtime 11.10-206 or later; earlier runtimes stop at startup. Its cloud and local libraries open, photos can be edited, and its round buttons draw correctly. |
 
 The [status board](https://neutronproject.org) tracks every release and is the canonical view. [What Neutron does today](https://neutronproject.org/wiki/start/basics/what-neutron-does/) covers the rest: installing and updating apps straight from Adobe, GPU acceleration, pen tablets, plugins and more.
 
@@ -223,7 +223,7 @@ put `--json` before the command: `neutron --json doctor --prefix <path>`.
 | Command | What it does |
 | :--- | :--- |
 | `neutron setup` / `update` / `uninstall` | Install, update or remove everything (see above). |
-| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, `audition`, `indesign`, and one experimental one: `lightroomcc` (Lightroom). Supports `--prefix`, `--scale`, and opening a project file. |
+| `neutron launch <app> [file]` | Launch an app through the Neutron stack. Apps: `premiere`, `photoshop`, `lightroom`, `aftereffects`, `illustrator`, `animate`, `mediaencoder`, `audition`, `indesign` and `lightroomcc` (Lightroom, the cloud app). Supports `--prefix`, `--scale`, and opening a project file. |
 | `neutron prefix provision <path>` | Make a Wine prefix Neutron-ready: Microsoft's components, the runtime's DXVK / vkd3d-proton / NVIDIA DLLs, fonts, display fixes. |
 | `neutron prefix info <path>` | Report the paths and state Collider needs. |
 | `neutron apps --prefix <path>` | List apps and install status in a prefix. |
