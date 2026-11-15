@@ -118,7 +118,7 @@ patched Wine foundation and shipping the fixes those applications need to run.
 
 ### Creative Cloud 2026
 
-The table above is the 2025 line; the 2026 line is below.
+The table above is the 2025 line; the 2026 and 2027 lines are below.
 
 | Application | Status | Notes |
 | :--- | :--- | :--- |
@@ -134,7 +134,22 @@ The table above is the 2025 line; the 2026 line is below.
 | **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
 | **Dynamic Link** (Premiere ↔ After Effects) | 🟢 `Beta` | Full round trip, and either app can open the other from its Dynamic Link menu — tested both ways on this release (runtime 11.10-118 or later). |
 
-The [status board](https://neutronproject.org) tracks both releases and is the canonical view. [What Neutron does today](https://neutronproject.org/wiki/start/basics/what-neutron-does/) covers the rest: installing and updating apps straight from Adobe, GPU acceleration, pen tablets, plugins and more.
+### Creative Cloud 2027
+
+| Application | Status | Notes |
+| :--- | :--- | :--- |
+| **Premiere Pro 2027** | 🟢 `Beta` | Runs on this release the same as 2026: projects, playback, Effect Controls and export. |
+| **Photoshop 2027** | 🟢 `Beta` | Runs on this release the same as 2026. Its tip videos play with runtime 11.10-206 or later. |
+| **After Effects 2027** | 🟢 `Beta` | Runs on this release the same as 2026: compositions, preview and Render Queue export. With After Effects 2026 installed beside it, use Neutron 1.0.0-beta.42 or later, which sets up the 2027 app. |
+| **Illustrator 2027** | 🟢 `Beta` | Runs on this release the same as 2026. Installing it needs Mud Hut 0.3.11 or later (`neutron update` installs it). |
+| **Media Encoder 2027** | 🟢 `Beta` | Runs on this release the same as 2026: queue and export. |
+| **Lightroom Classic 16** | 🟢 `Beta` | Runs the same as 15.6: Library, Develop, AI Denoise, export and Edit In. |
+| **Animate 2027** | 🟢 `Beta` | Runs on this release the same as 2026: canvas, drawing, frames and playback. |
+| **Audition 2027** | 🟢 `Beta` | `neutron launch audition`: playback with level meters, effects and multitrack sessions, the same as 2026. |
+| **InDesign 2027** | 🟢 `Beta` | `neutron launch indesign`: new documents, typing, the Type → Font menu and PDF export. |
+| **Lightroom CC** | 🟣 `Planned` | Distinct from Lightroom Classic. You can try it early with an experimental, unsupported profile: `neutron launch lightroomcc`. |
+
+The [status board](https://neutronproject.org) tracks every release and is the canonical view. [What Neutron does today](https://neutronproject.org/wiki/start/basics/what-neutron-does/) covers the rest: installing and updating apps straight from Adobe, GPU acceleration, pen tablets, plugins and more.
 
 > [!NOTE]
 > Even where a specific app is untested, the core fixes built for the apps above — licensing and
