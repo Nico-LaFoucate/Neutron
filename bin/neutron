@@ -1302,7 +1302,17 @@ APP_PROFILES = {
         "exe": _adobe("Adobe Illustrator 2025", "Support Files", "Contents", "Windows", "Illustrator.exe"),
         "dxvk_conf": "neutron-apps-dxvk.conf",
         "overrides": "ucrtbase=n,b;dwrite=b",
-        "nvapi": True, "env": {},
+        # NEUTRON_DISABLE_BTW=1 (Neutron#54, 2026-11-14): "The interface seems choppy/low fps while zooming/moving
+        # through the artboad with spacebar (hand tool)". Illustrator 30.8+ draws its canvas with Direct3D 12
+        # (AISniffer: DirectXRenderer) into a swap chain, and vkd3d-proton's blit-to-window copied every presented
+        # frame back from the GPU, waited for it, converted it and painted it through GDI on the present thread
+        # before the next present could start: hand-tool panning a 3400-object document presented 7.6-9.0 frames/s
+        # with two vkd3d threads near 50% each, against 57.8-63.0 with it off (lab il54, 96 dpi, 5 launches each on
+        # runtime 187, 2 each on 204), the cost Photoshop, Lightroom, After Effects and Premiere 2026 already set this for.
+        # Nothing in Illustrator needed it: the canvas swap chain presents straight to its own surface. Illustrator
+        # was simply the one Adobe Direct3D 12 canvas left without it (its Aug-2026 shear test found BTW neutral).
+        # setdefault in _apply_app_env, so NEUTRON_DISABLE_BTW=0 on the command line still turns it back on.
+        "nvapi": True, "env": {"NEUTRON_DISABLE_BTW": "1"},
         "accent": "#ff9a00", "export": False,
     },
     # Audition and InDesign: Beta on Creative Cloud 2026 since 2026-10-28 (his call: "They work pretty well at this
