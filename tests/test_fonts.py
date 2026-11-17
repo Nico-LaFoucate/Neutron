@@ -362,6 +362,7 @@ class FontsVerdict(unittest.TestCase):
     def test_replacement_target_absent_is_bad(self):
         """Entries intact, but Adobe Clean is not in the prefix: the same failure, one step later."""
         self.p.genuine_roman(); self.p.core_six()          # no Adobe Clean at all
+        self.p.font("tahoma.ttf", "Tahoma", family="Tahoma")   # the runtime's Tahoma, registered in every prefix
         v = N.fonts_verdict(self.p.root)
         c = by_name(v)["replacements"]
         self.assertEqual(c["status"], "bad", c)
@@ -403,7 +404,9 @@ class FontsVerdict(unittest.TestCase):
         self.assertEqual(N.expected_font_replacements(None), N.PROVISION_FONT_REPLACEMENTS)
         self.assertGreaterEqual(len(EXPECTED_MAP), 16)
         self.assertTrue(all(v == "Adobe Clean" for k, v in EXPECTED_MAP.items() if isinstance(v, str)), EXPECTED_MAP)
-        self.assertTrue(all(v[-1] == "Adobe Clean" for v in EXPECTED_MAP.values() if isinstance(v, tuple)), EXPECTED_MAP)
+        self.assertTrue(all(v[-1] == "Adobe Clean" for k, v in EXPECTED_MAP.items() if isinstance(v, tuple) and k != "Segoe UI"),
+                        EXPECTED_MAP)
+        self.assertEqual(EXPECTED_MAP["Segoe UI"], ("Adobe Clean", "Tahoma"))
         self.assertEqual(EXPECTED_MAP["Segoe UI Symbol"][-1], "Adobe Clean")
 
     # --- Segoe UI Symbol: its stand-in must have its glyphs (Bridge's rating stars, 2026-11-07) --------
@@ -437,9 +440,23 @@ class FontsVerdict(unittest.TestCase):
         self.assertEqual(writes, [
             (r"HKCU\Software\Wine\Fonts\Replacements", "Segoe UI Symbol", "REG_MULTI_SZ",
              "Noto Sans Symbols 2\\0DejaVu Sans\\0Adobe Clean"),
-            (r"HKCU\Software\Wine\Fonts\Replacements", "Segoe UI", "REG_SZ", "Adobe Clean")])
+            (r"HKCU\Software\Wine\Fonts\Replacements", "Segoe UI", "REG_MULTI_SZ", "Adobe Clean\\0Tahoma")])
         self.p.replacements["Segoe UI Symbol"] = self.SYMBOLS; self.p.write_reg()   # what the write puts on disk
         self.assertEqual(by_name(N.fonts_verdict(self.p.root))["replacements"]["status"], "good")
+
+    # --- Segoe UI outside an Adobe prefix (Pro Tools counter cut off, 2026-11-17) --------------------------
+    # Pro Tools asks DirectWrite for Segoe UI. With "Segoe UI"="Adobe Clean" and no Adobe app in the prefix the
+    # name was missing; Pro Tools' DFW then took the collection's first family (Avid's AvidTechnologyNew, no
+    # digits, ascent 717 + descent 122 of 1000) and the main counter's digits were cut off at the bottom.
+    def test_segoe_ui_answers_in_a_prefix_without_adobe_clean(self):   # KNOWN-BAD: the old "Adobe Clean" entry
+        self.p.genuine_roman(); self.p.core_six()
+        self.p.font("tahoma.ttf", "Tahoma", family="Tahoma")   # the runtime's Tahoma, registered in every prefix
+        answers = lambda v: [f for f in N._replacement_choices(v) if N._family_registered_files(self.p.root, f)]
+        self.assertEqual(answers("Adobe Clean"), [])                                  # the old entry: nothing
+        self.assertEqual(answers(N.PROVISION_FONT_REPLACEMENTS["Segoe UI"]), ["Tahoma"])
+        # an Adobe prefix keeps Adobe Clean: Wine takes the first installed family of the list
+        self.p.adobe_clean()
+        self.assertEqual(answers(N.PROVISION_FONT_REPLACEMENTS["Segoe UI"]), ["Adobe Clean", "Tahoma"])
 
     # --- Japanese, Chinese and Korean (issue 48, 2026-11-08) -----------------------------------------
     # The CJK names used to map to Adobe Clean, which has no CJK glyphs: every CJK character Wine drew with
@@ -489,6 +506,7 @@ class FontsVerdict(unittest.TestCase):
     def test_multi_entry_with_nothing_installed_names_its_fallback(self):
         """No family of the list registered (Adobe Clean absent too): bad, reported by the fallback family."""
         self.p.genuine_roman(); self.p.core_six()
+        self.p.font("tahoma.ttf", "Tahoma", family="Tahoma")   # the runtime's Tahoma, registered in every prefix
         self.p.replacements["Segoe UI Symbol"] = self.SYMBOLS; self.p.write_reg()
         c = by_name(N.fonts_verdict(self.p.root))["replacements"]
         self.assertEqual(c["status"], "bad", c)

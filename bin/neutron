@@ -546,7 +546,15 @@ PROVISION_FONT_REPLACEMENTS = {
     "Noto Sans TC": CJK_TC, "Noto Serif JP": CJK_JA_SERIF,
     "Noto Serif KR": CJK_KR_SERIF, "Noto Serif SC": CJK_SC_SERIF,
     "Noto Serif TC": CJK_TC_SERIF, "Sans": "Adobe Clean",
-    "Segoe UI": "Adobe Clean",
+    # Segoe UI is Windows' UI font, so every program may ask for it, not only Adobe's. Adobe Clean exists only in
+    # a prefix with an Adobe app; in any other prefix (Pro Tools, programs) the name resolved to nothing and the
+    # program fell back on its own: Pro Tools' DFW takes the FIRST family of the DirectWrite collection, which is
+    # Avid's 17-glyph AvidTechnologyNew (no digits; ascent 717 + descent 122 of 1000), so the main counter was
+    # sized for that font and drawn with fallback glyphs that sit lower: its digits were cut off at the bottom
+    # (his report 2026-11-17, Pro Tools on test build 212). Tahoma ships with every Neutron runtime
+    # (share/wine/fonts), so it always answers; Wine takes the first installed family, so Adobe prefixes keep
+    # Adobe Clean.
+    "Segoe UI": ("Adobe Clean", "Tahoma"),
     # Segoe UI Symbol is where Windows' symbols come from: it has the rating stars (U+2605/U+2606, Bridge's
     # Label menu) and the rest of the symbol blocks, DirectWrite maps the star to it, and Windows' font links
     # for Segoe UI and Tahoma end with it (starprobe on Windows 11, 2026-11-07). Its stand-in therefore has
