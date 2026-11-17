@@ -34,6 +34,13 @@ class Lib32Check(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix="neutron-lib32-")
         os.makedirs(os.path.join(self.root, "etc"))
         os.makedirs(os.path.join(self.root, "lib"))
+        # The 32-bit libraries Wine needs besides the C library (Mud-Hut#3, tests/test_lib32_libs.py) are there, so these
+        # tests see the C library alone.
+        for name, _why, _pk in N.LIB32_LIBS:
+            path = os.path.join(self.root, "usr/lib/i386-linux-gnu", name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"\x7fELF\x01")
 
     def tearDown(self):
         shutil.rmtree(self.root)

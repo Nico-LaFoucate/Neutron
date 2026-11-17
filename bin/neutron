@@ -9670,9 +9670,11 @@ def doctor_checks(prefix_arg=None):
         for c in _runtime_integrity_checks(_wine):
             check(c[0], c[1], c[2])
 
-    # The 32-bit C library: without it Wine does not start at all (GitHub Neutron#29, see LIB32_LOADER).
+    # The 32-bit C library: without it Wine does not start at all (GitHub Neutron#29, see LIB32_LOADER); without the
+    # 32-bit display and font libraries 32-bit programs get no windows (Mud-Hut#3, see LIB32_LIBS).
     _lib32 = lib32_problem()
-    check("lib32", not _lib32, _lib32 or "the 32-bit C library is installed (/%s)" % LIB32_LOADER)
+    check("lib32", not _lib32, _lib32 or "the 32-bit C library and the 32-bit libraries for windows, text "
+          "and secure connections are installed")
 
     # ntsync: speed, not correctness -- reported, never a failure.
     _nts = ntsync_status()
@@ -11222,32 +11224,108 @@ def _enable_ntsync(as_json, assume_yes):
 LIB32_LOADER = "lib/ld-linux.so.2"
 
 
+# Mud-Hut#3 (2026-11-17, Linux Mint 22.3): the 32-bit C library alone is not enough. Wine's 32-bit side takes its display
+# driver, fonts and TLS from the system's 32-bit libraries (the runtime's i386 unix modules link or dlopen them). With
+# only libc6:i386, which is all setup installed on Debian/Ubuntu/Mint, every 32-bit program ran without a display driver
+# ("winewayland.so: libwayland-client.so.0: cannot open"): at provision both Visual C++ installers exited 130 (their log:
+# "Failed to create window", exit 0x582), and a 32-bit window came up as a 6x32 sliver with no text (no FreeType).
+# Measured in a Mint 22.3 container with the fixed runtime: the Wayland group alone gives exit 0; with the font group the
+# window is laid out; with GnuTLS 32-bit processes stop logging "failed to load libgnutls, no support for encryption"
+# (signature checks and HTTPS in 32-bit installers and helpers). The X11 group is what the 32-bit X11 driver links or
+# loads (an X11 session writes Graphics=x11; not run in the lab, the list follows the module's needs).
+# Not here: 32-bit OpenGL/Vulkan/sound (about 63 MB more on Mint, mostly 32-bit Mesa) -- only 32-bit 3D programs use them.
+# Each entry: (file name, what it is for, {family: package}). Fedora and openSUSE install by the library's name, which
+# rpm resolves to the 32-bit package (64-bit libraries provide "<name>()(64bit)" instead), so no package names are
+# guessed there.
+LIB32_LIBS = (
+    ("libwayland-client.so.0", "windows", {"debian": "libwayland-client0:i386", "arch": "lib32-wayland"}),
+    ("libwayland-egl.so.1", "windows", {"debian": "libwayland-egl1:i386", "arch": "lib32-wayland"}),
+    ("libxkbcommon.so.0", "windows", {"debian": "libxkbcommon0:i386", "arch": "lib32-libxkbcommon"}),
+    ("libxkbregistry.so.0", "windows", {"debian": "libxkbregistry0:i386", "arch": "lib32-libxkbcommon"}),
+    ("libfreetype.so.6", "text", {"debian": "libfreetype6:i386", "arch": "lib32-freetype2"}),
+    ("libfontconfig.so.1", "text", {"debian": "libfontconfig1:i386", "arch": "lib32-fontconfig"}),
+    ("libgnutls.so.30", "secure connections", {"debian": "libgnutls30t64:i386", "arch": "lib32-gnutls"}),
+    ("libX11.so.6", "windows", {"debian": "libx11-6:i386", "arch": "lib32-libx11"}),
+    ("libXext.so.6", "windows", {"debian": "libxext6:i386", "arch": "lib32-libxext"}),
+    ("libxcb.so.1", "windows", {"debian": "libxcb1:i386", "arch": "lib32-libxcb"}),
+    ("libxcb-randr.so.0", "windows", {"debian": "libxcb-randr0:i386", "arch": "lib32-libxcb"}),
+    ("libXrender.so.1", "windows", {"debian": "libxrender1:i386", "arch": "lib32-libxrender"}),
+    ("libXrandr.so.2", "windows", {"debian": "libxrandr2:i386", "arch": "lib32-libxrandr"}),
+    ("libXi.so.6", "windows", {"debian": "libxi6:i386", "arch": "lib32-libxi"}),
+    ("libXcursor.so.1", "windows", {"debian": "libxcursor1:i386", "arch": "lib32-libxcursor"}),
+    ("libXfixes.so.3", "windows", {"debian": "libxfixes3:i386", "arch": "lib32-libxfixes"}),
+)
+# Where each family keeps 32-bit libraries. /usr/lib holds 64-bit ones on Arch, so a file only counts when it is 32-bit.
+LIB32_DIRS = ("usr/lib/i386-linux-gnu", "lib/i386-linux-gnu", "usr/lib32", "lib32", "usr/lib", "lib")
+
+
+def _is_elf32(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(5)
+    except OSError:
+        return False
+    return head[:4] == b"\x7fELF" and head[4:5] == b"\x01"
+
+
+def lib32_missing_libs(root="/"):
+    """The LIB32_LIBS entries this system has no 32-bit copy of, in order."""
+    return [e for e in LIB32_LIBS if not any(_is_elf32(os.path.join(root, d, e[0])) for d in LIB32_DIRS)]
+
+
+def _lib32_packages(fam, root="/"):
+    """The packages that bring the missing 32-bit pieces on this family, in order, without repeats."""
+    glibc = {"debian": "libc6:i386", "fedora": "glibc.i686", "opensuse": "glibc-32bit", "arch": "lib32-glibc"}
+    if fam not in glibc:
+        return []
+    out = [glibc[fam]] if not os.path.exists(os.path.join(root, LIB32_LOADER)) else []
+    for name, _why, pk in lib32_missing_libs(root):
+        p = name if fam in ("fedora", "opensuse") else pk[fam]
+        if p not in out:
+            out.append(p)
+    return out
+
+
 def lib32_install_command(root="/"):
-    """The command that installs the 32-bit C library on this distribution, as text for a message, or None."""
+    """The command that installs the missing 32-bit pieces on this distribution, as text for a message, or None."""
     osr = os_release(root)
     fam = _distro_family(osr)
+    pk = " ".join(_lib32_packages(fam, root))
     if fam == "arch":
         conf = _read_text(os.path.join(root, "etc/pacman.conf")) or ""
         if not re.search(r"(?m)^\s*\[multilib\]", conf):
-            return "enable the [multilib] repository in /etc/pacman.conf, then run `sudo pacman -Sy lib32-glibc`"
-        return "`sudo pacman -S lib32-glibc`"
+            return "enable the [multilib] repository in /etc/pacman.conf, then run `sudo pacman -Sy %s`" % pk
+        return "`sudo pacman -S %s`" % pk
     if fam == "fedora":
-        return ("`rpm-ostree install glibc.i686`" if os.path.exists(os.path.join(root, "run/ostree-booted"))
-                else "`sudo dnf install glibc.i686`")
+        return ("`rpm-ostree install %s`" % pk if os.path.exists(os.path.join(root, "run/ostree-booted"))
+                else "`sudo dnf install %s`" % pk)
     if fam == "opensuse":
-        return "`sudo zypper install glibc-32bit`"
+        return "`sudo zypper install %s`" % pk
     if fam == "debian":
-        return "`sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386`"
+        return "`sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install %s`" % pk
     return None
 
 
 def lib32_problem(root="/"):
-    """None when the 32-bit C library is there, else the sentence that says what to install."""
-    if os.path.exists(os.path.join(root, LIB32_LOADER)):
+    """None when the 32-bit C library and the 32-bit libraries Wine needs are there, else the sentence that says what
+    is missing and what to install."""
+    if not os.path.exists(os.path.join(root, LIB32_LOADER)):
+        how = lib32_install_command(root) or "your distribution's 32-bit glibc package (multilib)"
+        return ("the 32-bit C library is missing (/%s), so Wine cannot start: Adobe's apps start 32-bit helper "
+                "processes. Install it: %s" % (LIB32_LOADER, how))
+    miss = lib32_missing_libs(root)
+    if not miss:
         return None
-    how = lib32_install_command(root) or "your distribution's 32-bit glibc package (multilib)"
-    return ("the 32-bit C library is missing (/%s), so Wine cannot start: Adobe's apps start 32-bit helper "
-            "processes. Install it: %s" % (LIB32_LOADER, how))
+    whats = []
+    for _name, why, _pk in miss:
+        if why not in whats:
+            whats.append(why)
+    whats = ", ".join(whats[:-1]) + " and " + whats[-1] if len(whats) > 1 else whats[0]
+    how = lib32_install_command(root) or ("your distribution's 32-bit (multilib) packages of "
+                                         + ", ".join(e[0] for e in miss))
+    return ("the 32-bit libraries for %s are missing (%s), so 32-bit programs, like Adobe's installers and helpers, "
+            "cannot open windows or show text. Install them: %s"
+            % (whats, ", ".join(e[0] for e in miss), how))
 
 
 def prereq_plan(root="/"):
@@ -11255,45 +11333,46 @@ def prereq_plan(root="/"):
     install working before MAX"): {"missing": [what], "packages": [names], "command": shell command run as root or
     None, "can_install": bool, "how": a sentence when it can't be done for the user}. Collider shows the command and
     runs it through pkexec after a click; a terminal asks first and uses sudo. Image-based systems (rpm-ostree) need a
-    restart and Arch needs the multilib repository, so those get the sentence instead."""
+    restart and Arch needs the multilib repository, so those get the sentence instead. The 32-bit part is the C library
+    and LIB32_LIBS (Mud-Hut#3)."""
     osr = os_release(root)
     fam = _distro_family(osr)
     need_lib32 = not os.path.exists(os.path.join(root, LIB32_LOADER))
+    need_libs = bool(lib32_missing_libs(root))
     need_cab = not have("cabextract")
-    missing = (["the 32-bit C library"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
+    missing = ((["the 32-bit C library"] if need_lib32 else [])
+               + (["the 32-bit libraries for windows and text"] if need_libs else [])
+               + (["cabextract"] if need_cab else []))
     out = {"missing": missing, "packages": [], "command": None, "can_install": False, "how": None}
     if not missing:
         return out
     ostree = os.path.exists(os.path.join(root, "run/ostree-booted"))
+    pk = _lib32_packages(fam, root) + (["cabextract"] if need_cab else [])
     if fam == "fedora" and ostree:
-        pk = (["glibc.i686"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
         out.update(packages=pk, how="run `rpm-ostree install %s` in a terminal, then restart and set up again "
                                     "(this system is image-based)" % " ".join(pk))
     elif fam == "fedora":
-        pk = (["glibc.i686"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
         out.update(packages=pk, command="dnf install -y " + " ".join(pk), can_install=True)
     elif fam == "opensuse":
-        pk = (["glibc-32bit"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
         out.update(packages=pk, command="zypper --non-interactive install " + " ".join(pk), can_install=True)
     elif fam == "debian":
-        pk = (["libc6:i386"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
         # `;`, not `&&`, after the update: one broken source (a stale PPA; a live session's install disc) makes
         # apt-get update exit 100 and stopped the install, though the archive the packages come from was
         # fine (Linux Mint 22.3 live VM, 2026-10-27).
         cmd = "apt-get update; apt-get install -y " + " ".join(pk)
-        out.update(packages=pk, command=("dpkg --add-architecture i386 && " + cmd) if need_lib32 else cmd,
-                   can_install=True)
+        out.update(packages=pk, command=("dpkg --add-architecture i386 && " + cmd)
+                   if any(p.endswith(":i386") for p in pk) else cmd, can_install=True)
     elif fam == "arch":
         conf = _read_text(os.path.join(root, "etc/pacman.conf")) or ""
-        pk = (["lib32-glibc"] if need_lib32 else []) + (["cabextract"] if need_cab else [])
         out["packages"] = pk
-        if need_lib32 and not re.search(r"(?m)^\s*\[multilib\]", conf):
+        if (need_lib32 or need_libs) and not re.search(r"(?m)^\s*\[multilib\]", conf):
             out["how"] = ("enable the [multilib] repository in /etc/pacman.conf, then run `sudo pacman -Sy %s`"
                           % " ".join(pk))
         else:
             out.update(command="pacman -S --needed --noconfirm " + " ".join(pk), can_install=True)
     else:
-        out["how"] = "install your distribution's 32-bit glibc (multilib) and cabextract packages"
+        out["how"] = ("install your distribution's 32-bit glibc, Wayland, X11, FreeType, Fontconfig and GnuTLS "
+                      "(multilib) packages and cabextract")
     return out
 
 
@@ -11388,7 +11467,7 @@ def cmd_setup(args, updating=False):
     plan = _plan_with_ntsync(prereq_plan(), args)
     ntsync_tried = False
     # Only when the missing packages are all that stops setup (installing them can't fix an old glibc).
-    others = [p for p in problems if not p.startswith(("the 32-bit C library", "cabextract"))]
+    others = [p for p in problems if not p.startswith(("the 32-bit", "cabextract"))]
     if problems and not others and plan["can_install"] and (
             getattr(args, "install_prereqs", False) or (sys.stdin.isatty() and not args.json)):
         event(args, event="progress", stage="packages",
